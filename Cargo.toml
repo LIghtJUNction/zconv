@@ -1,0 +1,36 @@
+[package]
+name = "zconv"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Zero-dependency, allocation-free AI protocol conversion"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/LIghtJUNction/zconv"
+readme = "README.md"
+keywords = ["ai", "protocol", "no-std", "openai", "streaming"]
+categories = ["no-std", "parser-implementations", "encoding"]
+include = ["src/**", "examples/**", "tests/**", "benches/**", "README.md", "CHANGELOG.md", "LICENSE-*", "docs/**", "Cargo.toml"]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+
+[build-dependencies]
+
+[features]
+default = []
+
+[workspace]
+members = ["."]
+exclude = ["comparison", "fuzz"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1

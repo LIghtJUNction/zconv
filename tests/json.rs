@@ -1,4 +1,4 @@
-use zconv::json::{parse, JsonError, Kind, Limits, Token, Writer};
+use zconv::json::{parse, JsonError, JsonString, Kind, Limits, Token, Writer};
 use zconv::Error;
 
 #[test]
@@ -327,6 +327,32 @@ fn writer_roundtrip_and_exact_capacity() {
             kind: JsonError::InvalidUtf8
         })
     );
+}
+
+#[test]
+fn detached_spans_and_public_string_validation() {
+    let input = br#"{"payload":{"x":[1,null]},"text":"a\u0062"}"#;
+    let mut tokens = [Token::EMPTY; 32];
+    let document = parse(input, &mut tokens, Limits::default()).unwrap();
+    let detached = document.root().get("payload").unwrap().raw_value();
+    let original = document.root().get("text").unwrap().as_string().unwrap();
+    let reparsed = JsonString::parse(original.raw()).unwrap();
+    assert!(reparsed.eq_str("ab"));
+    // A detached raw value borrows input bytes, so token storage is reusable.
+    let other = parse(b"false", &mut tokens, Limits::default()).unwrap();
+    assert_eq!(other.root().as_bool(), Some(false));
+    assert_eq!(detached.kind(), Kind::Object);
+    assert_eq!(detached.raw(), br#"{"x":[1,null]}"#);
+    for invalid in [
+        b"".as_slice(),
+        b"0",
+        b" \"a\"",
+        b"\"a\" ",
+        br#""\ud800""#,
+        b"\"\xff\"",
+    ] {
+        assert!(JsonString::parse(invalid).is_err(), "{invalid:?}");
+    }
 }
 
 #[test]

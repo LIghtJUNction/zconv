@@ -519,6 +519,14 @@ pub struct Value<'a, 't> {
 }
 
 impl<'a, 't> Value<'a, 't> {
+    /// Detach a validated scalar or subtree span from the reusable token tape.
+    pub fn raw_value(self) -> RawValue<'a> {
+        RawValue {
+            raw: self.raw(),
+            kind: self.kind(),
+        }
+    }
+
     pub fn raw(self) -> &'a [u8] {
         let token = self.tokens[self.index];
         &self.input[token.start as usize..token.end as usize]
@@ -593,6 +601,47 @@ impl<'a, 't> Value<'a, 't> {
     }
 }
 
+/// A validated source span independent of the token tape's lifetime.
+/// Object navigation requires a `Value`; untouched subtrees only need this span.
+#[derive(Clone, Copy, Debug)]
+pub struct RawValue<'a> {
+    raw: &'a [u8],
+    kind: Kind,
+}
+
+impl<'a> RawValue<'a> {
+    pub fn raw(self) -> &'a [u8] {
+        self.raw
+    }
+    pub fn kind(self) -> Kind {
+        self.kind
+    }
+    pub fn is_null(self) -> bool {
+        self.kind == Kind::Null
+    }
+    pub fn as_string(self) -> Option<JsonString<'a>> {
+        (self.kind == Kind::String).then_some(JsonString { raw: self.raw })
+    }
+    pub fn as_bool(self) -> Option<bool> {
+        (self.kind == Kind::Bool).then(|| self.raw == b"true")
+    }
+    pub fn as_u64(self) -> Option<u64> {
+        if self.kind != Kind::Number {
+            return None;
+        }
+        let mut result = 0u64;
+        for &byte in self.raw {
+            if !byte.is_ascii_digit() {
+                return None;
+            }
+            result = result
+                .checked_mul(10)?
+                .checked_add(u64::from(byte - b'0'))?;
+        }
+        Some(result)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Array<'a, 't> {
     value: Value<'a, 't>,
@@ -650,6 +699,39 @@ pub struct JsonString<'a> {
 }
 
 impl<'a> JsonString<'a> {
+    /// Validate a standalone quoted JSON string without a token workspace.
+    /// Surrounding whitespace is deliberately excluded from this span API.
+    pub fn parse(raw: &'a [u8]) -> Result<Self, Error> {
+        if let Err(error) = core::str::from_utf8(raw) {
+            return Err(Error::InvalidJson {
+                offset: error.valid_up_to(),
+                kind: JsonError::InvalidUtf8,
+            });
+        }
+        if raw.first() != Some(&b'"') {
+            return Err(Error::InvalidJson {
+                offset: 0,
+                kind: if raw.is_empty() {
+                    JsonError::UnexpectedEof
+                } else {
+                    JsonError::Syntax
+                },
+            });
+        }
+        let mut parser = Parser {
+            input: raw,
+            tokens: &mut [],
+            pos: 0,
+            used: 0,
+            limits: Limits::default(),
+        };
+        parser.string()?;
+        if parser.pos != raw.len() {
+            return Err(parser.error(JsonError::TrailingData));
+        }
+        Ok(Self { raw })
+    }
+
     pub fn raw(self) -> &'a [u8] {
         self.raw
     }

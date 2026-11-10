@@ -507,7 +507,7 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
         Ok(())
     }
     fn write_usage(&mut self, protocol: Protocol) -> Result<(), Error> {
-        let mut usage = self.state.usage;
+        let mut usage = self.state.usage.usage();
         if protocol == Protocol::AnthropicMessages {
             usage.input = usage
                 .input
@@ -768,12 +768,19 @@ impl Sink for Emitter<'_, '_, '_, '_> {
             Protocol::OpenAiChat => {}
             Protocol::OpenAiCompletions => {}
             Protocol::AnthropicMessages => {
-                let input = self.state.usage.input.ok_or(Error::ContextRequired {
-                    field: "initial_usage.input",
-                })?;
+                let input = self
+                    .state
+                    .usage
+                    .usage()
+                    .input
+                    .ok_or(Error::ContextRequired {
+                        field: "initial_usage.input",
+                    })?;
                 let input = input
-                    .checked_sub(self.state.usage.cached.unwrap_or(0))
-                    .and_then(|input| input.checked_sub(self.state.usage.cache_write.unwrap_or(0)))
+                    .checked_sub(self.state.usage.usage().cached.unwrap_or(0))
+                    .and_then(|input| {
+                        input.checked_sub(self.state.usage.usage().cache_write.unwrap_or(0))
+                    })
                     .ok_or(Error::InvalidInput {
                         field: "usage",
                         reason: "cached tokens exceed canonical input",
@@ -787,7 +794,10 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                 self.writer.raw(b",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":");
                 number(&mut self.writer, input);
                 self.writer.raw(b",\"output_tokens\":");
-                number(&mut self.writer, self.state.usage.output.unwrap_or(0));
+                number(
+                    &mut self.writer,
+                    self.state.usage.usage().output.unwrap_or(0),
+                );
                 self.writer.raw(b"}}");
                 self.end_event();
             }
@@ -824,6 +834,7 @@ impl Sink for Emitter<'_, '_, '_, '_> {
         kind: BlockKind,
         id: Option<Text<'_>>,
         name: Option<Text<'_>>,
+        _item_id: Option<Text<'_>>,
     ) -> Result<(), Error> {
         if !self.state.begun || self.state.ended {
             return Err(Error::InvalidInput {
@@ -965,7 +976,7 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                         | Protocol::GeminiGenerateContent
                 ) =>
             {
-                self.block(key, kind, None, None)?;
+                self.block(key, kind, None, None, None)?;
                 self.state.item_count - 1
             }
             None => {
@@ -1169,47 +1180,7 @@ impl Sink for Emitter<'_, '_, '_, '_> {
         Ok(())
     }
     fn usage(&mut self, usage: Usage) -> Result<(), Error> {
-        // Keep cumulative source bases so a later cache/thinking-only update
-        // changes the canonical total without adding earlier updates twice.
-        if let Some(input) = usage.input {
-            self.state.input_base = Some(input);
-            self.state.input_basis = usage.input_basis;
-        }
-        if let Some(output) = usage.output {
-            self.state.output_base = Some(output);
-            self.state.output_basis = usage.output_basis;
-        }
-        self.state.usage.update(usage);
-        let overflow = Error::InvalidInput {
-            field: "usage",
-            reason: "counter overflow",
-        };
-        self.state.usage.input = match (self.state.input_base, self.state.input_basis) {
-            (Some(input), InputCount::Uncached) => Some(
-                input
-                    .checked_add(self.state.usage.cached.unwrap_or(0))
-                    .and_then(|input| input.checked_add(self.state.usage.cache_write.unwrap_or(0)))
-                    .ok_or(overflow)?,
-            ),
-            (input, InputCount::Total) => input,
-            (None, _) => None,
-        };
-        self.state.usage.output = match (self.state.output_base, self.state.output_basis) {
-            (Some(output), OutputCount::Visible) => Some(
-                output
-                    .checked_add(self.state.usage.reasoning.unwrap_or(0))
-                    .ok_or(overflow)?,
-            ),
-            (output, OutputCount::Total) => output,
-            (None, _) => None,
-        };
-        self.state.usage.input_basis = InputCount::Total;
-        self.state.usage.output_basis = OutputCount::Total;
-        if self.state.input_basis == InputCount::Uncached {
-            if let (Some(input), Some(output)) = (self.state.usage.input, self.state.usage.output) {
-                self.state.usage.total = Some(input.checked_add(output).ok_or(overflow)?);
-            }
-        }
+        self.state.usage.update(usage)?;
         Ok(())
     }
     fn choice(&mut self, choice: u32, reason: FinishReason) -> Result<(), Error> {
@@ -1251,6 +1222,7 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                     part: 0,
                 },
                 BlockKind::Text,
+                None,
                 None,
                 None,
             )?;
@@ -1298,7 +1270,7 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                         feature: "cancelled/failed terminal status without error payload",
                     });
                 }
-                if self.state.usage != Usage::default() {
+                if self.state.usage.usage() != Usage::default() {
                     self.chat_header(self.config.target.protocol == Protocol::OpenAiCompletions);
                     self.writer.raw(b",\"choices\":[],\"usage\":");
                     self.write_usage(self.config.target.protocol)?;
@@ -1373,7 +1345,7 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                         feature: "Gemini cancelled/failed status without error payload",
                     });
                 }
-                if self.state.usage != Usage::default() {
+                if self.state.usage.usage() != Usage::default() {
                     self.writer
                         .raw(b"data: {\"candidates\":[],\"usageMetadata\":");
                     self.write_usage(Protocol::GeminiGenerateContent)?;
@@ -1491,7 +1463,7 @@ impl Sink for Emitter<'_, '_, '_, '_> {
             })?,
             part: 0,
         };
-        self.block(key, BlockKind::Tool, id, Some(name))?;
+        self.block(key, BlockKind::Tool, id, Some(name), None)?;
         self.delta(key, BlockKind::Tool, arguments)?;
         self.close(key)
     }

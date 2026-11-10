@@ -105,6 +105,92 @@ impl Usage {
     }
 }
 
+/// Checked cumulative accounting shared by event consumers and stream encoders.
+///
+/// Present fields replace the preceding source counters. Cache/thinking-only
+/// updates recalculate canonical totals from the retained source bases; they do
+/// not add earlier cumulative updates twice. Missing fields remain unknown until
+/// supplied or derivable under the source's declared accounting basis.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UsageAccumulator {
+    usage: Usage,
+    input_base: Option<u64>,
+    input_basis: InputCount,
+    output_base: Option<u64>,
+    output_basis: OutputCount,
+}
+
+impl UsageAccumulator {
+    /// Initialize from caller-provided canonical, inclusive counters.
+    pub fn new(initial: Usage) -> Result<Self, Error> {
+        if initial.input_basis != InputCount::Total || initial.output_basis != OutputCount::Total {
+            return Err(Error::InvalidInput {
+                field: "initial_usage basis",
+                reason: "context counters must be canonical totals",
+            });
+        }
+        Ok(Self {
+            usage: initial,
+            input_base: initial.input,
+            input_basis: initial.input_basis,
+            output_base: initial.output,
+            output_basis: initial.output_basis,
+        })
+    }
+
+    /// The current canonical counters; this never invents an absent zero.
+    pub fn usage(&self) -> Usage {
+        self.usage
+    }
+
+    /// Apply a cumulative source update atomically. On overflow, retain the
+    /// previously committed counters so the caller can diagnose or recover.
+    pub fn update(&mut self, next: Usage) -> Result<Usage, Error> {
+        let mut updated = *self;
+        if let Some(input) = next.input {
+            updated.input_base = Some(input);
+            updated.input_basis = next.input_basis;
+        }
+        if let Some(output) = next.output {
+            updated.output_base = Some(output);
+            updated.output_basis = next.output_basis;
+        }
+        updated.usage.update(next);
+        let overflow = Error::InvalidInput {
+            field: "usage",
+            reason: "counter overflow",
+        };
+        updated.usage.input = match (updated.input_base, updated.input_basis) {
+            (Some(input), InputCount::Uncached) => Some(
+                input
+                    .checked_add(updated.usage.cached.unwrap_or(0))
+                    .and_then(|input| input.checked_add(updated.usage.cache_write.unwrap_or(0)))
+                    .ok_or(overflow)?,
+            ),
+            (input, InputCount::Total) => input,
+            (None, _) => None,
+        };
+        updated.usage.output = match (updated.output_base, updated.output_basis) {
+            (Some(output), OutputCount::Visible) => Some(
+                output
+                    .checked_add(updated.usage.reasoning.unwrap_or(0))
+                    .ok_or(overflow)?,
+            ),
+            (output, OutputCount::Total) => output,
+            (None, _) => None,
+        };
+        updated.usage.input_basis = InputCount::Total;
+        updated.usage.output_basis = OutputCount::Total;
+        if updated.input_basis == InputCount::Uncached {
+            if let (Some(input), Some(output)) = (updated.usage.input, updated.usage.output) {
+                updated.usage.total = Some(input.checked_add(output).ok_or(overflow)?);
+            }
+        }
+        *self = updated;
+        Ok(self.usage)
+    }
+}
+
 /// IDs for sources whose wire format omits a tool-call identifier.
 #[derive(Clone, Copy, Debug)]
 pub struct ToolId<'a> {
@@ -208,6 +294,9 @@ pub struct Event {
     pub a: EventText,
     pub b: EventText,
     pub c: EventText,
+    /// Source output item identity, separate from the tool call ID in `a`.
+    /// The target encoder continues to use caller-chosen target item IDs.
+    pub item_id: EventText,
     pub created: Option<u64>,
     pub usage: Usage,
     pub reason: FinishReason,
@@ -236,6 +325,12 @@ impl Event {
             present: false,
         },
         c: EventText {
+            offset: 0,
+            length: 0,
+            quoted: false,
+            present: false,
+        },
+        item_id: EventText {
             offset: 0,
             length: 0,
             quoted: false,
@@ -404,11 +499,7 @@ struct State {
     id: Span,
     model: Span,
     created: Option<u64>,
-    usage: Usage,
-    input_base: Option<u64>,
-    input_basis: InputCount,
-    output_base: Option<u64>,
-    output_basis: OutputCount,
+    usage: UsageAccumulator,
     aggregate_used: usize,
     aggregate_peak: usize,
     item_count: usize,
@@ -416,8 +507,8 @@ struct State {
     report: Report,
 }
 impl State {
-    fn new(context: StreamContext<'_>) -> Self {
-        Self {
+    fn new(context: StreamContext<'_>) -> Result<Self, Error> {
+        Ok(Self {
             begun: false,
             ended: false,
             seen_finish: false,
@@ -425,17 +516,13 @@ impl State {
             id: Span::EMPTY,
             model: Span::EMPTY,
             created: context.created,
-            usage: context.initial_usage,
-            input_base: context.initial_usage.input,
-            input_basis: context.initial_usage.input_basis,
-            output_base: context.initial_usage.output,
-            output_basis: context.initial_usage.output_basis,
+            usage: UsageAccumulator::new(context.initial_usage)?,
             aggregate_used: 0,
             aggregate_peak: 0,
             item_count: 0,
             sequence: 0,
             report: Report::default(),
-        }
+        })
     }
 }
 
@@ -473,7 +560,7 @@ impl<'a, 'c> StreamConverter<'a, 'c> {
             });
         }
         for format in [config.source, config.target] {
-            validate_format(format)?;
+            validate_stream_format(format)?;
         }
         if buffers.checkpoints.len() < buffers.items.len() {
             return Err(Error::WorkspaceTooSmall {
@@ -518,7 +605,7 @@ impl<'a, 'c> StreamConverter<'a, 'c> {
             checkpoints: buffers.checkpoints,
             events: buffers.events,
             aggregate: buffers.aggregate,
-            state: State::new(config.context),
+            state: State::new(config.context)?,
             pending_len: 0,
             pending_pos: 0,
             data_len: 0,
@@ -537,7 +624,7 @@ impl<'a, 'c> StreamConverter<'a, 'c> {
         self.state.report
     }
     pub fn usage(&self) -> Usage {
-        self.state.usage
+        self.state.usage.usage()
     }
     pub fn memory(&self) -> Memory {
         Memory {
@@ -971,6 +1058,7 @@ trait Sink {
         kind: BlockKind,
         id: Option<Text<'_>>,
         name: Option<Text<'_>>,
+        item_id: Option<Text<'_>>,
     ) -> Result<(), Error>;
     fn delta(&mut self, key: Key, kind: BlockKind, text: Text<'_>) -> Result<(), Error>;
     fn signature(&mut self, key: Key, text: Text<'_>) -> Result<(), Error>;
@@ -1007,16 +1095,7 @@ fn process(
     aggregate: &mut [u8],
     token_peak: &mut usize,
 ) -> Result<usize, Error> {
-    if payload == b"[DONE]" {
-        if !matches!(
-            config.source.protocol,
-            Protocol::OpenAiChat | Protocol::OpenAiCompletions
-        ) {
-            return Err(Error::InvalidInput {
-                field: "SSE data",
-                reason: "unexpected DONE marker",
-            });
-        }
+    if done_marker(config.source, event_type, payload)? {
         let mut emitter =
             encode::Emitter::new(config, Writer::new(output), state, items, aggregate);
         emitter.finish(Completion::Completed)?;
@@ -1028,18 +1107,11 @@ fn process(
     let document = json::parse(payload, tokens, config.json_limits)?;
     *token_peak = (*token_peak).max(document.tokens_used());
     let root = document.root();
+    validate_event_name(event_type, root)?;
     let discriminator = root
         .get("type")
         .or_else(|| root.get("event_type"))
         .and_then(Value::as_string);
-    if event_type != b"message"
-        && !discriminator.is_some_and(|value| value.bytes().eq(event_type.iter().copied()))
-    {
-        return Err(Error::InvalidInput {
-            field: "SSE event name",
-            reason: "does not match JSON event discriminator",
-        });
-    }
     if state.begun
         && discriminator.is_some_and(|value| {
             ["message_start", "response.created", "interaction.created"]
@@ -1164,10 +1236,78 @@ pub fn decode_event_format(
     events: &mut [Event],
     limits: json::Limits,
 ) -> Result<usize, Error> {
-    validate_format(format)?;
+    validate_stream_format(format)?;
     let document = json::parse(payload, tokens, limits)?;
     decode_ir_value(format, payload, document.root(), events)
 }
+
+/// Decode one framed SSE payload, including its event-name contract.
+///
+/// OpenAI Chat and Completions `[DONE]` becomes a single `Finish` event. Other
+/// payloads use the same validated parser and adapters as `decode_event_format`.
+/// All text spans refer to `payload`. This function is stateless: the consumer
+/// must check lifecycle, tool completeness and GenerateContent EOF termination.
+/// Discard the provisional event tape on error and retry capacity errors with
+/// the same frame. No input bytes are retained by this function.
+pub fn decode_frame_format(
+    format: Format,
+    event_type: &[u8],
+    payload: &[u8],
+    tokens: &mut [Token],
+    events: &mut [Event],
+    limits: json::Limits,
+) -> Result<usize, Error> {
+    validate_stream_format(format)?;
+    if done_marker(format, event_type, payload)? {
+        *events.first_mut().ok_or(Error::IrTooSmall { needed: 1 })? = Event {
+            kind: EventKind::Finish,
+            ..Event::EMPTY
+        };
+        return Ok(1);
+    }
+    let document = json::parse(payload, tokens, limits)?;
+    validate_event_name(event_type, document.root())?;
+    decode_ir_value(format, payload, document.root(), events)
+}
+
+fn done_marker(format: Format, event_type: &[u8], payload: &[u8]) -> Result<bool, Error> {
+    if payload != b"[DONE]" {
+        return Ok(false);
+    }
+    if !matches!(
+        format.protocol,
+        Protocol::OpenAiChat | Protocol::OpenAiCompletions
+    ) {
+        return Err(Error::InvalidInput {
+            field: "SSE data",
+            reason: "unexpected DONE marker",
+        });
+    }
+    if event_type != b"message" {
+        return Err(Error::InvalidInput {
+            field: "SSE event name",
+            reason: "DONE marker requires the default message event",
+        });
+    }
+    Ok(true)
+}
+
+fn validate_event_name(event_type: &[u8], root: Value<'_, '_>) -> Result<(), Error> {
+    let discriminator = root
+        .get("type")
+        .or_else(|| root.get("event_type"))
+        .and_then(Value::as_string);
+    if event_type != b"message"
+        && !discriminator.is_some_and(|value| value.bytes().eq(event_type.iter().copied()))
+    {
+        return Err(Error::InvalidInput {
+            field: "SSE event name",
+            reason: "does not match JSON event discriminator",
+        });
+    }
+    Ok(())
+}
+
 fn decode_ir_value(
     format: Format,
     payload: &[u8],
@@ -1183,7 +1323,8 @@ fn decode_ir_value(
     Ok(collector.used)
 }
 
-fn validate_format(format: Format) -> Result<(), Error> {
+/// Validate the stream adapter's supported version and profile before input.
+pub fn validate_stream_format(format: Format) -> Result<(), Error> {
     let profile = match format.profile {
         Profile::Standard => true,
         Profile::OpenAiCompatible(name) => {
@@ -1258,6 +1399,7 @@ impl Sink for Collector<'_, '_> {
         block: BlockKind,
         id: Option<Text<'_>>,
         name: Option<Text<'_>>,
+        item_id: Option<Text<'_>>,
     ) -> Result<(), Error> {
         self.add(Event {
             kind: EventKind::BlockStart,
@@ -1265,6 +1407,7 @@ impl Sink for Collector<'_, '_> {
             block,
             a: self.text(id)?,
             b: self.text(name)?,
+            item_id: self.text(item_id)?,
             ..Event::EMPTY
         })
     }
@@ -1406,7 +1549,13 @@ fn replay(event: Event, payload: &[u8], sink: &mut impl Sink) -> Result<(), Erro
     let b = event_text(event.b, payload)?;
     match event.kind {
         EventKind::Begin => sink.begin(a, b, event.created),
-        EventKind::BlockStart => sink.block(event.key, event.block, a, b),
+        EventKind::BlockStart => sink.block(
+            event.key,
+            event.block,
+            a,
+            b,
+            event_text(event.item_id, payload)?,
+        ),
         EventKind::Delta => sink.delta(event.key, event.block, required_text(a)?),
         EventKind::Signature => sink.signature(event.key, required_text(a)?),
         EventKind::BlockEnd => sink.close(event.key),

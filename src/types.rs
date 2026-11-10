@@ -93,6 +93,10 @@ pub enum Error {
     WorkspaceTooSmall {
         needed: usize,
     },
+    /// Exact decoded byte capacity required for embedded JSON validation.
+    ScratchTooSmall {
+        needed: usize,
+    },
     OutputTooSmall {
         needed: usize,
     },

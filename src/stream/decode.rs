@@ -261,7 +261,7 @@ fn chat(
                     let id = optional(call, "id")?;
                     let name = optional(function, "name")?;
                     if id.is_some() || name.is_some() {
-                        sink.block(key, BlockKind::Tool, id, name)?;
+                        sink.block(key, BlockKind::Tool, id, name, None)?;
                     }
                     if let Some(arguments) = optional(function, "arguments")? {
                         sink.delta(key, BlockKind::Tool, arguments)?;
@@ -279,7 +279,7 @@ fn chat(
                     part: 0,
                 };
                 if let Some(name) = optional(function, "name")? {
-                    sink.block(key, BlockKind::Tool, None, Some(name))?;
+                    sink.block(key, BlockKind::Tool, None, Some(name), None)?;
                 }
                 if let Some(arguments) = optional(function, "arguments")? {
                     sink.delta(key, BlockKind::Tool, arguments)?;
@@ -497,6 +497,7 @@ fn anthropic(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
                 BlockKind::Tool,
                 Some(string(block, "id")?),
                 Some(string(block, "name")?),
+                None,
             )?;
             if let Some(input) = block.get("input") {
                 if input.kind() != Kind::Object {
@@ -509,7 +510,7 @@ fn anthropic(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
         } else if eq(block, "type", "text") {
             fields(block, &["type", "text", "citations"])?;
             empty_only(block, "citations")?;
-            sink.block(key, BlockKind::Text, None, None)?;
+            sink.block(key, BlockKind::Text, None, None, None)?;
             if let Some(text) = optional(block, "text")? {
                 if text.len() != 0 {
                     sink.delta(key, BlockKind::Text, text)?;
@@ -517,7 +518,7 @@ fn anthropic(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
             }
         } else if eq(block, "type", "thinking") {
             fields(block, &["type", "thinking", "signature"])?;
-            sink.block(key, BlockKind::Reasoning, None, None)?;
+            sink.block(key, BlockKind::Reasoning, None, None, None)?;
             if let Some(text) = optional(block, "thinking")? {
                 if text.len() != 0 {
                     sink.delta(key, BlockKind::Reasoning, text)?;
@@ -627,6 +628,7 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
                 BlockKind::Tool,
                 Some(string(item, "call_id")?),
                 Some(string(item, "name")?),
+                optional(item, "id")?,
             )?;
             if let Some(arguments) = optional(item, "arguments")? {
                 if arguments.len() != 0 {
@@ -639,7 +641,13 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
             }
             empty_only(item, "content")?;
         } else if eq(item, "type", "reasoning") {
-            sink.block(key, BlockKind::Reasoning, optional(item, "id")?, None)?;
+            sink.block(
+                key,
+                BlockKind::Reasoning,
+                optional(item, "id")?,
+                None,
+                optional(item, "id")?,
+            )?;
         } else {
             return Err(Error::Unsupported {
                 feature: "Responses output item",
@@ -664,7 +672,13 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
             });
         };
         empty_only(part, "annotations")?;
-        sink.block(key, kind, optional(value, "item_id")?, None)?;
+        sink.block(
+            key,
+            kind,
+            optional(value, "item_id")?,
+            None,
+            optional(value, "item_id")?,
+        )?;
         let field = if kind == BlockKind::Text {
             "text"
         } else {
@@ -1088,15 +1102,16 @@ fn interactions(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error>
         let step = object(value, "step")?;
         if eq(step, "type", "model_output") {
             empty_only(step, "content")?;
-            sink.block(key, BlockKind::Text, None, None)
+            sink.block(key, BlockKind::Text, None, None, None)
         } else if eq(step, "type", "thought") {
-            sink.block(key, BlockKind::Reasoning, None, None)
+            sink.block(key, BlockKind::Reasoning, None, None, None)
         } else if eq(step, "type", "function_call") {
             sink.block(
                 key,
                 BlockKind::Tool,
                 Some(string(step, "id")?),
                 Some(string(step, "name")?),
+                None,
             )?;
             if let Some(arguments) = step.get("arguments") {
                 if arguments.kind() != Kind::Object {

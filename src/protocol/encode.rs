@@ -442,12 +442,12 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                 }
                 let len = match t {
                     Text::Json(s) => s.decode_into(self.scratch).map_err(|e| match e {
-                        Error::OutputTooSmall { needed } => Error::WorkspaceTooSmall { needed },
+                        Error::OutputTooSmall { needed } => Error::ScratchTooSmall { needed },
                         e => e,
                     })?,
                     Text::Utf8(s) => {
                         if s.len() > self.scratch.len() {
-                            return Err(Error::WorkspaceTooSmall { needed: s.len() });
+                            return Err(Error::ScratchTooSmall { needed: s.len() });
                         }
                         self.scratch[..s.len()].copy_from_slice(s.as_bytes());
                         s.len()

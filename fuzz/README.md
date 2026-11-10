@@ -9,6 +9,7 @@ Install `cargo-fuzz` and run:
 
 ```sh
 cargo install cargo-fuzz --locked
+python3 fuzz/seed_corpus.py
 cargo +nightly fuzz run json -- -max_total_time=60 -max_len=65536
 cargo +nightly fuzz run convert -- -max_total_time=60 -max_len=65536
 cargo +nightly fuzz run stream -- -max_total_time=60 -max_len=65536

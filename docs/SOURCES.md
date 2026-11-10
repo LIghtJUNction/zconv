@@ -8,12 +8,15 @@ Documentation retrieved on 2026-11-10. Adapter versions are explicit in `Format`
 | OpenAI Chat Completions | v1, legacy functions and current tools | https://developers.openai.com/api/reference/resources/chat |
 | OpenAI Responses | v1 | https://developers.openai.com/api/reference/resources/responses |
 | Responses events | v1 | https://developers.openai.com/api/reference/resources/responses/streaming-events |
+| Function strict defaults | Chat versus Responses | https://developers.openai.com/api/docs/guides/function-calling |
+| Responses migration semantics | Tool schema defaults and item identity | https://developers.openai.com/api/docs/guides/migrate-to-responses |
 | Anthropic Messages | 2023-06-01; explicit newer version checks | https://platform.claude.com/docs/en/api/messages |
 | Anthropic version differences | 2026-10-21 | https://platform.claude.com/docs/en/api/migration-2026-10-21 |
 | Anthropic streaming | versioned Messages events | https://platform.claude.com/docs/en/build-with-claude/streaming |
 | Gemini GenerateContent | v1beta JSON REST mapping | https://ai.google.dev/api/generate-content |
 | Gemini Interactions | v1, step-based resource | https://ai.google.dev/api/interactions-api-v1 |
 | Gemini Interactions events | interaction / step events | https://ai.google.dev/gemini-api/docs/streaming |
+| Gemini thought accounting | Visible output versus thought tokens | https://ai.google.dev/gemini-api/docs/thought-signatures |
 | SSE framing | WHATWG Living Standard, 2026-11-09 revision | https://html.spec.whatwg.org/multipage/server-sent-events.html |
 | JSON grammar | RFC 8259 | https://www.rfc-editor.org/rfc/rfc8259 |
 
@@ -59,3 +62,25 @@ extensions.
 
 Specifications define the supported wire contract. Additional model-specific
 validation and network headers remain the caller's responsibility.
+
+## Defaults and token-accounting differences
+
+Chat function definitions without an explicit `strict` setting use best-effort
+calling. Responses attempts schema normalization into strict mode when possible,
+otherwise falls back to best effort. Cross-conversion from Chat therefore writes
+`strict:false`; a Responses source with unresolved missing/null strict requires
+the caller to resolve the mode in IR before cross-conversion. Same-format IR
+retains the source's field-presence state. Explicit boolean settings are retained
+only where the target can express that guarantee.
+
+Anthropic's `input_tokens` excludes its separately reported cache read/write
+counts. The IR's input total includes them. Gemini's visible output count excludes
+thought tokens; the IR/OpenAI output total includes them. These conversions use
+checked integer addition/subtraction. The Interactions v1 reference example with
+input 7, visible output 23, thought 49 and total 79 is a regression fixture:
+canonical output is 72, and encoding back to Gemini restores visible output 23.
+
+The documented OpenAI Responses SSE union includes completed, incomplete and
+failed lifecycle events. A similarly named cancellation webhook is not reused
+as a stream event. Length and safety finishes preserve distinct incomplete
+reasons instead of being labeled successful completion.

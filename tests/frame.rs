@@ -326,3 +326,112 @@ fn scratch_capacity_is_distinct_from_token_capacity_and_retryable() {
         Error::ScratchTooSmall { needed: 7 }
     );
 }
+
+#[test]
+fn completed_empty_message_retains_an_item_without_fabricating_a_delta() {
+    let mut tokens = [Token::EMPTY; 128];
+    let mut events = [Event::EMPTY; 8];
+    let added = br#"{"type":"response.output_item.added","output_index":0,"item":{"id":"msg-empty","type":"message","role":"assistant","content":[]}}"#;
+    let done = br#"{"type":"response.output_item.done","output_index":0,"item":{"id":"msg-empty","type":"message","role":"assistant","content":[],"status":"completed"}}"#;
+    assert_eq!(
+        decode_frame_format(
+            Protocol::OpenAiResponses.into(),
+            b"response.output_item.added",
+            added,
+            &mut tokens,
+            &mut events,
+            Limits::default()
+        )
+        .unwrap(),
+        0
+    );
+    let count = decode_frame_format(
+        Protocol::OpenAiResponses.into(),
+        b"response.output_item.done",
+        done,
+        &mut tokens,
+        &mut events,
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(count, 2);
+    assert_eq!(events[0].kind, EventKind::BlockStart);
+    assert_eq!(events[0].block, BlockKind::Text);
+    assert_eq!(events[1].kind, EventKind::BlockEnd);
+    assert_eq!(events[0].key, events[1].key);
+    let id = events[0].item_id;
+    assert!(JsonString::parse(&done[id.offset..id.offset + id.length])
+        .unwrap()
+        .eq_str("msg-empty"));
+    let completed = br#"{"type":"response.completed","response":{"output":[{"id":"msg-empty","type":"message","role":"assistant","content":[],"status":"completed"}]}}"#;
+    let count = decode_frame_format(
+        Protocol::OpenAiResponses.into(),
+        b"response.completed",
+        completed,
+        &mut tokens,
+        &mut events,
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(count, 2);
+    assert_eq!(events[0].kind, EventKind::ChoiceEnd);
+    assert_eq!(events[1].kind, EventKind::Finish);
+}
+
+#[test]
+fn empty_final_message_is_valid_only_without_prior_content() {
+    use zconv::stream::{ActiveItem, Status, StreamBuffers, StreamConfig, StreamConverter};
+    for had_text in [false, true] {
+        let mut source = String::from(concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"m\",\"created_at\":1}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg-empty\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n"
+        ));
+        if had_text {
+            source.push_str(concat!(
+                "data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"item_id\":\"msg-empty\",\"part\":{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"item_id\":\"msg-empty\",\"delta\":\"x\"}\n\n"
+            ));
+        }
+        source.push_str(concat!(
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg-empty\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"status\":\"completed\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"id\":\"msg-empty\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"status\":\"completed\"}]}}\n\n"
+        ));
+        let mut framing = [0; 1024];
+        let mut data = [0; 1024];
+        let mut pending = [0; 4096];
+        let mut aggregate = [0; 1024];
+        let mut tokens = [Token::EMPTY; 256];
+        let mut items = [ActiveItem::EMPTY; 8];
+        let mut checkpoints = [ActiveItem::EMPTY; 8];
+        let mut events = [Event::EMPTY; 16];
+        let mut output = [0; 8192];
+        let mut config = StreamConfig::new(Protocol::OpenAiResponses, Protocol::OpenAiChat);
+        config.strategy = zconv::Strategy::Ir;
+        config.validate_snapshots = true;
+        let mut converter = StreamConverter::new(
+            config,
+            StreamBuffers {
+                framing: &mut framing,
+                data: &mut data,
+                pending: &mut pending,
+                tokens: &mut tokens,
+                items: &mut items,
+                checkpoints: &mut checkpoints,
+                events: &mut events,
+                aggregate: &mut aggregate,
+            },
+        )
+        .unwrap();
+        let step = converter.step(source.as_bytes(), &mut output, true);
+        if had_text {
+            assert!(
+                matches!(step.status, Status::Failed(Error::InvalidInput { .. })),
+                "{:?}",
+                step.status
+            );
+        } else {
+            assert_eq!(step.status, Status::Done);
+            assert_eq!(step.consumed, source.len());
+        }
+    }
+}

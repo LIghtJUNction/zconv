@@ -3061,7 +3061,7 @@ fn write_finish(
         Protocol::GeminiGenerateContent => "finishReason",
         _ => "finish_reason",
     };
-    if e.source == e.target {
+    if e.source == e.target && !choice.raw_finish.is_missing() {
         ptext(&mut e.w, comma, field, choice.raw_finish);
         return Ok(());
     }

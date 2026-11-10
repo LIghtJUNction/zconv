@@ -796,6 +796,25 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
             ..Key::default()
         };
         let item = object(value, "item")?;
+        if eq(item, "type", "message") {
+            array(item, "content")?;
+            if item
+                .get("content")
+                .is_some_and(|content| content.array().next().is_none())
+            {
+                // No content_part.added exists for an empty message. Represent
+                // the completed item with an empty block, without fabricating a
+                // text delta. A previous part at this key makes this duplicate
+                // start fail lifecycle validation instead of discarding text.
+                sink.block(
+                    key,
+                    BlockKind::Text,
+                    optional(item, "id")?,
+                    None,
+                    optional(item, "id")?,
+                )?;
+            }
+        }
         response_snapshot(item, key.index, sink)?;
         if eq(item, "status", "incomplete") {
             sink.incomplete(key)?;

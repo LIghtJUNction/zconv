@@ -18,7 +18,9 @@ on:
         type: boolean
         default: false
   push:
+    branches: [main]
     tags: ['v[0-9]*']
+    paths: [rust-toolchain.toml]
 permissions:
   contents: read
 concurrency:

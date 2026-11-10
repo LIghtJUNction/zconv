@@ -1,0 +1,11 @@
+[package]
+name = "zconv-comparison"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+zconv = { path = ".." }
+serde_json = "1.0"
+
+[workspace]

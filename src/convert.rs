@@ -46,7 +46,9 @@ pub struct Conversion<'a> {
 }
 
 impl Conversion<'_> {
-    pub const fn written(&self) -> usize { self.report.written }
+    pub const fn written(&self) -> usize {
+        self.report.written
+    }
 }
 
 /// Convert a complete request or response.
@@ -88,11 +90,17 @@ pub fn convert<'a>(
             report: EncodeReport {
                 written,
                 transport_model: if operation == Operation::Request {
-                    root.get("model").and_then(|v| v.as_string()).map(Text::Json)
+                    root.get("model")
+                        .and_then(|v| v.as_string())
+                        .map(Text::Json)
                         .or(options.context.model.map(Text::Utf8))
                         .map_or(Presence::Missing, Presence::Value)
-                } else { Presence::Missing },
-                transport_stream: root.get("stream").and_then(|v| v.as_bool())
+                } else {
+                    Presence::Missing
+                },
+                transport_stream: root
+                    .get("stream")
+                    .and_then(|v| v.as_bool())
                     .map_or(Presence::Missing, Presence::Value),
                 ..EncodeReport::default()
             },
@@ -100,11 +108,24 @@ pub fn convert<'a>(
         });
     }
     if options.strategy != Strategy::Ir {
-        match direct::convert(source, target, operation, root, &options.context,
-                              options.policy, output, workspace.scratch, workspace.nested_tokens) {
+        match direct::convert(
+            source,
+            target,
+            operation,
+            root,
+            &options.context,
+            options.policy,
+            output,
+            workspace.scratch,
+            workspace.nested_tokens,
+        ) {
             Ok(report) => {
                 resources.output_bytes = report.written;
-                return Ok(Conversion { path: Path::Direct, report, resources });
+                return Ok(Conversion {
+                    path: Path::Direct,
+                    report,
+                    resources,
+                });
             }
             Err(error @ Error::DirectUnavailable { .. }) => {
                 // Unsupported features do not conceal malformed source semantics.
@@ -113,7 +134,7 @@ pub fn convert<'a>(
                     protocol::validate(source, operation, root)?;
                     return Err(error);
                 }
-            },
+            }
             Err(error) => return Err(error),
         }
     }
@@ -121,16 +142,34 @@ pub fn convert<'a>(
         Operation::Request => {
             let request = protocol::decode_request(source, root, workspace.records)?;
             resources.ir_records_used = request.records.len();
-            protocol::encode_request(&request, target, &options.context, options.policy,
-                                     output, workspace.scratch, workspace.nested_tokens)?
+            protocol::encode_request(
+                &request,
+                target,
+                &options.context,
+                options.policy,
+                output,
+                workspace.scratch,
+                workspace.nested_tokens,
+            )?
         }
         Operation::Response => {
             let response = protocol::decode_response(source, root, workspace.records)?;
             resources.ir_records_used = response.records.len();
-            protocol::encode_response(&response, target, &options.context, options.policy,
-                                      output, workspace.scratch, workspace.nested_tokens)?
+            protocol::encode_response(
+                &response,
+                target,
+                &options.context,
+                options.policy,
+                output,
+                workspace.scratch,
+                workspace.nested_tokens,
+            )?
         }
     };
     resources.output_bytes = report.written;
-    Ok(Conversion { path: Path::Ir, report, resources })
+    Ok(Conversion {
+        path: Path::Ir,
+        report,
+        resources,
+    })
 }

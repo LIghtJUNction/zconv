@@ -54,6 +54,7 @@ pub enum Completion {
 }
 
 /// Cumulative counters. Absence is preserved; updates replace present fields.
+/// `input_basis` makes cache accounting explicit even outside an adapter.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Usage {
     pub input: Option<u64>,
@@ -61,6 +62,25 @@ pub struct Usage {
     pub total: Option<u64>,
     pub cached: Option<u64>,
     pub reasoning: Option<u64>,
+    pub cache_write: Option<u64>,
+    pub input_basis: InputCount,
+    pub output_basis: OutputCount,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum InputCount {
+    #[default]
+    Total,
+    /// Input excludes separately reported cache reads and writes.
+    Uncached,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OutputCount {
+    #[default]
+    Total,
+    /// Visible output excludes the separately reported thinking count.
+    Visible,
 }
 impl Usage {
     fn update(&mut self, next: Self) {
@@ -78,6 +98,9 @@ impl Usage {
         }
         if next.reasoning.is_some() {
             self.reasoning = next.reasoning;
+        }
+        if next.cache_write.is_some() {
+            self.cache_write = next.cache_write;
         }
     }
 }
@@ -105,6 +128,20 @@ pub struct StreamContext<'a> {
 pub struct StreamPolicy {
     pub drop_reasoning: bool,
     pub drop_extensions: bool,
+}
+
+/// Exact classes of source fields that the opt-in metadata policy may discard.
+/// The discriminants are bits in `Report::dropped_fields`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u32)]
+pub enum DroppedField {
+    #[default]
+    SystemFingerprint = 1,
+    ServiceTier = 2,
+    SafetyRatings = 4,
+    FinishMessage = 8,
+    AverageLogprobs = 16,
+    CacheCreationTokens = 32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -159,6 +196,7 @@ pub enum EventKind {
     Extension,
     ToolComplete,
     Snapshot,
+    BlockIncomplete,
 }
 
 /// Compact event IR. All spans refer to the associated payload, never a cache.
@@ -174,6 +212,7 @@ pub struct Event {
     pub usage: Usage,
     pub reason: FinishReason,
     pub completion: Completion,
+    pub extension: DroppedField,
 }
 impl Event {
     pub const EMPTY: Self = Self {
@@ -209,9 +248,13 @@ impl Event {
             total: None,
             cached: None,
             reasoning: None,
+            cache_write: None,
+            input_basis: InputCount::Total,
+            output_basis: OutputCount::Total,
         },
         reason: FinishReason::Stop,
         completion: Completion::Completed,
+        extension: DroppedField::SystemFingerprint,
     };
 }
 
@@ -245,6 +288,7 @@ pub struct ActiveItem {
     saw_delta: bool,
     validated: bool,
     content_length: usize,
+    incomplete: bool,
 }
 impl ActiveItem {
     pub const EMPTY: Self = Self {
@@ -267,6 +311,7 @@ impl ActiveItem {
         saw_delta: false,
         validated: false,
         content_length: 0,
+        incomplete: false,
     };
 }
 impl Default for ActiveItem {
@@ -318,6 +363,7 @@ pub struct Report {
     pub ir_events: usize,
     pub dropped_reasoning: usize,
     pub dropped_extensions: usize,
+    pub dropped_fields: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -359,6 +405,10 @@ struct State {
     model: Span,
     created: Option<u64>,
     usage: Usage,
+    input_base: Option<u64>,
+    input_basis: InputCount,
+    output_base: Option<u64>,
+    output_basis: OutputCount,
     aggregate_used: usize,
     aggregate_peak: usize,
     item_count: usize,
@@ -376,6 +426,10 @@ impl State {
             model: Span::EMPTY,
             created: context.created,
             usage: context.initial_usage,
+            input_base: context.initial_usage.input,
+            input_basis: context.initial_usage.input_basis,
+            output_base: context.initial_usage.output,
+            output_basis: context.initial_usage.output_basis,
             aggregate_used: 0,
             aggregate_peak: 0,
             item_count: 0,
@@ -410,14 +464,16 @@ pub struct StreamConverter<'a, 'c> {
 
 impl<'a, 'c> StreamConverter<'a, 'c> {
     pub fn new(config: StreamConfig<'c>, buffers: StreamBuffers<'a>) -> Result<Self, Error> {
+        if config.context.initial_usage.input_basis != InputCount::Total
+            || config.context.initial_usage.output_basis != OutputCount::Total
+        {
+            return Err(Error::InvalidInput {
+                field: "initial_usage basis",
+                reason: "context counters must be canonical totals",
+            });
+        }
         for format in [config.source, config.target] {
-            if format.version != Format::new(format.protocol).version
-                || format.profile != Profile::Standard
-            {
-                return Err(Error::Unsupported {
-                    feature: "stream protocol version/profile",
-                });
-            }
+            validate_format(format)?;
         }
         if buffers.checkpoints.len() < buffers.items.len() {
             return Err(Error::WorkspaceTooSmall {
@@ -923,7 +979,7 @@ trait Sink {
     fn choice(&mut self, choice: u32, reason: FinishReason) -> Result<(), Error>;
     fn finish(&mut self, completion: Completion) -> Result<(), Error>;
     fn failure(&mut self, code: Option<Text<'_>>, message: Text<'_>) -> Result<(), Error>;
-    fn extension(&mut self) -> Result<(), Error>;
+    fn extension(&mut self, field: DroppedField) -> Result<(), Error>;
     fn complete_tool(
         &mut self,
         key: Key,
@@ -932,6 +988,7 @@ trait Sink {
         arguments: Text<'_>,
     ) -> Result<(), Error>;
     fn snapshot(&mut self, key: Key, kind: BlockKind, text: Text<'_>) -> Result<(), Error>;
+    fn incomplete(&mut self, key: Key) -> Result<(), Error>;
 }
 
 // Separate mutable regions let the parser's input borrow end before its token
@@ -997,13 +1054,13 @@ fn process(
     }
     let mut emitter = encode::Emitter::new(config, Writer::new(output), state, items, aggregate);
     if path == Path::Ir {
-        let length = decode_ir_value(config.source.protocol, payload, root, events)?;
+        let length = decode_ir_value(config.source, payload, root, events)?;
         for event in &events[..length] {
             replay(*event, payload, &mut emitter)?;
         }
         emitter.state.report.ir_events = emitter.state.report.ir_events.saturating_add(length);
     } else {
-        decode::event(config.source.protocol, root, &mut emitter)?;
+        decode::event(config.source, root, &mut emitter)?;
     }
     emitter.state.report.source_events = emitter.state.report.source_events.saturating_add(1);
     let length = emitter.writer.finish()?;
@@ -1097,11 +1154,22 @@ pub fn decode_event(
     events: &mut [Event],
     limits: json::Limits,
 ) -> Result<usize, Error> {
+    decode_event_format(Format::new(protocol), payload, tokens, events, limits)
+}
+
+pub fn decode_event_format(
+    format: Format,
+    payload: &[u8],
+    tokens: &mut [Token],
+    events: &mut [Event],
+    limits: json::Limits,
+) -> Result<usize, Error> {
+    validate_format(format)?;
     let document = json::parse(payload, tokens, limits)?;
-    decode_ir_value(protocol, payload, document.root(), events)
+    decode_ir_value(format, payload, document.root(), events)
 }
 fn decode_ir_value(
-    protocol: Protocol,
+    format: Format,
     payload: &[u8],
     value: Value<'_, '_>,
     events: &mut [Event],
@@ -1111,8 +1179,23 @@ fn decode_ir_value(
         events,
         used: 0,
     };
-    decode::event(protocol, value, &mut collector)?;
+    decode::event(format, value, &mut collector)?;
     Ok(collector.used)
+}
+
+fn validate_format(format: Format) -> Result<(), Error> {
+    let profile = match format.profile {
+        Profile::Standard => true,
+        Profile::OpenAiCompatible(name) => {
+            format.protocol == Protocol::OpenAiChat && !name.is_empty()
+        }
+    };
+    if format.version != Format::new(format.protocol).version || !profile {
+        return Err(Error::Unsupported {
+            feature: "stream protocol version/profile",
+        });
+    }
+    Ok(())
 }
 
 struct Collector<'a, 'b> {
@@ -1242,9 +1325,10 @@ impl Sink for Collector<'_, '_> {
             ..Event::EMPTY
         })
     }
-    fn extension(&mut self) -> Result<(), Error> {
+    fn extension(&mut self, field: DroppedField) -> Result<(), Error> {
         self.add(Event {
             kind: EventKind::Extension,
+            extension: field,
             ..Event::EMPTY
         })
     }
@@ -1270,6 +1354,13 @@ impl Sink for Collector<'_, '_> {
             key,
             block,
             a: self.text(Some(text))?,
+            ..Event::EMPTY
+        })
+    }
+    fn incomplete(&mut self, key: Key) -> Result<(), Error> {
+        self.add(Event {
+            kind: EventKind::BlockIncomplete,
+            key,
             ..Event::EMPTY
         })
     }
@@ -1323,7 +1414,7 @@ fn replay(event: Event, payload: &[u8], sink: &mut impl Sink) -> Result<(), Erro
         EventKind::ChoiceEnd => sink.choice(event.key.choice, event.reason),
         EventKind::Finish => sink.finish(event.completion),
         EventKind::Failure => sink.failure(a, required_text(b)?),
-        EventKind::Extension => sink.extension(),
+        EventKind::Extension => sink.extension(event.extension),
         EventKind::ToolComplete => sink.complete_tool(
             event.key,
             a,
@@ -1331,6 +1422,7 @@ fn replay(event: Event, payload: &[u8], sink: &mut impl Sink) -> Result<(), Erro
             required_text(event_text(event.c, payload)?)?,
         ),
         EventKind::Snapshot => sink.snapshot(event.key, event.block, required_text(a)?),
+        EventKind::BlockIncomplete => sink.incomplete(event.key),
     }
 }
 

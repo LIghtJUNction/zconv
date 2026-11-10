@@ -58,12 +58,18 @@ impl Format {
             Protocol::GeminiInteractions => "v1",
             _ => "v1",
         };
-        Self { protocol, version, profile: Profile::Standard }
+        Self {
+            protocol,
+            version,
+            profile: Profile::Standard,
+        }
     }
 }
 
 impl From<Protocol> for Format {
-    fn from(protocol: Protocol) -> Self { Self::new(protocol) }
+    fn from(protocol: Protocol) -> Self {
+        Self::new(protocol)
+    }
 }
 
 /// Capacity `needed` is exact for completed output counts, a lower bound for
@@ -71,21 +77,54 @@ impl From<Protocol> for Format {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Error {
-    InvalidJson { offset: usize, kind: crate::json::JsonError },
-    DuplicateKey { offset: usize },
-    DepthLimitExceeded { limit: usize },
-    InputTooLarge { limit: usize },
-    WorkspaceTooSmall { needed: usize },
-    OutputTooSmall { needed: usize },
-    IrTooSmall { needed: usize },
-    LimitExceeded { kind: &'static str, limit: usize },
-    InvalidInput { field: &'static str, reason: &'static str },
-    Unsupported { feature: &'static str },
-    ContextRequired { field: &'static str },
-    DirectUnavailable { feature: &'static str },
-    PolicyViolation { feature: &'static str },
-    EventTooLarge { needed: usize },
-    TooManyActiveItems { needed: usize },
+    InvalidJson {
+        offset: usize,
+        kind: crate::json::JsonError,
+    },
+    DuplicateKey {
+        offset: usize,
+    },
+    DepthLimitExceeded {
+        limit: usize,
+    },
+    InputTooLarge {
+        limit: usize,
+    },
+    WorkspaceTooSmall {
+        needed: usize,
+    },
+    OutputTooSmall {
+        needed: usize,
+    },
+    IrTooSmall {
+        needed: usize,
+    },
+    LimitExceeded {
+        kind: &'static str,
+        limit: usize,
+    },
+    InvalidInput {
+        field: &'static str,
+        reason: &'static str,
+    },
+    Unsupported {
+        feature: &'static str,
+    },
+    ContextRequired {
+        field: &'static str,
+    },
+    DirectUnavailable {
+        feature: &'static str,
+    },
+    PolicyViolation {
+        feature: &'static str,
+    },
+    EventTooLarge {
+        needed: usize,
+    },
+    TooManyActiveItems {
+        needed: usize,
+    },
     TruncatedStream,
     AlreadyFinished,
 }

@@ -88,7 +88,7 @@ fn empty_only(value: Value<'_, '_>, name: &'static str) -> Result<(), Error> {
 }
 
 pub(super) fn event(
-    protocol: Protocol,
+    format: Format,
     value: Value<'_, '_>,
     sink: &mut impl Sink,
 ) -> Result<(), Error> {
@@ -104,9 +104,9 @@ pub(super) fn event(
             string(error, "message")?,
         );
     }
-    match protocol {
-        Protocol::OpenAiChat => chat(value, sink, false),
-        Protocol::OpenAiCompletions => chat(value, sink, true),
+    match format.protocol {
+        Protocol::OpenAiChat => chat(value, sink, false, format.profile),
+        Protocol::OpenAiCompletions => chat(value, sink, true, format.profile),
         Protocol::AnthropicMessages => anthropic(value, sink),
         Protocol::OpenAiResponses => responses(value, sink),
         Protocol::GeminiGenerateContent => google(value, sink),
@@ -114,7 +114,12 @@ pub(super) fn event(
     }
 }
 
-fn chat(value: Value<'_, '_>, sink: &mut impl Sink, legacy: bool) -> Result<(), Error> {
+fn chat(
+    value: Value<'_, '_>,
+    sink: &mut impl Sink,
+    legacy: bool,
+    profile: Profile,
+) -> Result<(), Error> {
     fields(
         value,
         &[
@@ -133,7 +138,11 @@ fn chat(value: Value<'_, '_>, sink: &mut impl Sink, legacy: bool) -> Result<(), 
             .get(name)
             .is_some_and(|value| value.kind() != Kind::Null)
         {
-            sink.extension()?;
+            sink.extension(if name == "system_fingerprint" {
+                DroppedField::SystemFingerprint
+            } else {
+                DroppedField::ServiceTier
+            })?;
         }
     }
     if let Some(usage) = value.get("usage") {
@@ -215,6 +224,11 @@ fn chat(value: Value<'_, '_>, sink: &mut impl Sink, legacy: bool) -> Result<(), 
             }
             for name in ["reasoning_content", "reasoning"] {
                 if let Some(text) = optional(delta, name)? {
+                    if !matches!(profile, Profile::OpenAiCompatible(_)) {
+                        return Err(Error::Unsupported {
+                            feature: "vendor reasoning requires OpenAiCompatible profile",
+                        });
+                    }
                     sink.delta(
                         Key {
                             choice: choice_index,
@@ -300,6 +314,16 @@ fn usage_openai(value: Value<'_, '_>, responses: bool) -> Result<Usage, Error> {
             "completion_tokens_details",
         )
     };
+    fields(
+        value,
+        &[
+            input_name,
+            output_name,
+            "total_tokens",
+            input_details,
+            output_details,
+        ],
+    )?;
     let mut usage = Usage {
         input: number(value, input_name)?,
         output: number(value, output_name)?,
@@ -307,9 +331,11 @@ fn usage_openai(value: Value<'_, '_>, responses: bool) -> Result<Usage, Error> {
         ..Usage::default()
     };
     if let Some(details) = value.get(input_details) {
+        fields(details, &["cached_tokens"])?;
         usage.cached = number(details, "cached_tokens")?;
     }
     if let Some(details) = value.get(output_details) {
+        fields(details, &["reasoning_tokens"])?;
         usage.reasoning = number(details, "reasoning_tokens")?;
     }
     Ok(usage)
@@ -329,12 +355,7 @@ fn usage_anthropic(value: Value<'_, '_>) -> Result<Usage, Error> {
             "iterations",
         ],
     )?;
-    for field in [
-        "cache_creation_input_tokens",
-        "cache_creation",
-        "server_tool_use",
-        "iterations",
-    ] {
+    for field in ["cache_creation", "server_tool_use", "iterations"] {
         if value
             .get(field)
             .is_some_and(|value| !is_null_or_empty(value) && value.as_u64() != Some(0))
@@ -348,6 +369,8 @@ fn usage_anthropic(value: Value<'_, '_>) -> Result<Usage, Error> {
         input: number(value, "input_tokens")?,
         output: number(value, "output_tokens")?,
         cached: number(value, "cache_read_input_tokens")?,
+        cache_write: number(value, "cache_creation_input_tokens")?,
+        input_basis: InputCount::Uncached,
         ..Usage::default()
     })
 }
@@ -369,12 +392,16 @@ fn usage_google(value: Value<'_, '_>, interactions: bool) -> Result<Usage, Error
             "thoughtsTokenCount",
         ]
     };
+    fields(value, &names)?;
     Ok(Usage {
         input: number(value, names[0])?,
         output: number(value, names[1])?,
         total: number(value, names[2])?,
         cached: number(value, names[3])?,
         reasoning: number(value, names[4])?,
+        cache_write: None,
+        input_basis: InputCount::Total,
+        output_basis: OutputCount::Visible,
     })
 }
 
@@ -441,6 +468,10 @@ fn anthropic(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
                 "usage",
             ],
         )?;
+        array(message, "content")?;
+        if message.get("type").is_some() && !eq(message, "type", "message") {
+            return Err(invalid("message.type"));
+        }
         if !eq(message, "role", "assistant") {
             return Err(invalid("message.role"));
         }
@@ -750,14 +781,17 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
             index: index(value, "output_index")?,
             ..Key::default()
         };
-        response_snapshot(object(value, "item")?, key.index, sink)?;
+        let item = object(value, "item")?;
+        response_snapshot(item, key.index, sink)?;
+        if eq(item, "status", "incomplete") {
+            sink.incomplete(key)?;
+        }
         return sink.close(key);
     }
     if [
         "response.completed",
         "response.incomplete",
         "response.failed",
-        "response.cancelled",
     ]
     .iter()
     .any(|name| event_type.eq_str(name))
@@ -772,9 +806,7 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
             let error = object(response, "error")?;
             return sink.failure(optional(error, "code")?, string(error, "message")?);
         }
-        let completion = if event_type.eq_str("response.cancelled") {
-            Completion::Cancelled
-        } else if event_type.eq_str("response.incomplete") {
+        let completion = if event_type.eq_str("response.incomplete") {
             Completion::Incomplete
         } else {
             Completion::Completed
@@ -796,7 +828,16 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
         sink.choice(
             0,
             if completion == Completion::Incomplete {
-                FinishReason::Length
+                let details = object(response, "incomplete_details")?;
+                if eq(details, "reason", "max_output_tokens") {
+                    FinishReason::Length
+                } else if eq(details, "reason", "content_filter") {
+                    FinishReason::Safety
+                } else {
+                    return Err(Error::Unsupported {
+                        feature: "Responses incomplete reason",
+                    });
+                }
             } else if tools {
                 FinishReason::ToolCalls
             } else {
@@ -914,6 +955,18 @@ fn google(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
         for name in ["citationMetadata", "groundingMetadata", "logprobsResult"] {
             empty_only(candidate, name)?;
         }
+        for (name, field) in [
+            ("safetyRatings", DroppedField::SafetyRatings),
+            ("finishMessage", DroppedField::FinishMessage),
+            ("avgLogprobs", DroppedField::AverageLogprobs),
+        ] {
+            if candidate
+                .get(name)
+                .is_some_and(|value| !is_null_or_empty(value))
+            {
+                sink.extension(field)?;
+            }
+        }
         let choice = number(candidate, "index")?.unwrap_or(0);
         let choice = u32::try_from(choice).map_err(|_| invalid("index"))?;
         if let Some(content) = candidate.get("content") {
@@ -962,6 +1015,11 @@ fn google(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
                         sink.signature(key, signature)?;
                     }
                 } else if let Some(function) = part.get("functionCall") {
+                    if part.get("thoughtSignature").is_some() {
+                        return Err(Error::Unsupported {
+                            feature: "Gemini function-bound signature",
+                        });
+                    }
                     fields(function, &["id", "name", "args"])?;
                     let key = Key {
                         choice,
@@ -974,6 +1032,15 @@ fn google(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
                         optional(function, "id")?,
                         string(function, "name")?,
                         Text::Utf8(arguments.raw()),
+                    )?;
+                } else if let Some(signature) = optional(part, "thoughtSignature")? {
+                    sink.signature(
+                        Key {
+                            choice,
+                            index: u32::MAX - 2,
+                            part: 0,
+                        },
+                        signature,
                     )?;
                 } else {
                     return Err(Error::Unsupported {

@@ -16,9 +16,20 @@ pub fn validate_format(format: Format) -> Result<(), Error> {
         Protocol::GeminiInteractions => format.version == "v1",
         _ => format.version == "v1",
     };
-    if !version { return Err(Error::Unsupported { feature: "protocol version" }); }
-    if !matches!(format.profile, Profile::Standard) && !matches!(format.protocol, Protocol::OpenAiChat | Protocol::OpenAiResponses | Protocol::OpenAiCompletions) {
-        return Err(Error::Unsupported { feature: "profile is only defined for OpenAI-compatible protocols" });
+    if !version {
+        return Err(Error::Unsupported {
+            feature: "protocol version",
+        });
+    }
+    if !matches!(format.profile, Profile::Standard)
+        && !matches!(
+            format.protocol,
+            Protocol::OpenAiChat | Protocol::OpenAiResponses | Protocol::OpenAiCompletions
+        )
+    {
+        return Err(Error::Unsupported {
+            feature: "profile is only defined for OpenAI-compatible protocols",
+        });
     }
     Ok(())
 }

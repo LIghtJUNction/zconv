@@ -41,6 +41,10 @@ fn context() -> Context<'static> {
         max_tokens: Some(100),
         response_id: Some("response_1"),
         item_ids: &["msg_0", "msg_1"],
+        tool_calls: &[zconv::ir::ToolBinding {
+            id: "legacy_call",
+            name: "legacy",
+        }],
         ..Context::default()
     }
 }
@@ -176,7 +180,7 @@ fn applicability_checks_precede_output_and_are_narrow() {
         ),
         Err(Error::DirectUnavailable { .. })
     ));
-    let input = br#"{"model":"m","messages":[{"role":"user","content":"x"}],"tools":[{"type":"function","function":{"name":"f","parameters":{}}}]}"#;
+    let input = br#"{"model":"m","messages":[{"role":"user","content":"x"}],"tools":[{"type":"web_search"}]}"#;
     assert!(matches!(
         run(
             OpenAiChat,
@@ -256,7 +260,7 @@ fn supported_wire_validation_rejects_malformed_values_without_ir() {
 
 #[test]
 fn unsupported_features_do_not_write_output() {
-    let input = br#"{"model":"m","messages":[{"role":"user","content":"x"}],"tools":[]}"#;
+    let input = br#"{"model":"m","messages":[{"role":"user","content":"x"}],"tools":[{"type":"web_search"}]}"#;
     let mut tokens = [json::Token::EMPTY; 64];
     let document = json::parse(input, &mut tokens, json::Limits::default()).unwrap();
     let mut output = [0xaa; 512];
@@ -384,15 +388,18 @@ fn semantic(protocol: Protocol, operation: Operation, bytes: &[u8]) -> Vec<Strin
     let document = json::parse(bytes, &mut tokens, json::Limits::default()).unwrap();
     let mut records = vec![Record::EMPTY; 128];
     let mut result = Vec::new();
-    let used;
-    match operation {
+    let used = match operation {
         Operation::Request => {
             let request =
                 zconv::protocol::decode_request(protocol.into(), document.root(), &mut records)
                     .unwrap();
             result.push(presence_text(request.model));
             result.push(format!("{:?}", request.parameters));
-            used = request.records.len();
+            result.push(format!(
+                "tools:{:?}|functions:{:?}|choice:{:?}",
+                request.tools, request.functions, request.tool_choice
+            ));
+            request.records.len()
         }
         Operation::Response => {
             let response =
@@ -404,9 +411,9 @@ fn semantic(protocol: Protocol, operation: Operation, bytes: &[u8]) -> Vec<Strin
                 "{:?}|{:?}|{:?}",
                 response.created, response.status, response.usage
             ));
-            used = response.records.len();
+            response.records.len()
         }
-    }
+    };
     for record in &records[..used] {
         match record {
             Record::Message(message) => result.push(format!(
@@ -523,6 +530,269 @@ fn direct_and_ir_preserve_the_same_request_semantics() {
             String::from_utf8_lossy(&ir.0)
         );
         assert_eq!((direct.1, direct.2), (ir.1, ir.2));
+    }
+}
+
+#[test]
+fn function_definitions_and_choices_have_direct_ir_parity() {
+    use Protocol::*;
+    let fixtures = [
+        (OpenAiChat, OpenAiResponses, br#"{"model":"m","messages":[{"role":"user","content":"weather"}],"tools":[{"type":"function","function":{"name":"weather","description":"Weather \u4e2d","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]},"strict":true}}],"tool_choice":{"type":"function","function":{"name":"weather"}},"parallel_tool_calls":false}"#.as_slice()),
+        (OpenAiChat, OpenAiResponses, br#"{"model":"m","messages":[],"functions":[{"name":"legacy","description":null}],"function_call":{"name":"legacy"}}"#),
+        (OpenAiChat, OpenAiResponses, br#"{"model":"m","messages":[],"tools":[{"type":"function","function":{"name":"f","parameters":null,"description":null,"strict":null}}],"tool_choice":null}"#),
+        (OpenAiChat, OpenAiResponses, br#"{"model":"m","messages":[],"tools":[{"type":"function","function":{"name":"f","strict":false}}],"tool_choice":"none"}"#),
+        (OpenAiChat, OpenAiResponses, br#"{"model":"m","messages":[],"tools":[]}"#),
+        (OpenAiChat, OpenAiResponses, br#"{"model":"m","messages":[],"tools":null}"#),
+        (OpenAiChat, OpenAiResponses, br#"{"model":"m","messages":[],"functions":[]}"#),
+        (OpenAiResponses, OpenAiChat, br#"{"model":"m","input":"weather","tools":[{"type":"function","name":"weather","parameters":{"type":"object"},"strict":true}],"tool_choice":{"type":"function","name":"weather"},"parallel_tool_calls":true}"#),
+        (OpenAiResponses, OpenAiChat, br#"{"model":"m","input":[],"tools":[{"type":"function","name":"f","description":null,"parameters":null,"strict":false}],"tool_choice":"required"}"#),
+        (OpenAiResponses, OpenAiChat, br#"{"model":"m","input":[],"tools":[],"tool_choice":"auto"}"#),
+        (OpenAiResponses, OpenAiChat, br#"{"model":"m","input":[],"tools":null,"tool_choice":null}"#),
+    ];
+    for (source, target, input) in fixtures {
+        let direct = routed(
+            source,
+            target,
+            Operation::Request,
+            input,
+            zconv::Strategy::Direct,
+        );
+        let ir = routed(
+            source,
+            target,
+            Operation::Request,
+            input,
+            zconv::Strategy::Ir,
+        );
+        assert_eq!(
+            semantic(target, Operation::Request, &direct.0),
+            semantic(target, Operation::Request, &ir.0),
+            "{source:?}->{target:?}\nDirect={}\nIR={}",
+            String::from_utf8_lossy(&direct.0),
+            String::from_utf8_lossy(&ir.0)
+        );
+    }
+}
+
+#[test]
+fn function_call_and_result_history_have_direct_ir_parity() {
+    use Protocol::*;
+    let fixtures = [
+        (OpenAiChat, OpenAiResponses, br#"{"model":"m","messages":[{"role":"user","content":"weather"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"weather","arguments":"{\"city\":\"\\u4e2d\\ud83d\\ude00\"}"}}]},{"role":"tool","tool_call_id":"call_1","content":"{\"ok\":true}"}]}"#.as_slice()),
+        (OpenAiChat, OpenAiResponses, br#"{"model":"m","messages":[{"role":"assistant","content":"check both","tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{}"}},{"id":"call_2","type":"function","function":{"name":"g","arguments":"{\"x\":1}"}}]},{"role":"tool","tool_call_id":"call_2","content":"2"},{"role":"tool","tool_call_id":"call_1","content":"1"}]}"#),
+        (OpenAiChat, OpenAiResponses, br#"{"model":"m","messages":[{"role":"assistant","function_call":{"name":"legacy","arguments":"{\"quoted\":\"a\\\"b\"}"}},{"role":"function","name":"legacy","content":"done"}]}"#),
+        (OpenAiChat, OpenAiResponses, br#"{"model":"m","messages":[{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"model produced invalid JSON {"}}]}]}"#),
+        (OpenAiResponses, OpenAiChat, br#"{"model":"m","input":[{"role":"user","content":"weather"},{"type":"function_call","call_id":"call_1","name":"weather","arguments":"{\"city\":\"\\u4e2d\"}"},{"type":"function_call_output","call_id":"call_1","output":"sunny"}]}"#),
+        (OpenAiResponses, OpenAiChat, br#"{"model":"m","input":[{"type":"function_call","id":"fc_1","status":"completed","call_id":"call_1","name":"f","arguments":"{}"},{"type":"function_call_output","id":"out_1","status":"completed","call_id":"call_1","output":"done"}]}"#),
+    ];
+    for (source, target, input) in fixtures {
+        let direct = routed(
+            source,
+            target,
+            Operation::Request,
+            input,
+            zconv::Strategy::Direct,
+        );
+        let ir = routed(
+            source,
+            target,
+            Operation::Request,
+            input,
+            zconv::Strategy::Ir,
+        );
+        assert_eq!(
+            semantic(target, Operation::Request, &direct.0),
+            semantic(target, Operation::Request, &ir.0),
+            "{source:?}->{target:?}\nDirect={}\nIR={}",
+            String::from_utf8_lossy(&direct.0),
+            String::from_utf8_lossy(&ir.0)
+        );
+        assert_eq!((direct.1, direct.2), (ir.1, ir.2));
+    }
+}
+
+#[test]
+fn tool_history_requires_real_ids_and_preserves_argument_string_bytes() {
+    use Protocol::*;
+    let legacy = br#"{"model":"m","messages":[{"role":"assistant","function_call":{"name":"missing","arguments":"{}"}}]}"#;
+    assert_eq!(
+        run(
+            OpenAiChat,
+            OpenAiResponses,
+            Operation::Request,
+            legacy,
+            Context::default(),
+            Policy::default()
+        )
+        .unwrap_err(),
+        Error::ContextRequired {
+            field: "tool call ID"
+        }
+    );
+    let context = Context {
+        tool_calls: &[
+            zconv::ir::ToolBinding {
+                id: "a",
+                name: "missing",
+            },
+            zconv::ir::ToolBinding {
+                id: "b",
+                name: "missing",
+            },
+        ],
+        ..Context::default()
+    };
+    assert_eq!(
+        run(
+            OpenAiChat,
+            OpenAiResponses,
+            Operation::Request,
+            legacy,
+            context,
+            Policy::default()
+        )
+        .unwrap_err(),
+        Error::ContextRequired {
+            field: "unambiguous tool call ID"
+        }
+    );
+    let wrong_role = br#"{"model":"m","messages":[{"role":"user","content":"x","tool_calls":[{"id":"a","type":"function","function":{"name":"f","arguments":"{}"}}]}]}"#;
+    assert!(matches!(
+        run(
+            OpenAiChat,
+            OpenAiResponses,
+            Operation::Request,
+            wrong_role,
+            Context::default(),
+            Policy::default()
+        ),
+        Err(Error::InvalidInput {
+            field: "tool_calls",
+            ..
+        })
+    ));
+    let source = br#"{"model":"m","messages":[{"role":"assistant","tool_calls":[{"id":"call_exact","type":"function","function":{"name":"f","arguments":"{\"text\":\"\\u4e2d\\n\"}"}}]}]}"#;
+    let (out, _) = run(
+        OpenAiChat,
+        OpenAiResponses,
+        Operation::Request,
+        source,
+        Context::default(),
+        Policy::default(),
+    )
+    .unwrap();
+    let mut before_tokens = [json::Token::EMPTY; 64];
+    let mut after_tokens = [json::Token::EMPTY; 64];
+    let before = json::parse(source, &mut before_tokens, json::Limits::default()).unwrap();
+    let after = json::parse(&out, &mut after_tokens, json::Limits::default()).unwrap();
+    let call = before
+        .root()
+        .get("messages")
+        .unwrap()
+        .array()
+        .next()
+        .unwrap()
+        .get("tool_calls")
+        .unwrap()
+        .array()
+        .next()
+        .unwrap();
+    let item = after.root().get("input").unwrap().array().next().unwrap();
+    assert_eq!(
+        item.get("call_id").unwrap().raw(),
+        call.get("id").unwrap().raw()
+    );
+    assert_eq!(
+        item.get("arguments").unwrap().raw(),
+        call.get("function")
+            .unwrap()
+            .get("arguments")
+            .unwrap()
+            .raw()
+    );
+}
+
+#[test]
+fn tool_strict_defaults_are_resolved_without_changing_provider_semantics() {
+    use Protocol::*;
+    for (strict, expected) in [
+        ("", false),
+        (",\"strict\":null", false),
+        (",\"strict\":false", false),
+        (",\"strict\":true", true),
+    ] {
+        let input = format!(
+            r#"{{"model":"m","messages":[],"tools":[{{"type":"function","function":{{"name":"f","parameters":{{"type":"object","properties":{{}},"additionalProperties":false,"required":[]}}{strict}}}}}]}}"#
+        );
+        let direct = routed(
+            OpenAiChat,
+            OpenAiResponses,
+            Operation::Request,
+            input.as_bytes(),
+            zconv::Strategy::Direct,
+        );
+        let ir = routed(
+            OpenAiChat,
+            OpenAiResponses,
+            Operation::Request,
+            input.as_bytes(),
+            zconv::Strategy::Ir,
+        );
+        assert_eq!(
+            semantic(OpenAiResponses, Operation::Request, &direct.0),
+            semantic(OpenAiResponses, Operation::Request, &ir.0)
+        );
+        let mut tokens = [json::Token::EMPTY; 128];
+        let document = json::parse(&direct.0, &mut tokens, json::Limits::default()).unwrap();
+        assert_eq!(
+            document
+                .root()
+                .get("tools")
+                .unwrap()
+                .array()
+                .next()
+                .unwrap()
+                .get("strict")
+                .unwrap()
+                .as_bool(),
+            Some(expected)
+        );
+    }
+    for strict in ["", ",\"strict\":null"] {
+        let input = format!(
+            r#"{{"model":"m","input":[],"tools":[{{"type":"function","name":"f","parameters":{{}}{strict}}}]}}"#
+        );
+        for strategy in [zconv::Strategy::Direct, zconv::Strategy::Ir] {
+            let mut tokens = [json::Token::EMPTY; 128];
+            let mut records = [Record::EMPTY; 32];
+            let mut output = [0; 1024];
+            let result = zconv::convert(
+                OpenAiResponses.into(),
+                OpenAiChat.into(),
+                Operation::Request,
+                input.as_bytes(),
+                &mut output,
+                zconv::Options {
+                    strategy,
+                    ..zconv::Options::default()
+                },
+                zconv::Workspace {
+                    tokens: &mut tokens,
+                    records: &mut records,
+                    scratch: &mut [],
+                    nested_tokens: &mut [],
+                },
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::ContextRequired {
+                        field: "resolved tool strict mode"
+                    })
+                ),
+                "{strategy:?}: {result:?}"
+            );
+        }
     }
 }
 

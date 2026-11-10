@@ -6,7 +6,10 @@
 //! replacement. Validated raw fragments borrow input only; the token tape can
 //! be reused immediately after decoding.
 
-use crate::{json::{JsonString, RawValue}, Format};
+use crate::{
+    json::{JsonString, RawValue},
+    Format,
+};
 
 /// Missing, explicit null, and present values are distinct states.
 #[derive(Clone, Copy, Debug, Default)]
@@ -18,9 +21,19 @@ pub enum Presence<T> {
 }
 
 impl<T> Presence<T> {
-    pub const fn is_missing(&self) -> bool { matches!(self, Self::Missing) }
-    pub const fn is_null(&self) -> bool { matches!(self, Self::Null) }
-    pub fn value(self) -> Option<T> { if let Self::Value(v) = self { Some(v) } else { None } }
+    pub const fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+    pub const fn is_null(&self) -> bool {
+        matches!(self, Self::Null)
+    }
+    pub fn value(self) -> Option<T> {
+        if let Self::Value(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
 }
 
 /// An unchanged wire string or caller-provided replacement text.
@@ -32,13 +45,22 @@ pub enum Text<'a> {
 
 impl<'a> Text<'a> {
     pub fn eq_str(self, s: &str) -> bool {
-        match self { Self::Json(v) => v.eq_str(s), Self::Utf8(v) => v == s }
+        match self {
+            Self::Json(v) => v.eq_str(s),
+            Self::Utf8(v) => v == s,
+        }
     }
     pub fn as_str(self) -> Option<&'a str> {
-        match self { Self::Json(v) => v.as_str(), Self::Utf8(v) => Some(v) }
+        match self {
+            Self::Json(v) => v.as_str(),
+            Self::Utf8(v) => Some(v),
+        }
     }
     pub fn decoded_len(self) -> usize {
-        match self { Self::Json(v) => v.decoded_len(), Self::Utf8(v) => v.len() }
+        match self {
+            Self::Json(v) => v.decoded_len(),
+            Self::Utf8(v) => v.len(),
+        }
     }
 }
 
@@ -51,7 +73,10 @@ pub enum Number<'a> {
 
 impl Number<'_> {
     pub fn as_u64(self) -> Option<u64> {
-        match self { Self::Json(v) => v.as_u64(), Self::Unsigned(v) => Some(v) }
+        match self {
+            Self::Json(v) => v.as_u64(),
+            Self::Unsigned(v) => Some(v),
+        }
     }
 }
 
@@ -66,13 +91,29 @@ pub enum Data<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Role { System, Developer, User, Assistant, Tool }
+pub enum Role {
+    System,
+    Developer,
+    User,
+    Assistant,
+    Tool,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ContentShape { Missing, Null, String, Array }
+pub enum ContentShape {
+    Missing,
+    Null,
+    String,
+    Array,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MediaKind { Image, Audio, File, Video }
+pub enum MediaKind {
+    Image,
+    Audio,
+    File,
+    Video,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum MediaSource<'a> {
@@ -91,10 +132,21 @@ pub struct Media<'a> {
     pub filename: Presence<Text<'a>>,
 }
 
+/// A provider thought and a public reasoning summary have different semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReasoningKind {
+    Thought,
+    Summary,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Content<'a> {
     Text(Text<'a>),
-    Reasoning { text: Presence<Text<'a>>, signature: Presence<Text<'a>> },
+    Reasoning {
+        kind: ReasoningKind,
+        text: Presence<Text<'a>>,
+        signature: Presence<Text<'a>>,
+    },
     Refusal(Text<'a>),
     Media(Media<'a>),
     ToolCall {
@@ -110,13 +162,21 @@ pub enum Content<'a> {
         is_error: Presence<bool>,
     },
     /// A source-owned block that has no declared cross-protocol representation.
-    Opaque { source: Format, value: RawValue<'a> },
+    Opaque {
+        source: Format,
+        value: RawValue<'a>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Span { pub start: usize, pub end: usize }
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+}
 
-impl Span { pub const EMPTY: Self = Self { start: 0, end: 0 }; }
+impl Span {
+    pub const EMPTY: Self = Self { start: 0, end: 0 };
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Message<'a> {
@@ -167,7 +227,19 @@ pub enum ToolChoice<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Finish { Missing, Null, Stop, Length, ToolCalls, Safety, Refusal, Error, Cancelled, InProgress, Other }
+pub enum Finish {
+    Missing,
+    Null,
+    Stop,
+    Length,
+    ToolCalls,
+    Safety,
+    Refusal,
+    Error,
+    Cancelled,
+    InProgress,
+    Other,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Choice<'a> {
@@ -193,9 +265,16 @@ impl Extension<'_> {
     /// Empty standard annotation lists carry no annotation to translate. Their
     /// presence is retained in the IR and restored for the original format.
     pub fn is_empty_annotation(&self) -> bool {
-        self.location == "content" && self.key.eq_str("annotations")
+        self.location == "content"
+            && self.key.eq_str("annotations")
             && self.value.kind() == crate::json::Kind::Array
-            && self.value.raw().iter().filter(|b| !b.is_ascii_whitespace()).copied().eq(b"[]".iter().copied())
+            && self
+                .value
+                .raw()
+                .iter()
+                .filter(|b| !b.is_ascii_whitespace())
+                .copied()
+                .eq(b"[]".iter().copied())
     }
 }
 
@@ -210,8 +289,14 @@ pub enum Record<'a> {
     Extension(Extension<'a>),
 }
 
-impl Record<'_> { pub const EMPTY: Self = Self::Empty; }
-impl Default for Record<'_> { fn default() -> Self { Self::EMPTY } }
+impl Record<'_> {
+    pub const EMPTY: Self = Self::Empty;
+}
+impl Default for Record<'_> {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Parameters<'a> {
@@ -230,7 +315,10 @@ pub struct Parameters<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct ContextRef<'a> { pub source: Format, pub id: Text<'a> }
+pub struct ContextRef<'a> {
+    pub source: Format,
+    pub id: Text<'a>,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct OutputConstraint<'a> {
@@ -244,7 +332,12 @@ pub struct OutputConstraint<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OutputMode { Text, JsonObject, JsonSchema, Opaque }
+pub enum OutputMode {
+    Text,
+    JsonObject,
+    JsonSchema,
+    Opaque,
+}
 
 /// Separate request header; no response-only fields are present.
 pub struct Request<'a, 's> {
@@ -252,6 +345,7 @@ pub struct Request<'a, 's> {
     pub model: Presence<Text<'a>>,
     pub tools: Presence<()>,
     pub functions: Presence<()>,
+    pub instruction_presence: Presence<()>,
     pub parameters: Parameters<'a>,
     pub tool_choice: ToolChoice<'a>,
     pub context: Presence<ContextRef<'a>>,
@@ -262,7 +356,9 @@ pub struct Request<'a, 's> {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Usage<'a> {
+    /// Inclusive prompt count, including cache reads and cache writes.
     pub input_tokens: Presence<Number<'a>>,
+    /// Inclusive generated count, including reasoning/thought tokens.
     pub output_tokens: Presence<Number<'a>>,
     pub total_tokens: Presence<Number<'a>>,
     pub cached_tokens: Presence<Number<'a>>,
@@ -343,9 +439,16 @@ pub const METADATA_ISO_UPDATED: u32 = 16;
 #[derive(Clone, Copy, Debug)]
 pub enum Loss<'a> {
     Extension(Extension<'a>),
-    Reasoning { record: usize },
-    Context { source: Format },
-    Metadata { field: &'static str, record: Option<usize> },
+    Reasoning {
+        record: usize,
+    },
+    Context {
+        source: Format,
+    },
+    Metadata {
+        field: &'static str,
+        record: Option<usize>,
+    },
 }
 
 pub struct Losses<'r, 'a> {
@@ -362,31 +465,58 @@ pub struct Losses<'r, 'a> {
 impl<'r, 'a> Iterator for Losses<'r, 'a> {
     type Item = Loss<'a>;
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(source) = self.context.take() { return Some(Loss::Context { source }); }
+        if let Some(source) = self.context.take() {
+            return Some(Loss::Context { source });
+        }
         loop {
             if self.pending_metadata != 0 {
                 let bit = 1u32 << self.pending_metadata.trailing_zeros();
                 self.pending_metadata &= !bit;
-                let field = match bit { METADATA_CREATED => "created", METADATA_ITEM_ID => "item.id", METADATA_ITEM_STATUS => "item.status", METADATA_ISO_CREATED => "created (ISO 8601)", _ => "updated (ISO 8601)" };
-                return Some(Loss::Metadata { field, record: self.pending_record });
+                let field = match bit {
+                    METADATA_CREATED => "created",
+                    METADATA_ITEM_ID => "item.id",
+                    METADATA_ITEM_STATUS => "item.status",
+                    METADATA_ISO_CREATED => "created (ISO 8601)",
+                    _ => "updated (ISO 8601)",
+                };
+                return Some(Loss::Metadata {
+                    field,
+                    record: self.pending_record,
+                });
             }
-            if let Some(record) = self.pending_reasoning.take() { return Some(Loss::Reasoning { record }); }
+            if let Some(record) = self.pending_reasoning.take() {
+                return Some(Loss::Reasoning { record });
+            }
             let record = self.records.get(self.at)?;
             let index = self.at;
             self.at += 1;
             let (id, status) = match record {
                 Record::Block(b) => {
-                    if matches!(b.content, Content::Reasoning { .. }) && self.policy.drop_reasoning { self.pending_reasoning = Some(index); }
+                    if matches!(b.content, Content::Reasoning { .. }) && self.policy.drop_reasoning
+                    {
+                        self.pending_reasoning = Some(index);
+                    }
                     (b.item_id, b.item_status)
                 }
                 Record::Message(m) => (m.item_id, m.item_status),
-                Record::Extension(e) if e.source != self.target && self.policy.drop_extensions && !e.is_empty_annotation() => return Some(Loss::Extension(*e)),
+                Record::Extension(e)
+                    if e.source != self.target
+                        && self.policy.drop_extensions
+                        && !e.is_empty_annotation() =>
+                {
+                    return Some(Loss::Extension(*e))
+                }
                 _ => (Presence::Missing, Presence::Missing),
             };
-            if self.target.protocol != crate::Protocol::OpenAiResponses && self.policy.drop_metadata {
+            if self.target.protocol != crate::Protocol::OpenAiResponses && self.policy.drop_metadata
+            {
                 self.pending_record = Some(index);
-                if !id.is_missing() { self.pending_metadata |= METADATA_ITEM_ID; }
-                if !status.is_missing() { self.pending_metadata |= METADATA_ITEM_STATUS; }
+                if !id.is_missing() {
+                    self.pending_metadata |= METADATA_ITEM_ID;
+                }
+                if !status.is_missing() {
+                    self.pending_metadata |= METADATA_ITEM_STATUS;
+                }
             }
         }
     }
@@ -399,7 +529,16 @@ impl<'a> Request<'a, '_> {
             Presence::Null if self.source != target && policy.drop_context => Some(self.source),
             _ => None,
         };
-        Losses { records: self.records, target, policy, at: 0, context, pending_metadata: 0, pending_record: None, pending_reasoning: None }
+        Losses {
+            records: self.records,
+            target,
+            policy,
+            at: 0,
+            context,
+            pending_metadata: 0,
+            pending_record: None,
+            pending_reasoning: None,
+        }
     }
 }
 
@@ -407,12 +546,33 @@ impl<'a> Response<'a, '_> {
     pub fn losses(&self, target: Format, policy: Policy) -> Losses<'_, 'a> {
         let mut pending_metadata = 0;
         if policy.drop_metadata {
-            if !matches!(target.protocol, crate::Protocol::OpenAiChat | crate::Protocol::OpenAiResponses | crate::Protocol::OpenAiCompletions) && !self.created.is_missing() { pending_metadata |= METADATA_CREATED; }
+            if !matches!(
+                target.protocol,
+                crate::Protocol::OpenAiChat
+                    | crate::Protocol::OpenAiResponses
+                    | crate::Protocol::OpenAiCompletions
+            ) && !self.created.is_missing()
+            {
+                pending_metadata |= METADATA_CREATED;
+            }
             if target.protocol != crate::Protocol::GeminiInteractions {
-                if !self.created_iso.is_missing() { pending_metadata |= METADATA_ISO_CREATED; }
-                if !self.updated_iso.is_missing() { pending_metadata |= METADATA_ISO_UPDATED; }
+                if !self.created_iso.is_missing() {
+                    pending_metadata |= METADATA_ISO_CREATED;
+                }
+                if !self.updated_iso.is_missing() {
+                    pending_metadata |= METADATA_ISO_UPDATED;
+                }
             }
         }
-        Losses { records: self.records, target, policy, at: 0, context: None, pending_metadata, pending_record: None, pending_reasoning: None }
+        Losses {
+            records: self.records,
+            target,
+            policy,
+            at: 0,
+            context: None,
+            pending_metadata,
+            pending_record: None,
+            pending_reasoning: None,
+        }
     }
 }

@@ -3,7 +3,8 @@
 //! These paths do not construct request, response, or content IR records. Their
 //! applicability scan covers every field they consume; features outside this
 //! finite subset return `DirectUnavailable` before writing output. Rich content,
-//! provider extensions, and tools remain available through the semantic IR path.
+//! provider extensions remain available through the semantic IR path. OpenAI
+//! Chat/Responses additionally have direct function-tool request conversion.
 
 use crate::ir::{
     Context, EncodeReport, Policy, Presence, Text, METADATA_CREATED, METADATA_ITEM_ID,
@@ -74,7 +75,14 @@ fn request_scalars(root: V<'_, '_>, source: Protocol, target: Protocol) -> Resul
         if parameters.kind() != Kind::Object {
             return Err(invalid("generation config", "expected an object"));
         }
-        for field in ["temperature", "top_p", "topP"] {
+        for field in [
+            "temperature",
+            if source == Protocol::GeminiGenerateContent {
+                "topP"
+            } else {
+                "top_p"
+            },
+        ] {
             if let Some(value) = parameters.get(field) {
                 if !value.is_null() && value.kind() != Kind::Number {
                     return Err(invalid(field, "expected number"));
@@ -89,12 +97,13 @@ fn request_scalars(root: V<'_, '_>, source: Protocol, target: Protocol) -> Resul
                 }
             }
         }
-        for field in [
-            "max_tokens",
-            "max_completion_tokens",
-            "max_output_tokens",
-            "maxOutputTokens",
-        ] {
+        let maximum_fields: &[&str] = match source {
+            Protocol::OpenAiChat => &["max_tokens", "max_completion_tokens"],
+            Protocol::OpenAiResponses => &["max_output_tokens"],
+            Protocol::GeminiGenerateContent => &["maxOutputTokens"],
+            _ => &["max_tokens"],
+        };
+        for &field in maximum_fields {
             if let Some(value) = parameters.get(field) {
                 if !value.is_null() && !integer(value) {
                     return Err(invalid(field, "expected unsigned integer"));
@@ -109,7 +118,11 @@ fn request_scalars(root: V<'_, '_>, source: Protocol, target: Protocol) -> Resul
                 }
             }
         }
-        for field in ["stop", "stop_sequences", "stopSequences"] {
+        for field in [match source {
+            Protocol::AnthropicMessages => "stop_sequences",
+            Protocol::GeminiGenerateContent => "stopSequences",
+            _ => "stop",
+        }] {
             if let Some(value) = parameters.get(field) {
                 match value.kind() {
                     Kind::String if field == "stop" => {}
@@ -131,12 +144,20 @@ fn request_scalars(root: V<'_, '_>, source: Protocol, target: Protocol) -> Resul
             }
         }
     }
-    if let Some(value) = root.get("stream") {
-        if !value.is_null() && value.as_bool().is_none() {
-            return Err(invalid("stream", "expected boolean"));
+    for field in ["stream", "parallel_tool_calls"] {
+        if source == Protocol::GeminiGenerateContent
+            || (field == "parallel_tool_calls"
+                && !matches!(source, Protocol::OpenAiChat | Protocol::OpenAiResponses))
+        {
+            continue;
         }
-        if value.is_null() && target == Protocol::AnthropicMessages {
-            return Err(unavailable("null stream setting"));
+        if let Some(value) = root.get(field) {
+            if !value.is_null() && value.as_bool().is_none() {
+                return Err(invalid(field, "expected boolean"));
+            }
+            if value.is_null() && target == Protocol::AnthropicMessages {
+                return Err(unavailable("null stream setting"));
+            }
         }
     }
     if source == Protocol::AnthropicMessages && !root.get("max_tokens").is_some_and(integer) {
@@ -219,6 +240,12 @@ pub fn convert<'a>(
 ) -> Result<EncodeReport<'a>, Error> {
     crate::protocol::validate_format(source)?;
     crate::protocol::validate_format(target)?;
+    if context.tool_calls.len() > 64 {
+        return Err(Error::LimitExceeded {
+            kind: "external tool bindings",
+            limit: 64,
+        });
+    }
     if source.profile != Profile::Standard
         || target.profile != Profile::Standard
         || source.version != Format::new(source.protocol).version
@@ -240,7 +267,14 @@ pub fn convert<'a>(
         return Err(unavailable("conversion direction"));
     }
     match operation {
-        Operation::Request => request(source.protocol, target.protocol, root, context, output),
+        Operation::Request => request(
+            source.protocol,
+            target.protocol,
+            root,
+            context,
+            policy,
+            output,
+        ),
         Operation::Response => response(
             source.protocol,
             target.protocol,
@@ -250,6 +284,505 @@ pub fn convert<'a>(
             output,
         ),
     }
+}
+
+fn check_function_definition(
+    definition: V<'_, '_>,
+    source: Protocol,
+    legacy: bool,
+) -> Result<(), Error> {
+    let named = if source == Protocol::OpenAiChat && !legacy {
+        keys(definition, &["type", "function"])?;
+        if !string(required(definition, "type")?, "type")?.eq_str("function") {
+            return Err(unavailable("non-function tool definition"));
+        }
+        required(definition, "function")?
+    } else {
+        definition
+    };
+    if source == Protocol::OpenAiResponses {
+        keys(
+            named,
+            &["type", "name", "description", "parameters", "strict"],
+        )?;
+        if !string(required(named, "type")?, "type")?.eq_str("function") {
+            return Err(unavailable("non-function tool definition"));
+        }
+    } else {
+        keys(named, &["name", "description", "parameters", "strict"])?;
+    }
+    string(required(named, "name")?, "name")?;
+    if let Some(value) = named.get("description") {
+        if !value.is_null() {
+            string(value, "description")?;
+        }
+    }
+    if let Some(value) = named.get("parameters") {
+        if !value.is_null() && value.kind() != Kind::Object {
+            return Err(invalid("parameters", "expected object"));
+        }
+    }
+    if let Some(value) = named.get("strict") {
+        if !value.is_null() && value.as_bool().is_none() {
+            return Err(invalid("strict", "expected boolean"));
+        }
+    }
+    if source == Protocol::OpenAiResponses && named.get("strict").map_or(true, Value::is_null) {
+        // Responses can normalize schemas when strictness is implicit; Chat
+        // cannot reproduce that provider operation by merely omitting a flag.
+        return Err(Error::ContextRequired {
+            field: "resolved tool strict mode",
+        });
+    }
+    Ok(())
+}
+
+fn check_tools(root: V<'_, '_>, source: Protocol) -> Result<(), Error> {
+    if root.get("tools").is_some() && root.get("functions").is_some() {
+        return Err(unavailable("simultaneous tool definition spellings"));
+    }
+    for field in ["tools", "functions"] {
+        if let Some(list) = root.get(field) {
+            if list.is_null() && field == "tools" {
+                continue;
+            }
+            array(list, field)?;
+            for definition in list.array() {
+                check_function_definition(definition, source, field == "functions")?;
+            }
+        }
+    }
+    if root.get("tool_choice").is_some() && root.get("function_call").is_some() {
+        return Err(unavailable("simultaneous tool choice spellings"));
+    }
+    if let Some(value) = root
+        .get("tool_choice")
+        .or_else(|| root.get("function_call"))
+    {
+        if value.is_null() {
+            return Ok(());
+        }
+        if let Some(choice) = value.as_string() {
+            if ["auto", "none", "required"]
+                .iter()
+                .any(|name| choice.eq_str(name))
+            {
+                return Ok(());
+            }
+            return Err(unavailable("tool choice mode"));
+        }
+        if source == Protocol::OpenAiResponses {
+            keys(value, &["type", "name"])?;
+            if !string(required(value, "type")?, "type")?.eq_str("function") {
+                return Err(unavailable("tool choice type"));
+            }
+            string(required(value, "name")?, "name")?;
+        } else if root.get("function_call").is_some() {
+            keys(value, &["name"])?;
+            string(required(value, "name")?, "name")?;
+        } else {
+            keys(value, &["type", "function"])?;
+            if !string(required(value, "type")?, "type")?.eq_str("function") {
+                return Err(unavailable("tool choice type"));
+            }
+            let function = required(value, "function")?;
+            keys(function, &["name"])?;
+            string(required(function, "name")?, "name")?;
+        }
+    }
+    Ok(())
+}
+
+fn write_function_definition(
+    writer: &mut Writer<'_>,
+    definition: V<'_, '_>,
+    source: Protocol,
+    target: Protocol,
+    legacy: bool,
+) {
+    let definition = if source == Protocol::OpenAiChat && !legacy {
+        definition.get("function").unwrap_or(definition)
+    } else {
+        definition
+    };
+    writer.raw(if target == Protocol::OpenAiChat {
+        b"{\"type\":\"function\",\"function\":{\"name\":"
+    } else {
+        b"{\"type\":\"function\",\"name\":"
+    });
+    if let Some(name) = definition.get("name") {
+        writer.raw(name.raw());
+    }
+    for field in ["description", "parameters"] {
+        copy(writer, definition, field, field.as_bytes());
+    }
+    if source == Protocol::OpenAiChat
+        && target == Protocol::OpenAiResponses
+        && definition.get("strict").map_or(true, Value::is_null)
+    {
+        // Preserve Chat's non-strict default across Responses' different default.
+        writer.raw(b",\"strict\":false");
+    } else {
+        copy(writer, definition, "strict", b"strict");
+    }
+    if target == Protocol::OpenAiChat {
+        writer.byte(b'}');
+    }
+    writer.byte(b'}');
+}
+
+fn write_tools(writer: &mut Writer<'_>, root: V<'_, '_>, source: Protocol, target: Protocol) {
+    let modern = root.get("tools");
+    let legacy = root.get("functions");
+    if modern.is_some() || legacy.is_some() {
+        property(writer, b"tools");
+        if modern.is_some_and(Value::is_null) && legacy.is_none() {
+            writer.raw(b"null");
+        } else {
+            writer.byte(b'[');
+            let mut first = true;
+            for (list, is_legacy) in [(modern, false), (legacy, true)] {
+                for definition in list.into_iter().flat_map(Value::array) {
+                    if !first {
+                        writer.byte(b',');
+                    }
+                    first = false;
+                    write_function_definition(writer, definition, source, target, is_legacy);
+                }
+            }
+            writer.byte(b']');
+        }
+    }
+    if let Some(choice) = root
+        .get("tool_choice")
+        .or_else(|| root.get("function_call"))
+    {
+        property(writer, b"tool_choice");
+        if choice.is_null() || choice.kind() == Kind::String {
+            writer.raw(choice.raw());
+        } else {
+            let name = choice.get("name").or_else(|| {
+                choice
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+            });
+            writer.raw(if target == Protocol::OpenAiChat {
+                b"{\"type\":\"function\",\"function\":{\"name\":"
+            } else {
+                b"{\"type\":\"function\",\"name\":"
+            });
+            if let Some(name) = name {
+                writer.raw(name.raw());
+            }
+            if target == Protocol::OpenAiChat {
+                writer.byte(b'}');
+            }
+            writer.byte(b'}');
+        }
+    }
+    copy(writer, root, "parallel_tool_calls", b"parallel_tool_calls");
+}
+
+fn call_id<'a>(
+    id: Option<V<'a, '_>>,
+    name: Option<JsonString<'a>>,
+    context: &Context<'a>,
+) -> Result<Text<'a>, Error> {
+    if let Some(value) = id {
+        if !value.is_null() {
+            return Ok(Text::Json(string(value, "tool call ID")?));
+        }
+    }
+    let name = name.ok_or(Error::ContextRequired {
+        field: "tool call ID",
+    })?;
+    let mut found = None;
+    for binding in context.tool_calls {
+        if name.eq_str(binding.name) {
+            if found.is_some() {
+                return Err(Error::ContextRequired {
+                    field: "unambiguous tool call ID",
+                });
+            }
+            found = Some(Text::Utf8(binding.id));
+        }
+    }
+    found.ok_or(Error::ContextRequired {
+        field: "tool call ID",
+    })
+}
+
+fn check_call(function: V<'_, '_>) -> Result<(), Error> {
+    keys(function, &["name", "arguments"])?;
+    string(required(function, "name")?, "name")?;
+    string(required(function, "arguments")?, "arguments")?;
+    Ok(())
+}
+
+fn check_chat_history(
+    message: V<'_, '_>,
+    role: JsonString<'_>,
+    context: &Context<'_>,
+) -> Result<(), Error> {
+    if role.eq_str("tool") || role.eq_str("function") {
+        keys(
+            message,
+            if role.eq_str("tool") {
+                &["role", "tool_call_id", "content"]
+            } else {
+                &["role", "name", "content"]
+            },
+        )?;
+        let name = if role.eq_str("function") {
+            Some(string(required(message, "name")?, "name")?)
+        } else {
+            None
+        };
+        let id = if role.eq_str("tool") {
+            Some(required(message, "tool_call_id")?)
+        } else {
+            None
+        };
+        call_id(id, name, context)?;
+        let result = required(message, "content")?;
+        if result.kind() != Kind::String {
+            return Err(unavailable("non-string tool result"));
+        }
+        return Ok(());
+    }
+    keys(message, &["role", "content", "tool_calls", "function_call"])?;
+    let modern = message.get("tool_calls");
+    let legacy = message.get("function_call");
+    if modern.is_some() && legacy.is_some() {
+        return Err(unavailable("simultaneous tool call spellings"));
+    }
+    if modern.is_some() || legacy.is_some() {
+        if !role.eq_str("assistant") {
+            return Err(invalid("tool_calls", "must belong to assistant"));
+        }
+        if let Some(calls) = modern {
+            if calls.is_null() {
+                return Err(unavailable("null tool call list"));
+            }
+            array(calls, "tool_calls")?;
+            if calls.array().next().is_none() {
+                return Err(unavailable("empty tool call list"));
+            }
+            for call in calls.array() {
+                keys(call, &["id", "type", "function"])?;
+                if !string(required(call, "type")?, "type")?.eq_str("function") {
+                    return Err(unavailable("non-function tool call"));
+                }
+                let function = required(call, "function")?;
+                check_call(function)?;
+                call_id(
+                    call.get("id"),
+                    function.get("name").and_then(Value::as_string),
+                    context,
+                )?;
+            }
+        }
+        if let Some(function) = legacy {
+            if function.is_null() {
+                return Err(unavailable("null legacy function call"));
+            }
+            check_call(function)?;
+            call_id(
+                None,
+                function.get("name").and_then(Value::as_string),
+                context,
+            )?;
+        }
+        if let Some(content) = message.get("content") {
+            if !content.is_null() {
+                check_text(content, Protocol::OpenAiChat)?;
+            }
+        }
+    } else {
+        check_text(required(message, "content")?, Protocol::OpenAiChat)?;
+    }
+    Ok(())
+}
+
+fn request_item_metadata(
+    item: V<'_, '_>,
+    policy: Policy,
+    count: &mut usize,
+    fields: &mut u32,
+) -> Result<(), Error> {
+    for field in ["id", "status"] {
+        if let Some(value) = item.get(field) {
+            if !value.is_null() {
+                string(value, field)?;
+            }
+            if field == "status" && !value.is_null() && !is(Some(value), "completed") {
+                return Err(unavailable("non-completed request item"));
+            }
+            if !policy.drop_metadata {
+                return Err(Error::PolicyViolation {
+                    feature: "response item metadata",
+                });
+            }
+            *count = count.checked_add(1).ok_or(Error::LimitExceeded {
+                kind: "metadata losses",
+                limit: usize::MAX,
+            })?;
+            *fields |= if field == "id" {
+                METADATA_ITEM_ID
+            } else {
+                METADATA_ITEM_STATUS
+            };
+        }
+    }
+    Ok(())
+}
+
+fn check_response_history(
+    item: V<'_, '_>,
+    context: &Context<'_>,
+    policy: Policy,
+    count: &mut usize,
+    fields: &mut u32,
+) -> Result<(), Error> {
+    if is(item.get("type"), "function_call") {
+        keys(
+            item,
+            &["type", "call_id", "name", "arguments", "id", "status"],
+        )?;
+        let name = string(required(item, "name")?, "name")?;
+        string(required(item, "arguments")?, "arguments")?;
+        call_id(item.get("call_id"), Some(name), context)?;
+    } else if is(item.get("type"), "function_call_output") {
+        keys(item, &["type", "call_id", "output", "id", "status"])?;
+        string(required(item, "call_id")?, "call_id")?;
+        if required(item, "output")?.kind() != Kind::String {
+            return Err(unavailable("non-string tool result"));
+        }
+    } else {
+        keys(item, &["type", "role", "content", "id", "status"])?;
+        if item.get("type").is_some() && !is(item.get("type"), "message") {
+            return Err(unavailable("Responses input item"));
+        }
+        let role = string(required(item, "role")?, "role")?;
+        if !["user", "assistant", "system", "developer"]
+            .iter()
+            .any(|name| role.eq_str(name))
+        {
+            return Err(invalid("role", "unknown Responses message role"));
+        }
+        check_text(required(item, "content")?, Protocol::OpenAiResponses)?;
+    }
+    request_item_metadata(item, policy, count, fields)
+}
+
+fn separate(writer: &mut Writer<'_>, first: &mut bool) {
+    if !*first {
+        writer.byte(b',');
+    }
+    *first = false;
+}
+
+fn write_call_item(writer: &mut Writer<'_>, function: V<'_, '_>, id: Text<'_>) {
+    writer.raw(b"{\"type\":\"function_call\",\"call_id\":");
+    text(writer, id);
+    copy(writer, function, "name", b"name");
+    copy(writer, function, "arguments", b"arguments");
+    writer.byte(b'}');
+}
+
+fn write_chat_history(
+    writer: &mut Writer<'_>,
+    message: V<'_, '_>,
+    context: &Context<'_>,
+    first: &mut bool,
+) -> Result<(), Error> {
+    let role = string(required(message, "role")?, "role")?;
+    if role.eq_str("tool") || role.eq_str("function") {
+        let id = call_id(
+            message.get("tool_call_id"),
+            message.get("name").and_then(Value::as_string),
+            context,
+        )?;
+        separate(writer, first);
+        writer.raw(b"{\"type\":\"function_call_output\",\"call_id\":");
+        text(writer, id);
+        copy(writer, message, "content", b"output");
+        writer.byte(b'}');
+        return Ok(());
+    }
+    let modern = message.get("tool_calls");
+    let legacy = message.get("function_call");
+    if let Some(content) = message.get("content") {
+        if content.kind() == Kind::String
+            || (content.kind() == Kind::Array
+                && (content.array().next().is_some() || (modern.is_none() && legacy.is_none())))
+        {
+            separate(writer, first);
+            write_message(
+                writer,
+                role,
+                content,
+                Protocol::OpenAiChat,
+                Protocol::OpenAiResponses,
+            );
+        }
+    }
+    for call in modern.into_iter().flat_map(Value::array) {
+        let function = required(call, "function")?;
+        let id = call_id(
+            call.get("id"),
+            function.get("name").and_then(Value::as_string),
+            context,
+        )?;
+        separate(writer, first);
+        write_call_item(writer, function, id);
+    }
+    if let Some(function) = legacy {
+        let id = call_id(
+            None,
+            function.get("name").and_then(Value::as_string),
+            context,
+        )?;
+        separate(writer, first);
+        write_call_item(writer, function, id);
+    }
+    Ok(())
+}
+
+fn write_response_history(
+    writer: &mut Writer<'_>,
+    item: V<'_, '_>,
+    context: &Context<'_>,
+    first: &mut bool,
+) -> Result<(), Error> {
+    separate(writer, first);
+    if is(item.get("type"), "function_call") {
+        let id = call_id(
+            item.get("call_id"),
+            item.get("name").and_then(Value::as_string),
+            context,
+        )?;
+        writer.raw(b"{\"role\":\"assistant\",\"tool_calls\":[{\"id\":");
+        text(writer, id);
+        writer.raw(b",\"type\":\"function\",\"function\":{\"name\":");
+        writer.raw(required(item, "name")?.raw());
+        copy(writer, item, "arguments", b"arguments");
+        writer.raw(b"}}]}");
+    } else if is(item.get("type"), "function_call_output") {
+        writer.raw(b"{\"role\":\"tool\",\"tool_call_id\":");
+        writer.raw(required(item, "call_id")?.raw());
+        copy(writer, item, "output", b"content");
+        writer.byte(b'}');
+    } else {
+        write_message(
+            writer,
+            string(required(item, "role")?, "role")?,
+            required(item, "content")?,
+            Protocol::OpenAiResponses,
+            Protocol::OpenAiChat,
+        );
+    }
+    Ok(())
 }
 
 fn check_text(value: V<'_, '_>, source: Protocol) -> Result<(), Error> {
@@ -366,6 +899,7 @@ fn request<'a>(
     target: Protocol,
     root: V<'a, '_>,
     context: &Context<'a>,
+    policy: Policy,
     output: &mut [u8],
 ) -> Result<EncodeReport<'a>, Error> {
     use Protocol::*;
@@ -378,22 +912,45 @@ fn request<'a>(
     };
     let mut system = None;
     let mut instructions = None;
+    let mut dropped_metadata = 0;
+    let mut metadata_loss_fields = 0;
     let messages;
     match source {
         OpenAiChat => {
             keys(
                 root,
-                &[
-                    "model",
-                    "messages",
-                    "stream",
-                    "temperature",
-                    "top_p",
-                    "max_tokens",
-                    "max_completion_tokens",
-                    "stop",
-                ],
+                if target == OpenAiResponses {
+                    &[
+                        "model",
+                        "messages",
+                        "stream",
+                        "temperature",
+                        "top_p",
+                        "max_tokens",
+                        "max_completion_tokens",
+                        "stop",
+                        "tools",
+                        "functions",
+                        "tool_choice",
+                        "function_call",
+                        "parallel_tool_calls",
+                    ]
+                } else {
+                    &[
+                        "model",
+                        "messages",
+                        "stream",
+                        "temperature",
+                        "top_p",
+                        "max_tokens",
+                        "max_completion_tokens",
+                        "stop",
+                    ]
+                },
             )?;
+            if target == OpenAiResponses {
+                check_tools(root, source)?;
+            }
             if root.get("max_tokens").is_some() && root.get("max_completion_tokens").is_some() {
                 return Err(unavailable("two token limit fields"));
             }
@@ -403,7 +960,6 @@ fn request<'a>(
             messages = required(root, "messages")?;
             array(messages, "messages")?;
             for (position, message) in messages.array().enumerate() {
-                keys(message, &["role", "content"])?;
                 let role = string(required(message, "role")?, "role")?;
                 if ![
                     "system",
@@ -418,6 +974,11 @@ fn request<'a>(
                 {
                     return Err(invalid("role", "unknown role"));
                 }
+                if target == OpenAiResponses {
+                    check_chat_history(message, role, context)?;
+                    continue;
+                }
+                keys(message, &["role", "content"])?;
                 let content = required(message, "content")?;
                 check_text(content, source)?;
                 if role.eq_str("system") && target != OpenAiResponses {
@@ -445,10 +1006,17 @@ fn request<'a>(
                     "temperature",
                     "top_p",
                     "max_output_tokens",
+                    "tools",
+                    "tool_choice",
+                    "parallel_tool_calls",
                 ],
             )?;
+            check_tools(root, source)?;
             messages = required(root, "input")?;
             if let Some(value) = root.get("instructions") {
+                if value.is_null() {
+                    return Err(unavailable("null instructions"));
+                }
                 string(value, "instructions")?;
                 instructions = Some(value);
             }
@@ -456,18 +1024,13 @@ fn request<'a>(
             } else {
                 array(messages, "input")?;
                 for message in messages.array() {
-                    keys(message, &["type", "role", "content"])?;
-                    if message.get("type").is_some() && !is(message.get("type"), "message") {
-                        return Err(unavailable("Responses input item"));
-                    }
-                    let role = string(required(message, "role")?, "role")?;
-                    if !["user", "assistant", "system", "developer"]
-                        .iter()
-                        .any(|name| role.eq_str(name))
-                    {
-                        return Err(invalid("role", "unknown Responses message role"));
-                    }
-                    check_text(required(message, "content")?, source)?;
+                    check_response_history(
+                        message,
+                        context,
+                        policy,
+                        &mut dropped_metadata,
+                        &mut metadata_loss_fields,
+                    )?;
                 }
             }
         }
@@ -587,6 +1150,14 @@ fn request<'a>(
         writer.byte(b'}');
     } else {
         for message in messages.array() {
+            if source == OpenAiChat && target == OpenAiResponses {
+                write_chat_history(&mut writer, message, context, &mut first)?;
+                continue;
+            }
+            if source == OpenAiResponses && target == OpenAiChat {
+                write_response_history(&mut writer, message, context, &mut first)?;
+                continue;
+            }
             let role = string(required(message, "role")?, "role")?;
             if source == OpenAiChat && target != OpenAiResponses && role.eq_str("system") {
                 continue;
@@ -724,9 +1295,17 @@ fn request<'a>(
             }
         }
     }
+    if matches!(
+        (source, target),
+        (OpenAiChat, OpenAiResponses) | (OpenAiResponses, OpenAiChat)
+    ) {
+        write_tools(&mut writer, root, source, target);
+    }
     writer.byte(b'}');
     let mut report = EncodeReport {
         written: writer.finish()?,
+        dropped_metadata,
+        metadata_loss_fields,
         ..EncodeReport::default()
     };
     if target == GeminiGenerateContent {

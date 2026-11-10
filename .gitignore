@@ -5,3 +5,5 @@
 /fuzz/corpus/
 *.profraw
 *.profdata
+__pycache__/
+*.pyc

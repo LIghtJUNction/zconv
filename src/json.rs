@@ -8,6 +8,38 @@ use crate::Error;
 use core::cmp::Ordering;
 
 const NONE: u32 = u32::MAX;
+// A word test may flag extra bytes after a borrow, but never misses a quote,
+// backslash or control byte. A scalar check resolves the flagged word. This is
+// portable safe Rust; validation of UTF-8 is performed once before tokenization.
+#[inline]
+fn plain_string_prefix(bytes: &[u8]) -> usize {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    fn zero_byte(word: u64) -> bool {
+        word.wrapping_sub(ONES) & !word & HIGH != 0
+    }
+    let mut position = 0;
+    while bytes.len() - position >= 8 {
+        let chunk = &bytes[position..position + 8];
+        let word = u64::from_ne_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ]);
+        if zero_byte(word ^ (ONES * u64::from(b'"')))
+            || zero_byte(word ^ (ONES * u64::from(b'\\')))
+            || word.wrapping_sub(ONES * 0x20) & !word & HIGH != 0
+        {
+            break;
+        }
+        position += 8;
+    }
+    while let Some(&byte) = bytes.get(position) {
+        if byte == b'"' || byte == b'\\' || byte < 0x20 {
+            break;
+        }
+        position += 1;
+    }
+    position
+}
 /// Recursion is bounded independently of caller-provided limits.
 pub const MAX_DEPTH: usize = 64;
 
@@ -396,6 +428,7 @@ impl Parser<'_, '_> {
 
     fn string(&mut self) -> Result<(), Error> {
         self.pos += 1; // opening quotation mark was checked by the caller
+        self.pos += plain_string_prefix(&self.input[self.pos..]);
         loop {
             let byte = *self
                 .input

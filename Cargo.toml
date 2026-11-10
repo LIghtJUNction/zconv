@@ -18,6 +18,14 @@ path = "src/lib.rs"
 name = "convert"
 harness = false
 
+[[bench]]
+name = "json"
+harness = false
+
+[[bench]]
+name = "stream"
+harness = false
+
 [dependencies]
 
 [dev-dependencies]

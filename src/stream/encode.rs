@@ -51,6 +51,15 @@ fn quoted_span(writer: &mut Writer<'_>, aggregate: &[u8], value: Span) {
 }
 
 impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
+    fn reasoning_supported(&self) -> bool {
+        matches!(
+            self.config.target.protocol,
+            Protocol::AnthropicMessages
+                | Protocol::GeminiGenerateContent
+                | Protocol::GeminiInteractions
+        ) || (self.config.target.protocol == Protocol::OpenAiChat
+            && matches!(self.config.target.profile, Profile::OpenAiCompatible(_)))
+    }
     pub(super) fn new(
         config: StreamConfig<'a>,
         writer: Writer<'b>,
@@ -226,7 +235,14 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
         self.writer.string(status);
         self.writer.raw(b",\"error\":null,\"incomplete_details\":");
         self.writer.raw(if status == b"incomplete" {
-            b"{\"reason\":\"max_output_tokens\"}"
+            if self.items[..self.state.item_count]
+                .iter()
+                .any(|item| item.reason == FinishReason::Safety)
+            {
+                b"{\"reason\":\"content_filter\"}"
+            } else {
+                b"{\"reason\":\"max_output_tokens\"}"
+            }
         } else {
             b"null"
         });
@@ -366,7 +382,11 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
         }
         self.writer.raw(b",\"status\":");
         self.writer.string(if complete {
-            b"completed"
+            if item.incomplete {
+                b"incomplete"
+            } else {
+                b"completed"
+            }
         } else {
             b"in_progress"
         });
@@ -392,12 +412,7 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
         }
         if self.items[slot].kind == BlockKind::Reasoning
             && self.config.policy.drop_reasoning
-            && !matches!(
-                self.config.target.protocol,
-                Protocol::AnthropicMessages
-                    | Protocol::GeminiGenerateContent
-                    | Protocol::GeminiInteractions
-            )
+            && !self.reasoning_supported()
         {
             self.items[slot].closed = true;
             return Ok(());
@@ -492,7 +507,39 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
         Ok(())
     }
     fn write_usage(&mut self, protocol: Protocol) -> Result<(), Error> {
-        let usage = self.state.usage;
+        let mut usage = self.state.usage;
+        if protocol == Protocol::AnthropicMessages {
+            usage.input = usage
+                .input
+                .map(|input| {
+                    input
+                        .checked_sub(usage.cached.unwrap_or(0))
+                        .and_then(|input| input.checked_sub(usage.cache_write.unwrap_or(0)))
+                        .ok_or(Error::InvalidInput {
+                            field: "usage",
+                            reason: "cached tokens exceed canonical input",
+                        })
+                })
+                .transpose()?;
+        } else if usage.cache_write.is_some() {
+            self.extension(DroppedField::CacheCreationTokens)?;
+        }
+        if matches!(
+            protocol,
+            Protocol::GeminiGenerateContent | Protocol::GeminiInteractions
+        ) {
+            usage.output = usage
+                .output
+                .map(|output| {
+                    output
+                        .checked_sub(usage.reasoning.unwrap_or(0))
+                        .ok_or(Error::InvalidInput {
+                            field: "usage",
+                            reason: "reasoning tokens exceed canonical output",
+                        })
+                })
+                .transpose()?;
+        }
         if protocol == Protocol::AnthropicMessages
             && (usage.input.is_none() || usage.output.is_none())
         {
@@ -598,6 +645,15 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
             } else {
                 self.writer.string(names[index]);
                 self.writer.byte(b':');
+                number(&mut self.writer, value);
+            }
+        }
+        if protocol == Protocol::AnthropicMessages {
+            if let Some(value) = usage.cache_write {
+                if !first {
+                    self.writer.byte(b',');
+                }
+                self.writer.raw(b"\"cache_creation_input_tokens\":");
                 number(&mut self.writer, value);
             }
         }
@@ -715,6 +771,13 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                 let input = self.state.usage.input.ok_or(Error::ContextRequired {
                     field: "initial_usage.input",
                 })?;
+                let input = input
+                    .checked_sub(self.state.usage.cached.unwrap_or(0))
+                    .and_then(|input| input.checked_sub(self.state.usage.cache_write.unwrap_or(0)))
+                    .ok_or(Error::InvalidInput {
+                        field: "usage",
+                        reason: "cached tokens exceed canonical input",
+                    })?;
                 self.named(b"message_start", b"type");
                 self.writer.raw(b",\"message\":{\"id\":");
                 quoted_span(&mut self.writer, self.aggregate, self.state.id);
@@ -769,9 +832,24 @@ impl Sink for Emitter<'_, '_, '_, '_> {
             });
         }
         if self.lookup(key, Some(kind)).is_some() {
+            if kind == BlockKind::Tool && self.config.source.protocol == Protocol::OpenAiChat {
+                return Err(Error::Unsupported {
+                    feature: "fragmented/repeated tool name or id header",
+                });
+            }
             return Err(Error::InvalidInput {
                 field: "block start",
                 reason: "duplicate block index",
+            });
+        }
+        if matches!(
+            self.config.source.protocol,
+            Protocol::AnthropicMessages | Protocol::OpenAiResponses | Protocol::GeminiInteractions
+        ) && self.lookup(key, None).is_some()
+        {
+            return Err(Error::InvalidInput {
+                field: "block start",
+                reason: "index reused with a different block type",
             });
         }
         if key.choice != 0
@@ -787,12 +865,7 @@ impl Sink for Emitter<'_, '_, '_, '_> {
             });
         }
         if kind == BlockKind::Reasoning
-            && !matches!(
-                self.config.target.protocol,
-                Protocol::AnthropicMessages
-                    | Protocol::GeminiGenerateContent
-                    | Protocol::GeminiInteractions
-            )
+            && !self.reasoning_supported()
             && !self.config.policy.drop_reasoning
         {
             return Err(Error::Unsupported {
@@ -834,8 +907,8 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                 .ok_or(Error::ContextRequired {
                     field: "tool call id",
                 })?;
-            let name = name.ok_or(Error::ContextRequired {
-                field: "tool function name",
+            let name = name.ok_or(Error::Unsupported {
+                feature: "stream tool header missing a complete function name",
             })?;
             if id.len() == 0 || name.len() == 0 {
                 return Err(Error::InvalidInput {
@@ -844,7 +917,7 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                 });
             }
             for existing in &self.items[..self.state.item_count] {
-                if existing.kind == BlockKind::Tool {
+                if existing.kind == BlockKind::Tool && existing.key.choice == key.choice {
                     let same = match id {
                         Text::Utf8(bytes) => bytes == span(self.aggregate, existing.id),
                         Text::Json(value) => value
@@ -875,12 +948,7 @@ impl Sink for Emitter<'_, '_, '_, '_> {
         self.state.item_count += 1;
         if kind == BlockKind::Reasoning
             && self.config.policy.drop_reasoning
-            && !matches!(
-                self.config.target.protocol,
-                Protocol::AnthropicMessages
-                    | Protocol::GeminiGenerateContent
-                    | Protocol::GeminiInteractions
-            )
+            && !self.reasoning_supported()
         {
             return Ok(());
         }
@@ -915,12 +983,7 @@ impl Sink for Emitter<'_, '_, '_, '_> {
         }
         if kind == BlockKind::Reasoning
             && self.config.policy.drop_reasoning
-            && !matches!(
-                self.config.target.protocol,
-                Protocol::AnthropicMessages
-                    | Protocol::GeminiGenerateContent
-                    | Protocol::GeminiInteractions
-            )
+            && !self.reasoning_supported()
         {
             self.state.report.dropped_reasoning =
                 self.state.report.dropped_reasoning.saturating_add(1);
@@ -949,10 +1012,10 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                     text.write(&mut self.writer);
                     self.writer.raw(b"}}]");
                 } else {
-                    self.writer.raw(if kind == BlockKind::Refusal {
-                        b"\"refusal\":"
-                    } else {
-                        b"\"content\":"
+                    self.writer.raw(match kind {
+                        BlockKind::Refusal => b"\"refusal\":",
+                        BlockKind::Reasoning => b"\"reasoning_content\":",
+                        _ => b"\"content\":",
                     });
                     text.write(&mut self.writer);
                 }
@@ -1106,41 +1169,45 @@ impl Sink for Emitter<'_, '_, '_, '_> {
         Ok(())
     }
     fn usage(&mut self, usage: Usage) -> Result<(), Error> {
-        // Anthropic includes cached tokens outside input_tokens. Cross-vendor
-        // accounting needs their explicit sum, with checked integer arithmetic.
-        let mut usage = usage;
-        if self.config.source.protocol == Protocol::AnthropicMessages
-            && self.config.target.protocol != Protocol::AnthropicMessages
-        {
-            if let Some(cached) = usage.cached.or(self.state.usage.cached) {
-                if let Some(input) = usage.input {
-                    usage.input = Some(input.checked_add(cached).ok_or(Error::InvalidInput {
-                        field: "usage",
-                        reason: "counter overflow",
-                    })?);
-                }
-            }
+        // Keep cumulative source bases so a later cache/thinking-only update
+        // changes the canonical total without adding earlier updates twice.
+        if let Some(input) = usage.input {
+            self.state.input_base = Some(input);
+            self.state.input_basis = usage.input_basis;
         }
-        if self.config.target.protocol == Protocol::AnthropicMessages
-            && self.config.source.protocol != Protocol::AnthropicMessages
-        {
-            if let Some(cached) = usage.cached.or(self.state.usage.cached) {
-                if let Some(input) = usage.input {
-                    usage.input = Some(input.checked_sub(cached).ok_or(Error::InvalidInput {
-                        field: "usage",
-                        reason: "cached tokens exceed input tokens",
-                    })?);
-                }
-            }
+        if let Some(output) = usage.output {
+            self.state.output_base = Some(output);
+            self.state.output_basis = usage.output_basis;
         }
         self.state.usage.update(usage);
-        if self.config.source.protocol == Protocol::AnthropicMessages {
+        let overflow = Error::InvalidInput {
+            field: "usage",
+            reason: "counter overflow",
+        };
+        self.state.usage.input = match (self.state.input_base, self.state.input_basis) {
+            (Some(input), InputCount::Uncached) => Some(
+                input
+                    .checked_add(self.state.usage.cached.unwrap_or(0))
+                    .and_then(|input| input.checked_add(self.state.usage.cache_write.unwrap_or(0)))
+                    .ok_or(overflow)?,
+            ),
+            (input, InputCount::Total) => input,
+            (None, _) => None,
+        };
+        self.state.usage.output = match (self.state.output_base, self.state.output_basis) {
+            (Some(output), OutputCount::Visible) => Some(
+                output
+                    .checked_add(self.state.usage.reasoning.unwrap_or(0))
+                    .ok_or(overflow)?,
+            ),
+            (output, OutputCount::Total) => output,
+            (None, _) => None,
+        };
+        self.state.usage.input_basis = InputCount::Total;
+        self.state.usage.output_basis = OutputCount::Total;
+        if self.state.input_basis == InputCount::Uncached {
             if let (Some(input), Some(output)) = (self.state.usage.input, self.state.usage.output) {
-                self.state.usage.total =
-                    Some(input.checked_add(output).ok_or(Error::InvalidInput {
-                        field: "usage",
-                        reason: "counter overflow",
-                    })?);
+                self.state.usage.total = Some(input.checked_add(output).ok_or(overflow)?);
             }
         }
         Ok(())
@@ -1165,6 +1232,12 @@ impl Sink for Emitter<'_, '_, '_, '_> {
         for slot in 0..self.state.item_count {
             if self.items[slot].key.choice == choice {
                 found = true;
+                self.items[slot].reason = reason;
+                if !self.items[slot].closed
+                    && matches!(reason, FinishReason::Length | FinishReason::Safety)
+                {
+                    self.items[slot].incomplete = true;
+                }
                 self.close_slot(slot)?;
                 self.items[slot].finished = true;
                 self.items[slot].reason = reason;
@@ -1182,6 +1255,9 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                 None,
             )?;
             let slot = self.state.item_count - 1;
+            self.items[slot].reason = reason;
+            self.items[slot].incomplete =
+                matches!(reason, FinishReason::Length | FinishReason::Safety);
             self.close_slot(slot)?;
             self.items[slot].finished = true;
             self.items[slot].reason = reason;
@@ -1189,7 +1265,7 @@ impl Sink for Emitter<'_, '_, '_, '_> {
         self.state.seen_finish = true;
         self.emit_choice(choice, reason)
     }
-    fn finish(&mut self, completion: Completion) -> Result<(), Error> {
+    fn finish(&mut self, mut completion: Completion) -> Result<(), Error> {
         if !self.state.begun || self.state.ended {
             return Err(Error::InvalidInput {
                 field: "stream end",
@@ -1210,6 +1286,11 @@ impl Sink for Emitter<'_, '_, '_, '_> {
             .first()
             .filter(|item| item.used)
             .map_or(FinishReason::Stop, |item| item.reason);
+        if completion == Completion::Completed
+            && matches!(reason, FinishReason::Length | FinishReason::Safety)
+        {
+            completion = Completion::Incomplete;
+        }
         match self.config.target.protocol {
             Protocol::OpenAiChat | Protocol::OpenAiCompletions => {
                 if completion == Completion::Cancelled || completion == Completion::Failed {
@@ -1251,6 +1332,11 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                 self.end_event();
             }
             Protocol::OpenAiResponses => {
+                if completion == Completion::Cancelled {
+                    return Err(Error::Unsupported {
+                        feature: "Responses SSE cancellation terminal event",
+                    });
+                }
                 let status = match completion {
                     Completion::Incomplete => b"incomplete".as_slice(),
                     Completion::Failed => b"failed",
@@ -1260,7 +1346,11 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                 self.response_event(match completion {
                     Completion::Incomplete => b"response.incomplete",
                     Completion::Failed => b"response.failed",
-                    Completion::Cancelled => b"response.cancelled",
+                    Completion::Cancelled => {
+                        return Err(Error::Unsupported {
+                            feature: "Responses SSE cancellation terminal event",
+                        })
+                    }
                     _ => b"response.completed",
                 })?;
                 self.writer.raw(b",\"response\":");
@@ -1361,12 +1451,20 @@ impl Sink for Emitter<'_, '_, '_, '_> {
         self.state.failure = true;
         Ok(())
     }
-    fn extension(&mut self) -> Result<(), Error> {
+    fn extension(&mut self, field: DroppedField) -> Result<(), Error> {
         if !self.config.policy.drop_extensions {
             return Err(Error::PolicyViolation {
-                feature: "stream provider metadata (system_fingerprint/service_tier)",
+                feature: match field {
+                    DroppedField::SystemFingerprint => "system_fingerprint",
+                    DroppedField::ServiceTier => "service_tier",
+                    DroppedField::SafetyRatings => "safetyRatings",
+                    DroppedField::FinishMessage => "finishMessage",
+                    DroppedField::AverageLogprobs => "avgLogprobs",
+                    DroppedField::CacheCreationTokens => "cache_creation_input_tokens",
+                },
             });
         }
+        self.state.report.dropped_fields |= field as u32;
         self.state.report.dropped_extensions =
             self.state.report.dropped_extensions.saturating_add(1);
         Ok(())
@@ -1426,6 +1524,23 @@ impl Sink for Emitter<'_, '_, '_, '_> {
             });
         }
         Ok(())
+    }
+    fn incomplete(&mut self, key: Key) -> Result<(), Error> {
+        let mut found = false;
+        for item in &mut self.items[..self.state.item_count] {
+            if item.key.choice == key.choice && item.key.index == key.index {
+                item.incomplete = true;
+                found = true;
+            }
+        }
+        if found {
+            Ok(())
+        } else {
+            Err(Error::InvalidInput {
+                field: "incomplete block",
+                reason: "block missing",
+            })
+        }
     }
 }
 

@@ -10,12 +10,26 @@ fn main() -> Result<(), zconv::Error> {
     let mut scratch = [0; 512];
     let mut output = [0; 1024];
     let converted = convert(
-        Protocol::OpenAiChat.into(), Protocol::OpenAiResponses.into(), Operation::Request,
-        input, &mut output, Options::default(),
-        Workspace { tokens: &mut tokens, records: &mut records,
-                    scratch: &mut scratch, nested_tokens: &mut nested_tokens },
+        Protocol::OpenAiChat.into(),
+        Protocol::OpenAiResponses.into(),
+        Operation::Request,
+        input,
+        &mut output,
+        Options::default(),
+        Workspace {
+            tokens: &mut tokens,
+            records: &mut records,
+            scratch: &mut scratch,
+            nested_tokens: &mut nested_tokens,
+        },
     )?;
-    println!("path={:?}, IR records={}", converted.path, converted.resources.ir_records_used);
-    println!("{}", String::from_utf8_lossy(&output[..converted.written()]));
+    println!(
+        "path={:?}, IR records={}",
+        converted.path, converted.resources.ir_records_used
+    );
+    println!(
+        "{}",
+        String::from_utf8_lossy(&output[..converted.written()])
+    );
     Ok(())
 }

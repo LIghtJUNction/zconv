@@ -1,0 +1,116 @@
+name: Release
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version increment (none for the first release or an explicit version)
+        required: true
+        type: choice
+        default: patch
+        options: [none, patch, minor, major]
+      version:
+        description: Optional explicit stable SemVer; requires bump=none
+        required: false
+        type: string
+      publish:
+        description: Publish to crates.io and create a GitHub release
+        required: true
+        type: boolean
+        default: false
+  push:
+    tags: ['v[0-9]*']
+permissions:
+  contents: read
+concurrency:
+  group: zconv-release
+  cancel-in-progress: false
+jobs:
+  verify:
+    if: github.repository == 'LIghtJUNction/zconv'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require the default branch for manual releases
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          REF: ${{ github.ref }}
+        run: test "$REF" = refs/heads/main
+      - run: rustup toolchain install 1.74.0 --profile minimal
+      - name: Validate and prepare the version
+        id: plan
+        env:
+          BUMP: ${{ inputs.bump || 'none' }}
+          VERSION: ${{ inputs.version }}
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: python3 scripts/release.py prepare
+      - run: rustup toolchain install 1.74.0 --profile minimal
+      - run: rustup component add rustfmt clippy
+      - run: cargo +1.74.0 test --all-targets --locked
+      - run: cargo test --release --locked
+      - run: cargo test --doc --locked
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: python3 scripts/check_package.py
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      - run: cargo test --manifest-path comparison/Cargo.toml --locked
+      - run: cargo package --allow-dirty --locked
+      - name: Check name ownership and version availability
+        run: python3 scripts/release.py registry
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: release-package
+          path: |
+            target/package/*.crate
+            Cargo.toml
+            Cargo.lock
+          if-no-files-found: error
+  publish:
+    needs: verify
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install 1.74.0 --profile minimal
+      - name: Apply exactly the verified version
+        env:
+          BUMP: none
+          VERSION: ${{ needs.verify.outputs.version }}
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: python3 scripts/release.py prepare
+      - name: Check branch and tag before publishing
+        run: python3 scripts/release.py git-preflight
+      - name: Recheck registry immediately before publication
+        run: python3 scripts/release.py registry
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          test -n "$CARGO_REGISTRY_TOKEN"
+          cargo publish --locked --allow-dirty
+      - name: Record the published version and tag
+        env:
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if ! git diff --quiet -- Cargo.toml Cargo.lock comparison/Cargo.lock fuzz/Cargo.lock; then
+            git add Cargo.toml Cargo.lock comparison/Cargo.lock fuzz/Cargo.lock
+            git commit -m "chore: release $RELEASE_VERSION"
+            git push origin HEAD:main
+          fi
+          if ! git show-ref --verify --quiet "refs/tags/v$RELEASE_VERSION"; then
+            git tag -a "v$RELEASE_VERSION" -m "zconv $RELEASE_VERSION"
+            git push origin "refs/tags/v$RELEASE_VERSION"
+          fi
+          gh release create "v$RELEASE_VERSION" --verify-tag --title "zconv $RELEASE_VERSION" --generate-notes

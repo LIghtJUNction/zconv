@@ -30,12 +30,9 @@ fn config(source: Protocol, target: Protocol, strategy: Strategy) -> StreamConfi
     config
 }
 
-fn run(
-    input: &[u8],
-    config: StreamConfig<'_>,
-    split: usize,
-    output_size: usize,
-) -> Result<(Vec<u8>, Path, Report, Usage, Memory), (Error, Vec<u8>)> {
+type RunResult = Result<(Vec<u8>, Path, Report, Usage, Memory), (Error, Vec<u8>)>;
+
+fn run(input: &[u8], config: StreamConfig<'_>, split: usize, output_size: usize) -> RunResult {
     let mut framing = vec![0; 65536];
     let mut data = vec![0; 65536];
     let mut pending = vec![0; 65536];
@@ -920,7 +917,10 @@ fn anthropic_cached_token_translation_is_reversible_without_double_counting() {
             output: Some(3),
             total: Some(8),
             cached: Some(2),
-            reasoning: None
+            reasoning: None,
+            cache_write: None,
+            input_basis: InputCount::Total,
+            output_basis: OutputCount::Total,
         }
     );
 }
@@ -969,5 +969,220 @@ fn arbitrary_bytes_are_bounded_and_never_panic() {
                 7,
             );
         }
+    }
+}
+
+#[test]
+fn vendor_reasoning_requires_an_explicit_profile_and_never_leaks_into_standard_chat() {
+    let input = String::from_utf8(CHAT.to_vec()).unwrap().replace(
+        "\"content\":\"Hi \\u4e2d\"",
+        "\"reasoning_content\":\"Hi \\u4e2d\"",
+    );
+    let standard = run(
+        input.as_bytes(),
+        config(
+            Protocol::OpenAiChat,
+            Protocol::GeminiGenerateContent,
+            Strategy::Auto,
+        ),
+        1,
+        1,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        standard.0,
+        Error::Unsupported {
+            feature: "vendor reasoning requires OpenAiCompatible profile"
+        }
+    ));
+    let mut profiled = config(
+        Protocol::OpenAiChat,
+        Protocol::GeminiGenerateContent,
+        Strategy::Auto,
+    );
+    profiled.source.profile = zconv::Profile::OpenAiCompatible("example-provider");
+    let google = run(input.as_bytes(), profiled, 1, 1).unwrap();
+    assert!(String::from_utf8_lossy(&google.0).contains("\"thought\":true"));
+    let mut target = config(
+        Protocol::GeminiGenerateContent,
+        Protocol::OpenAiChat,
+        Strategy::Auto,
+    );
+    target.target.profile = zconv::Profile::OpenAiCompatible("example-provider");
+    let compatible = run(&google.0, target, 1, 1).unwrap();
+    assert!(String::from_utf8_lossy(&compatible.0).contains("\"reasoning_content\":"));
+    assert!(matches!(
+        run(
+            &google.0,
+            config(
+                Protocol::GeminiGenerateContent,
+                Protocol::OpenAiChat,
+                Strategy::Auto
+            ),
+            1,
+            1
+        )
+        .unwrap_err()
+        .0,
+        Error::Unsupported {
+            feature: "reasoning stream target"
+        }
+    ));
+}
+
+#[test]
+fn cache_creation_tokens_require_explicit_loss_policy_in_other_protocols() {
+    let anthropic = run(
+        CHAT,
+        config(
+            Protocol::OpenAiChat,
+            Protocol::AnthropicMessages,
+            Strategy::Auto,
+        ),
+        1,
+        1,
+    )
+    .unwrap()
+    .0;
+    let source = String::from_utf8(anthropic).unwrap().replace(
+        "\"input_tokens\":5",
+        "\"input_tokens\":5,\"cache_read_input_tokens\":2,\"cache_creation_input_tokens\":3",
+    );
+    let failure = run(
+        source.as_bytes(),
+        config(
+            Protocol::AnthropicMessages,
+            Protocol::OpenAiChat,
+            Strategy::Auto,
+        ),
+        1,
+        1,
+    )
+    .unwrap_err();
+    assert_eq!(
+        failure.0,
+        Error::PolicyViolation {
+            feature: "cache_creation_input_tokens"
+        }
+    );
+    let mut lossy = config(
+        Protocol::AnthropicMessages,
+        Protocol::OpenAiChat,
+        Strategy::Auto,
+    );
+    lossy.policy.drop_extensions = true;
+    let result = run(source.as_bytes(), lossy, 1, 1).unwrap();
+    assert_eq!(result.3.input, Some(10));
+    assert_eq!(result.3.total, Some(13));
+    assert_eq!(result.3.cache_write, Some(3));
+    assert_ne!(
+        result.2.dropped_fields & DroppedField::CacheCreationTokens as u32,
+        0
+    );
+    let same = run(
+        source.as_bytes(),
+        config(
+            Protocol::AnthropicMessages,
+            Protocol::AnthropicMessages,
+            Strategy::Auto,
+        ),
+        1,
+        1,
+    )
+    .unwrap();
+    assert!(String::from_utf8_lossy(&same.0).contains("\"cache_creation_input_tokens\":3"));
+}
+
+#[test]
+fn gemini_thought_tokens_normalize_to_inclusive_openai_output() {
+    let input = b"data: {\"responseId\":\"r1\",\"modelVersion\":\"m\",\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":7,\"candidatesTokenCount\":23,\"thoughtsTokenCount\":49,\"totalTokenCount\":79}}\n\n";
+    let chat = run(
+        input,
+        config(
+            Protocol::GeminiGenerateContent,
+            Protocol::OpenAiChat,
+            Strategy::Direct,
+        ),
+        1,
+        1,
+    )
+    .unwrap();
+    assert_eq!(chat.3.input, Some(7));
+    assert_eq!(chat.3.output, Some(72));
+    assert_eq!(chat.3.total, Some(79));
+    assert_eq!(chat.3.reasoning, Some(49));
+    let google = run(
+        &chat.0,
+        config(
+            Protocol::OpenAiChat,
+            Protocol::GeminiGenerateContent,
+            Strategy::Direct,
+        ),
+        1,
+        1,
+    )
+    .unwrap();
+    assert!(String::from_utf8_lossy(&google.0).contains("\"candidatesTokenCount\":23"));
+    assert!(String::from_utf8_lossy(&google.0).contains("\"thoughtsTokenCount\":49"));
+    let payload = br#"{"event_type":"interaction.completed","interaction":{"status":"completed","usage":{"total_input_tokens":7,"total_output_tokens":23,"total_thought_tokens":49,"total_tokens":79}}}"#;
+    let mut tokens = [Token::EMPTY; 128];
+    let mut events = [Event::EMPTY; 16];
+    let length = decode_event(
+        Protocol::GeminiInteractions,
+        payload,
+        &mut tokens,
+        &mut events,
+        json::Limits::default(),
+    )
+    .unwrap();
+    let usage = events[..length]
+        .iter()
+        .find(|event| event.kind == EventKind::Usage)
+        .unwrap()
+        .usage;
+    assert_eq!(usage.output_basis, OutputCount::Visible);
+    assert_eq!(usage.output, Some(23));
+}
+
+#[test]
+fn length_and_safety_finishes_remain_incomplete_in_responses() {
+    for (reason, details) in [
+        ("length", "max_output_tokens"),
+        ("content_filter", "content_filter"),
+    ] {
+        let source = String::from_utf8(CHAT.to_vec()).unwrap().replace(
+            "\"finish_reason\":\"stop\"",
+            &format!("\"finish_reason\":\"{reason}\""),
+        );
+        let response = run(
+            source.as_bytes(),
+            config(
+                Protocol::OpenAiChat,
+                Protocol::OpenAiResponses,
+                Strategy::Auto,
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        let wire = String::from_utf8_lossy(&response.0);
+        assert!(wire.contains("\"type\":\"response.incomplete\""));
+        assert!(wire.contains(&format!(
+            "\"incomplete_details\":{{\"reason\":\"{details}\"}}"
+        )));
+        let back = run(
+            &response.0,
+            config(
+                Protocol::OpenAiResponses,
+                Protocol::OpenAiChat,
+                Strategy::Auto,
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8_lossy(&back.0).contains(&format!("\"finish_reason\":\"{reason}\""))
+        );
     }
 }

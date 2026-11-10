@@ -1,3 +1,4 @@
+use zconv::json;
 use zconv::json::{parse, JsonError, JsonString, Kind, Limits, Token, Writer};
 use zconv::Error;
 
@@ -374,6 +375,36 @@ fn arbitrary_bytes_and_every_truncation_do_not_panic() {
                 *byte = random as u8;
             }
             let _ = parse(&input[..length], &mut tokens, Limits::default());
+        }
+    }
+}
+
+#[test]
+fn string_word_boundaries_do_not_skip_controls_or_escapes() {
+    let mut tokens = [json::Token::EMPTY; 4];
+    for length in 0..=80 {
+        for position in 0..length {
+            for byte in 0u8..=255 {
+                let mut input = vec![b'a'; length + 2];
+                input[0] = b'"';
+                input[length + 1] = b'"';
+                input[position + 1] = byte;
+                let valid = (0x20..0x80).contains(&byte) && byte != b'"' && byte != b'\\';
+                assert_eq!(
+                    json::parse(&input, &mut tokens, json::Limits::default()).is_ok(),
+                    valid,
+                    "length={length}, position={position}, byte={byte}"
+                );
+            }
+        }
+        for position in 0..=length {
+            let mut input = Vec::from(b"\"".as_slice());
+            input.extend(std::iter::repeat(b'a').take(position));
+            input.extend_from_slice(b"\\u4e2d\\ud83d\\ude00\\n");
+            input.extend(std::iter::repeat(b'a').take(length - position));
+            input.push(b'"');
+            let parsed = json::parse(&input, &mut tokens, json::Limits::default()).unwrap();
+            assert_eq!(parsed.root().as_string().unwrap().decoded_len(), length + 8);
         }
     }
 }

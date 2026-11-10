@@ -18,22 +18,60 @@ fn main() {
     let mut records = vec![Record::EMPTY; 128];
     let mut scratch = vec![0; 65536];
     let mut output = vec![0; 131072];
-    let context = Context { max_tokens: Some(32), model: Some("test-model"), ..Context::default() };
-    for (name, input) in [("small", &small), ("unicode", &unicode), ("long_text", &long), ("tools", &tools)] {
-        let iterations = if name == "long_text" { (iterations / 32).max(1) } else { iterations };
-        for target in [Protocol::OpenAiResponses, Protocol::AnthropicMessages, Protocol::GeminiGenerateContent] {
+    let context = Context {
+        max_tokens: Some(32),
+        model: Some("test-model"),
+        ..Context::default()
+    };
+    for (name, input) in [
+        ("small", &small),
+        ("unicode", &unicode),
+        ("long_text", &long),
+        ("tools", &tools),
+    ] {
+        let iterations = if name == "long_text" {
+            (iterations / 32).max(1)
+        } else {
+            iterations
+        };
+        for target in [
+            Protocol::OpenAiResponses,
+            Protocol::AnthropicMessages,
+            Protocol::GeminiGenerateContent,
+        ] {
             for strategy in [Strategy::Auto, Strategy::Direct, Strategy::Ir] {
-                if name == "tools" && strategy == Strategy::Direct { continue; }
-                let options = Options { strategy, context, policy: Policy::default(), ..Options::default() };
+                if name == "tools"
+                    && strategy == Strategy::Direct
+                    && target != Protocol::OpenAiResponses
+                {
+                    continue;
+                }
+                let options = Options {
+                    strategy,
+                    context,
+                    policy: Policy::default(),
+                    ..Options::default()
+                };
                 let mut times = Vec::with_capacity(rounds);
                 let mut last = None;
                 for _ in 0..rounds {
                     let start = Instant::now();
                     for _ in 0..iterations {
-                        let result = convert(Protocol::OpenAiChat.into(), target.into(), Operation::Request,
-                            black_box(input), black_box(&mut output), options,
-                            Workspace { tokens: &mut tokens, records: &mut records,
-                                        scratch: &mut scratch, nested_tokens: &mut nested }).unwrap();
+                        let result = convert(
+                            Protocol::OpenAiChat.into(),
+                            target.into(),
+                            Operation::Request,
+                            black_box(input),
+                            black_box(&mut output),
+                            options,
+                            Workspace {
+                                tokens: &mut tokens,
+                                records: &mut records,
+                                scratch: &mut scratch,
+                                nested_tokens: &mut nested,
+                            },
+                        )
+                        .unwrap();
                         black_box(&output[..result.written()]);
                         last = Some(result);
                     }
@@ -50,6 +88,10 @@ fn main() {
             }
         }
     }
-    eprintln!("sizes: Token={} Record={} StreamConverter={}", std::mem::size_of::<Token>(),
-        std::mem::size_of::<Record<'_>>(), std::mem::size_of::<zconv::stream::StreamConverter<'_, '_>>());
+    eprintln!(
+        "sizes: Token={} Record={} StreamConverter={}",
+        std::mem::size_of::<Token>(),
+        std::mem::size_of::<Record<'_>>(),
+        std::mem::size_of::<zconv::stream::StreamConverter<'_, '_>>()
+    );
 }

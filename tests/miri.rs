@@ -13,11 +13,31 @@ fn unicode_tape_ir_and_reused_storage() {
     let mut output = [0; 512];
     let mut scratch = [0; 128];
     for strategy in [Strategy::Direct, Strategy::Ir] {
-        let result = convert(Protocol::OpenAiChat.into(), Protocol::OpenAiResponses.into(),
-            Operation::Request, input, &mut output,
-            Options { strategy, context: Context::default(), ..Options::default() },
-            Workspace { tokens: &mut tokens, records: &mut records, scratch: &mut scratch, nested_tokens: &mut nested }).unwrap();
-        json::parse(&output[..result.written()], &mut tokens, json::Limits::default()).unwrap();
+        let result = convert(
+            Protocol::OpenAiChat.into(),
+            Protocol::OpenAiResponses.into(),
+            Operation::Request,
+            input,
+            &mut output,
+            Options {
+                strategy,
+                context: Context::default(),
+                ..Options::default()
+            },
+            Workspace {
+                tokens: &mut tokens,
+                records: &mut records,
+                scratch: &mut scratch,
+                nested_tokens: &mut nested,
+            },
+        )
+        .unwrap();
+        json::parse(
+            &output[..result.written()],
+            &mut tokens,
+            json::Limits::default(),
+        )
+        .unwrap();
     }
 }
 
@@ -27,16 +47,31 @@ fn stream_split_utf8_and_pending_output() {
         "data: {\"id\":\"r\",\"model\":\"m\",\"created\":1,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"中\"},\"finish_reason\":null}]}\r\n\r\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n",
         "data: [DONE]\n\n").as_bytes();
-    let mut framing = [0; 256]; let mut data = [0; 256]; let mut pending = [0; 2048];
-    let mut tokens = [Token::EMPTY; 64]; let mut items = [ActiveItem::EMPTY; 4];
-    let mut checkpoints = [ActiveItem::EMPTY; 4]; let mut events = [Event::EMPTY; 8];
+    let mut framing = [0; 256];
+    let mut data = [0; 256];
+    let mut pending = [0; 2048];
+    let mut tokens = [Token::EMPTY; 64];
+    let mut items = [ActiveItem::EMPTY; 4];
+    let mut checkpoints = [ActiveItem::EMPTY; 4];
+    let mut events = [Event::EMPTY; 8];
     let mut aggregate = [0; 256];
     let mut config = StreamConfig::new(Protocol::OpenAiChat, Protocol::OpenAiResponses);
     config.strategy = Strategy::Ir;
     config.context.item_id_prefix = Some("local_");
-    let mut stream = StreamConverter::new(config, StreamBuffers { framing: &mut framing,
-        data: &mut data, pending: &mut pending, tokens: &mut tokens, items: &mut items,
-        checkpoints: &mut checkpoints, events: &mut events, aggregate: &mut aggregate }).unwrap();
+    let mut stream = StreamConverter::new(
+        config,
+        StreamBuffers {
+            framing: &mut framing,
+            data: &mut data,
+            pending: &mut pending,
+            tokens: &mut tokens,
+            items: &mut items,
+            checkpoints: &mut checkpoints,
+            events: &mut events,
+            aggregate: &mut aggregate,
+        },
+    )
+    .unwrap();
     let mut offset = 0;
     let mut output = [0; 13];
     let mut finished = false;
@@ -45,8 +80,11 @@ fn stream_split_utf8_and_pending_output() {
         let result = stream.step(&wire[offset..end], &mut output, end == wire.len());
         offset += result.consumed;
         match result.status {
-            Status::Done => { finished = true; break; }
-            Status::NeedInput | Status::NeedOutput => {},
+            Status::Done => {
+                finished = true;
+                break;
+            }
+            Status::NeedInput | Status::NeedOutput => {}
             other => panic!("{other:?}"),
         }
     }

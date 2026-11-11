@@ -1,0 +1,39 @@
+name: Rust 2024 Clippy migration fixes
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/edition-clippy-fix.yml
+
+permissions:
+  contents: read
+
+jobs:
+  fix:
+    if: github.repository == 'LIghtJUNction/zconv'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: true
+      - run: rustup toolchain install 1.99.1 --profile minimal --component clippy,rustfmt
+      - name: Apply machine-applicable Rust 2024 Clippy suggestions
+        run: |
+          cargo +1.99.1 clippy --fix --allow-dirty --allow-staged --all-targets -- -D warnings || true
+          cargo +1.99.1 fmt --all
+      - name: Commit source-only changes
+        run: |
+          git add -u -- '*.rs'
+          if git diff --cached --quiet; then
+            echo 'No machine-applicable edits'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'refactor(edition): apply Rust 2024 Clippy fixes'
+          git push origin HEAD:main

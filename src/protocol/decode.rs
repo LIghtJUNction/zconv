@@ -1,8 +1,8 @@
 use super::{invalid, validate_format};
 use crate::{
+    Error, Format, Operation, Protocol,
     ir::*,
     json::{Kind, RawValue, Value},
-    Error, Format, Operation, Protocol,
 };
 
 type V<'a, 't> = Value<'a, 't>;
@@ -2036,7 +2036,7 @@ fn usage<'a, 't>(
                 present: true,
                 is_null: true,
                 ..Usage::default()
-            })
+            });
         }
         Some(v) => v,
     };

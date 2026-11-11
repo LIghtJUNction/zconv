@@ -12,7 +12,7 @@
 use std::mem::size_of;
 use zconv::ir::Record;
 use zconv::json::{self, Token};
-use zconv::{convert, Error, Operation, Options, Protocol, Strategy, Workspace};
+use zconv::{Error, Operation, Options, Protocol, Strategy, Workspace, convert};
 
 const INPUT: &[u8] = br#"{"model":"example-model","messages":[{"role":"user","content":"Hello"}]}"#;
 
@@ -135,7 +135,9 @@ fn main() -> Result<(), Error> {
         size_of::<Token>(),
         size_of::<Record<'_>>()
     );
-    println!("path,input_bytes,output_bytes,token_slots,token_bytes,ir_slots,ir_bytes,scratch_bytes,nested_token_bytes,provided_bytes,input_plus_provided_bytes");
+    println!(
+        "path,input_bytes,output_bytes,token_slots,token_bytes,ir_slots,ir_bytes,scratch_bytes,nested_token_bytes,provided_bytes,input_plus_provided_bytes"
+    );
     show(Strategy::Direct, direct)?;
     show(Strategy::Ir, ir)?;
     Ok(())

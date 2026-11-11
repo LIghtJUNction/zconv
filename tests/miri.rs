@@ -2,7 +2,7 @@
 use zconv::ir::{Context, Record};
 use zconv::json::{self, Token};
 use zconv::stream::{ActiveItem, Event, Status, StreamBuffers, StreamConfig, StreamConverter};
-use zconv::{convert, Operation, Options, Protocol, Strategy, Workspace};
+use zconv::{Operation, Options, Protocol, Strategy, Workspace, convert};
 
 #[test]
 fn unicode_tape_ir_and_reused_storage() {

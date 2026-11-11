@@ -1,7 +1,7 @@
 //! Routing, resource accounting, and caller-owned conversion buffers.
 
 use crate::ir::{Context, EncodeReport, Policy, Presence, Record, Text};
-use crate::{direct, json, protocol, Error, Format, Operation, Path, Strategy};
+use crate::{Error, Format, Operation, Path, Strategy, direct, json, protocol};
 
 /// Controls selection and permitted semantic losses. The default is strict.
 #[derive(Clone, Copy, Debug, Default)]

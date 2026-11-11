@@ -1,7 +1,8 @@
 use zconv::{
+    Error, Format, Protocol,
     ir::*,
     json::{self, Token},
-    protocol, Error, Format, Protocol,
+    protocol,
 };
 
 const PROTOCOLS: [Protocol; 6] = [
@@ -523,15 +524,16 @@ fn legacy_functions_keep_legacy_wire_and_need_ids_when_upgrading() {
     assert!(doc.root().get("functions").is_some());
     assert!(doc.root().get("tools").is_none());
     assert!(doc.root().get("function_call").is_some());
-    assert!(doc
-        .root()
-        .get("messages")
-        .unwrap()
-        .array()
-        .next()
-        .unwrap()
-        .get("function_call")
-        .is_some());
+    assert!(
+        doc.root()
+            .get("messages")
+            .unwrap()
+            .array()
+            .next()
+            .unwrap()
+            .get("function_call")
+            .is_some()
+    );
     assert!(matches!(
         request_conversion(
             input,
@@ -610,25 +612,28 @@ fn structured_schema_chat_responses_roundtrip_and_gemini_same_format() {
     )
     .unwrap();
     let doc = json::parse(&back, &mut tokens, json::Limits::default()).unwrap();
-    assert!(doc
-        .root()
-        .get("response_format")
-        .unwrap()
-        .get("json_schema")
-        .unwrap()
-        .get("name")
-        .unwrap()
-        .as_string()
-        .unwrap()
-        .eq_str("answer"));
+    assert!(
+        doc.root()
+            .get("response_format")
+            .unwrap()
+            .get("json_schema")
+            .unwrap()
+            .get("name")
+            .unwrap()
+            .as_string()
+            .unwrap()
+            .eq_str("answer")
+    );
     let google=br#"{"contents":[{"parts":[{"text":"hi"}]}],"generationConfig":{"responseMimeType":"application/json","responseJsonSchema":{"type":"object"}}}"#;
-    assert!(request_conversion(
-        google,
-        Protocol::GeminiGenerateContent,
-        Protocol::GeminiGenerateContent,
-        Policy::default()
-    )
-    .is_ok());
+    assert!(
+        request_conversion(
+            google,
+            Protocol::GeminiGenerateContent,
+            Protocol::GeminiGenerateContent,
+            Policy::default()
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -938,19 +943,21 @@ fn reasoning_summary_keeps_item_identity_signature_and_order() {
     let output = doc.root().get("output").unwrap();
     assert_eq!(output.array().count(), 1);
     let item = output.array().next().unwrap();
-    assert!(item
-        .get("id")
-        .unwrap()
-        .as_string()
-        .unwrap()
-        .eq_str("reason_1"));
+    assert!(
+        item.get("id")
+            .unwrap()
+            .as_string()
+            .unwrap()
+            .eq_str("reason_1")
+    );
     assert_eq!(item.get("summary").unwrap().array().count(), 2);
-    assert!(item
-        .get("encrypted_content")
-        .unwrap()
-        .as_string()
-        .unwrap()
-        .eq_str("opaque-signature"));
+    assert!(
+        item.get("encrypted_content")
+            .unwrap()
+            .as_string()
+            .unwrap()
+            .eq_str("opaque-signature")
+    );
     assert!(matches!(
         protocol::encode_response(
             &response,
@@ -992,20 +999,21 @@ fn refusal_and_safety_are_never_plain_success() {
     )
     .unwrap();
     let doc = json::parse(&out[..report.written], &mut tokens, json::Limits::default()).unwrap();
-    assert!(doc
-        .root()
-        .get("choices")
-        .unwrap()
-        .array()
-        .next()
-        .unwrap()
-        .get("message")
-        .unwrap()
-        .get("refusal")
-        .unwrap()
-        .as_string()
-        .unwrap()
-        .eq_str("declined"));
+    assert!(
+        doc.root()
+            .get("choices")
+            .unwrap()
+            .array()
+            .next()
+            .unwrap()
+            .get("message")
+            .unwrap()
+            .get("refusal")
+            .unwrap()
+            .as_string()
+            .unwrap()
+            .eq_str("declined")
+    );
     let blocked = br#"{"promptFeedback":{"blockReason":"SAFETY"}}"#;
     let doc = json::parse(blocked, &mut tokens, json::Limits::default()).unwrap();
     let response = protocol::decode_response(
@@ -1029,24 +1037,27 @@ fn refusal_and_safety_are_never_plain_success() {
     )
     .unwrap();
     let doc = json::parse(&out[..report.written], &mut tokens, json::Limits::default()).unwrap();
-    assert!(doc
-        .root()
-        .get("choices")
-        .unwrap()
-        .array()
-        .next()
-        .unwrap()
-        .get("finish_reason")
-        .unwrap()
-        .as_string()
-        .unwrap()
-        .eq_str("content_filter"));
+    assert!(
+        doc.root()
+            .get("choices")
+            .unwrap()
+            .array()
+            .next()
+            .unwrap()
+            .get("finish_reason")
+            .unwrap()
+            .as_string()
+            .unwrap()
+            .eq_str("content_filter")
+    );
 }
 
 #[test]
 fn failed_and_cancelled_resources_keep_status() {
     for state in ["failed", "cancelled"] {
-        let input=format!("{{\"id\":\"r\",\"model\":\"m\",\"created_at\":1,\"status\":\"{state}\",\"output\":[],\"error\":null}}");
+        let input = format!(
+            "{{\"id\":\"r\",\"model\":\"m\",\"created_at\":1,\"status\":\"{state}\",\"output\":[],\"error\":null}}"
+        );
         let mut tokens = [Token::EMPTY; 256];
         let mut records = [Record::EMPTY; 32];
         let doc = json::parse(input.as_bytes(), &mut tokens, json::Limits::default()).unwrap();
@@ -1070,23 +1081,26 @@ fn failed_and_cancelled_resources_keep_status() {
         .unwrap();
         let doc =
             json::parse(&out[..report.written], &mut tokens, json::Limits::default()).unwrap();
-        assert!(doc
-            .root()
-            .get("status")
-            .unwrap()
-            .as_string()
-            .unwrap()
-            .eq_str(state));
-        assert!(protocol::encode_response(
-            &response,
-            Protocol::OpenAiChat.into(),
-            &context(),
-            Policy::default(),
-            &mut out,
-            &mut scratch,
-            &mut tokens
-        )
-        .is_err());
+        assert!(
+            doc.root()
+                .get("status")
+                .unwrap()
+                .as_string()
+                .unwrap()
+                .eq_str(state)
+        );
+        assert!(
+            protocol::encode_response(
+                &response,
+                Protocol::OpenAiChat.into(),
+                &context(),
+                Policy::default(),
+                &mut out,
+                &mut scratch,
+                &mut tokens
+            )
+            .is_err()
+        );
     }
 }
 

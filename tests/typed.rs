@@ -1,7 +1,8 @@
 use zconv::{
+    Protocol,
     ir::*,
     json::{self, Token},
-    protocol, Protocol,
+    protocol,
 };
 
 #[test]
@@ -59,7 +60,9 @@ fn unchanged_missing_null_and_unknown_finish_are_preserved() {
         ",\"finish_reason\":null",
         ",\"finish_reason\":\"vendor-finish\"",
     ] {
-        let input = format!("{{\"id\":\"r\",\"model\":\"m\",\"created\":1,\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"x\"}}{ending}}}]}}");
+        let input = format!(
+            "{{\"id\":\"r\",\"model\":\"m\",\"created\":1,\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"x\"}}{ending}}}]}}"
+        );
         let mut tokens = [Token::EMPTY; 128];
         let mut records = [Record::EMPTY; 16];
         let doc = json::parse(input.as_bytes(), &mut tokens, json::Limits::default()).unwrap();
@@ -87,12 +90,14 @@ fn unchanged_missing_null_and_unknown_finish_are_preserved() {
         match ending {
             "" => assert!(choice.get("finish_reason").is_none()),
             ",\"finish_reason\":null" => assert!(choice.get("finish_reason").unwrap().is_null()),
-            _ => assert!(choice
-                .get("finish_reason")
-                .unwrap()
-                .as_string()
-                .unwrap()
-                .eq_str("vendor-finish")),
+            _ => assert!(
+                choice
+                    .get("finish_reason")
+                    .unwrap()
+                    .as_string()
+                    .unwrap()
+                    .eq_str("vendor-finish")
+            ),
         }
     }
 }

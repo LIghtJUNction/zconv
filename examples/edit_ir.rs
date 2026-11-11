@@ -1,6 +1,6 @@
 use zconv::ir::{Content, Context, Policy, Record, Text};
 use zconv::json::{self, Token};
-use zconv::{protocol, Protocol};
+use zconv::{Protocol, protocol};
 
 fn main() -> Result<(), zconv::Error> {
     let input = br#"{"model":"example-model","messages":[{"role":"user","content":"before"}]}"#;

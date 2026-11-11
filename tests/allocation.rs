@@ -4,7 +4,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use zconv::ir::Record;
 use zconv::json::Token;
-use zconv::{convert, Operation, Options, Protocol, Strategy, Workspace};
+use zconv::{Operation, Options, Protocol, Strategy, Workspace, convert};
 
 struct CountingAllocator;
 thread_local! {

@@ -573,7 +573,7 @@ impl<'a, 'c> StreamConverter<'a, 'c> {
             Strategy::Direct if !direct => {
                 return Err(Error::DirectUnavailable {
                     feature: "stream direction",
-                })
+                });
             }
             _ if direct => Path::Direct,
             _ => Path::Ir,
@@ -664,7 +664,7 @@ impl<'a, 'c> StreamConverter<'a, 'c> {
                 return Err(Error::InvalidInput {
                     field: "buffer",
                     reason: "use the typed workspace replacement method",
-                })
+                });
             }
         };
         if buffer.len() < used {
@@ -810,7 +810,7 @@ impl<'a, 'c> StreamConverter<'a, 'c> {
                         buffer: BufferKind::Framing,
                         needed,
                         exact: false,
-                    }
+                    };
                 }
                 sse::Status::Event => {
                     let frame = match self.framing.event() {
@@ -829,7 +829,7 @@ impl<'a, 'c> StreamConverter<'a, 'c> {
                                 buffer: BufferKind::Data,
                                 needed,
                                 exact: true,
-                            }
+                            };
                         }
                         Err(error) => {
                             self.error = Some(error);

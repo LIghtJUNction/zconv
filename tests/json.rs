@@ -1,6 +1,6 @@
-use zconv::json;
-use zconv::json::{parse, JsonError, JsonString, Kind, Limits, Token, Writer};
 use zconv::Error;
+use zconv::json;
+use zconv::json::{JsonError, JsonString, Kind, Limits, Token, Writer, parse};
 
 #[test]
 fn borrowed_structure_and_arbitrary_field_order() {
@@ -17,12 +17,14 @@ fn borrowed_structure_and_arbitrary_field_order() {
     assert_eq!(values[2].as_bool(), Some(true));
     assert_eq!(values[3].raw(), b"-12.50e+2");
     assert_eq!(values[3].as_u64(), None);
-    assert!(values[4]
-        .get("s")
-        .unwrap()
-        .as_string()
-        .unwrap()
-        .eq_str("hi"));
+    assert!(
+        values[4]
+            .get("s")
+            .unwrap()
+            .as_string()
+            .unwrap()
+            .eq_str("hi")
+    );
     assert_eq!(
         root.object()
             .map(|(key, _)| key.as_str().unwrap())
@@ -77,12 +79,14 @@ fn duplicate_keys_are_rejected_after_unescaping() {
         );
     }
     let mut tokens = [Token::EMPTY; 64];
-    assert!(parse(
-        br#"{"a":0,"b":{"a":1},"A":2}"#,
-        &mut tokens,
-        Limits::default()
-    )
-    .is_ok());
+    assert!(
+        parse(
+            br#"{"a":0,"b":{"a":1},"A":2}"#,
+            &mut tokens,
+            Limits::default()
+        )
+        .is_ok()
+    );
 }
 
 #[test]

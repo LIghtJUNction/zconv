@@ -74,7 +74,7 @@ fn run(input: &[u8], config: StreamConfig<'_>, split: usize, output_size: usize)
                     converter.report(),
                     converter.usage(),
                     converter.memory(),
-                ))
+                ));
             }
             Status::Failed(error) => return Err((error, result)),
             Status::NeedBuffer { buffer, needed, .. } => {

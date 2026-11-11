@@ -7,8 +7,8 @@
 //! be reused immediately after decoding.
 
 use crate::{
-    json::{JsonString, RawValue},
     Format,
+    json::{JsonString, RawValue},
 };
 
 /// Missing, explicit null, and present values are distinct states.
@@ -504,7 +504,7 @@ impl<'r, 'a> Iterator for Losses<'r, 'a> {
                         && self.policy.drop_extensions
                         && !e.is_empty_annotation() =>
                 {
-                    return Some(Loss::Extension(*e))
+                    return Some(Loss::Extension(*e));
                 }
                 _ => (Presence::Missing, Presence::Missing),
             };

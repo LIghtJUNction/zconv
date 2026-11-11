@@ -2,13 +2,15 @@
 use std::{hint::black_box, time::Instant};
 use zconv::ir::{Context, Policy, Record};
 use zconv::json::Token;
-use zconv::{convert, Operation, Options, Protocol, Strategy, Workspace};
+use zconv::{Operation, Options, Protocol, Strategy, Workspace, convert};
 
 fn main() {
     let quick = !std::env::args().any(|arg| arg == "--full");
     let iterations = if quick { 50 } else { 10_000 };
     let rounds = if quick { 3 } else { 15 };
-    println!("case,strategy,input_bytes,output_bytes,median_ns,p95_ns,mib_per_second,token_bytes_reserved,ir_bytes_reserved,ir_records_used,scratch_bytes_reserved,nested_token_bytes_reserved");
+    println!(
+        "case,strategy,input_bytes,output_bytes,median_ns,p95_ns,mib_per_second,token_bytes_reserved,ir_bytes_reserved,ir_records_used,scratch_bytes_reserved,nested_token_bytes_reserved"
+    );
     let small = br#"{"model":"test-model","messages":[{"role":"user","content":"hello"}],"max_completion_tokens":17,"temperature":0,"stream":false}"#.to_vec();
     let unicode = "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"你好，世界。Δοκιμή 😀 \\\"quoted\\\" \\u4e2d\"}],\"max_completion_tokens\":17}".as_bytes().to_vec();
     let long = format!("{{\"model\":\"test-model\",\"messages\":[{{\"role\":\"user\",\"content\":\"{}\"}}],\"max_completion_tokens\":17}}", "abcdef 中文 ".repeat(4096)).into_bytes();
@@ -82,9 +84,17 @@ fn main() {
                 let p95 = times[(times.len() * 95 / 100).min(times.len() - 1)];
                 let result = last.unwrap();
                 let r = result.resources;
-                println!("{name}_{target:?},{strategy:?},{},{},{median:.1},{p95:.1},{:.2},{},{},{},{},{}",
-                    input.len(), result.written(), input.len() as f64 / 1048576.0 / (median * 1e-9),
-                    r.token_storage_bytes, r.ir_storage_bytes, r.ir_records_used, r.scratch_capacity, r.nested_token_storage_bytes);
+                println!(
+                    "{name}_{target:?},{strategy:?},{},{},{median:.1},{p95:.1},{:.2},{},{},{},{},{}",
+                    input.len(),
+                    result.written(),
+                    input.len() as f64 / 1048576.0 / (median * 1e-9),
+                    r.token_storage_bytes,
+                    r.ir_storage_bytes,
+                    r.ir_records_used,
+                    r.scratch_capacity,
+                    r.nested_token_storage_bytes
+                );
             }
         }
     }

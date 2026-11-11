@@ -1,6 +1,6 @@
 use zconv::ir::Record;
 use zconv::json::Token;
-use zconv::{convert, Operation, Options, Protocol, Workspace};
+use zconv::{Operation, Options, Protocol, Workspace, convert};
 
 fn main() -> Result<(), zconv::Error> {
     let input = br#"{"model":"example-model","messages":[{"role":"user","content":"Hello"}]}"#;

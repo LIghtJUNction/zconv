@@ -1,7 +1,7 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 use zconv::{
-    convert, ir::Record, json::Token, Format, Operation, Options, Protocol, Strategy, Workspace,
+    Format, Operation, Options, Protocol, Strategy, Workspace, convert, ir::Record, json::Token,
 };
 
 const PROTOCOLS: [Protocol; 6] = [

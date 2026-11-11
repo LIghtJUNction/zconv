@@ -16,8 +16,8 @@ use std::mem::size_of;
 use std::time::Instant;
 use zconv::json::{Limits, Token};
 use zconv::stream::{
-    decode_event, ActiveItem, Event, Memory, Report, Status, StreamBuffers, StreamConfig,
-    StreamConverter,
+    ActiveItem, Event, Memory, Report, Status, StreamBuffers, StreamConfig, StreamConverter,
+    decode_event,
 };
 use zconv::{Path, Protocol, Strategy};
 
@@ -343,9 +343,15 @@ fn main() {
         size_of::<Memory>(),
         size_of::<Report>()
     );
-    println!("# batch_*_ns are statistics of per-stream batch means; single_*_ns and first_write_*_ns are separate individual samples.");
-    println!("# first_write is the first step return with written>0, including converter construction; all-input/full-output may return only after the whole stream is converted.");
-    println!("# All allocation, fixture building, calibration formatting and result printing are outside measured loops. No competitor speed claim is made.");
+    println!(
+        "# batch_*_ns are statistics of per-stream batch means; single_*_ns and first_write_*_ns are separate individual samples."
+    );
+    println!(
+        "# first_write is the first step return with written>0, including converter construction; all-input/full-output may return only after the whole stream is converted."
+    );
+    println!(
+        "# All allocation, fixture building, calibration formatting and result printing are outside measured loops. No competitor speed claim is made."
+    );
     for target in [Protocol::AnthropicMessages, Protocol::OpenAiResponses] {
         for strategy in [Strategy::Auto, Strategy::Direct, Strategy::Ir] {
             for byte_input in [false, true] {
@@ -362,21 +368,45 @@ fn main() {
             }
         }
     }
-    println!("target,strategy,path,input_chunk_bytes,output_slice_bytes,input_bytes,output_bytes,step_calls,streams_per_batch,batches,batch_mean_ns,batch_median_ns,batch_mean_p95_ns,single_mean_ns,single_median_ns,single_p95_ns,first_write_mean_ns,first_write_median_ns,first_write_p95_ns,input_mib_per_second,output_mib_per_second");
+    println!(
+        "target,strategy,path,input_chunk_bytes,output_slice_bytes,input_bytes,output_bytes,step_calls,streams_per_batch,batches,batch_mean_ns,batch_median_ns,batch_mean_p95_ns,single_mean_ns,single_median_ns,single_p95_ns,first_write_mean_ns,first_write_median_ns,first_write_p95_ns,input_mib_per_second,output_mib_per_second"
+    );
     for row in &results {
         let seconds = row.batch.mean * 1e-9;
-        println!("{:?},{:?},{:?},{},{},{},{},{},{},{},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.3},{:.3}",
-            row.target, row.strategy, row.observation.path, row.input_chunk, row.output_capacity,
-            fixture.wire.len(), row.observation.output_bytes, row.observation.calls, row.iterations, row.batches,
-            row.batch.mean, row.batch.median, row.batch.p95,
-            row.single.mean, row.single.median, row.single.p95,
-            row.first_write.mean, row.first_write.median, row.first_write.p95,
+        println!(
+            "{:?},{:?},{:?},{},{},{},{},{},{},{},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.3},{:.3}",
+            row.target,
+            row.strategy,
+            row.observation.path,
+            row.input_chunk,
+            row.output_capacity,
+            fixture.wire.len(),
+            row.observation.output_bytes,
+            row.observation.calls,
+            row.iterations,
+            row.batches,
+            row.batch.mean,
+            row.batch.median,
+            row.batch.p95,
+            row.single.mean,
+            row.single.median,
+            row.single.p95,
+            row.first_write.mean,
+            row.first_write.median,
+            row.first_write.p95,
             fixture.wire.len() as f64 / 1048576.0 / seconds,
-            row.observation.output_bytes as f64 / 1048576.0 / seconds);
+            row.observation.output_bytes as f64 / 1048576.0 / seconds
+        );
     }
-    println!("# memory: byte capacities/peaks except explicitly named *_records; input and caller output are separate from converter workspaces.");
-    println!("# workspace_high_water_sum adds independent region high-water marks; it is not a measured concurrent peak, stack peak or RSS. Event IR high water is measured from fixture preflight decoding.");
-    println!("target,strategy,input_chunk_bytes,output_slice_bytes,output_backing_capacity,state_bytes,framing_capacity,framing_peak,data_capacity,data_peak,pending_capacity,pending_peak,token_capacity,token_peak_records,token_peak_bytes,item_capacity,item_peak_records,item_peak_bytes,checkpoint_capacity,event_ir_capacity,event_ir_peak_records,event_ir_peak_bytes,ir_events_total,aggregate_capacity,aggregate_used,aggregate_peak,state_and_buffer_capacity_total,workspace_high_water_sum");
+    println!(
+        "# memory: byte capacities/peaks except explicitly named *_records; input and caller output are separate from converter workspaces."
+    );
+    println!(
+        "# workspace_high_water_sum adds independent region high-water marks; it is not a measured concurrent peak, stack peak or RSS. Event IR high water is measured from fixture preflight decoding."
+    );
+    println!(
+        "target,strategy,input_chunk_bytes,output_slice_bytes,output_backing_capacity,state_bytes,framing_capacity,framing_peak,data_capacity,data_peak,pending_capacity,pending_peak,token_capacity,token_peak_records,token_peak_bytes,item_capacity,item_peak_records,item_peak_bytes,checkpoint_capacity,event_ir_capacity,event_ir_peak_records,event_ir_peak_bytes,ir_events_total,aggregate_capacity,aggregate_used,aggregate_peak,state_and_buffer_capacity_total,workspace_high_water_sum"
+    );
     for row in &results {
         let m = row.observation.memory;
         let event_peak = if row.observation.path == Path::Ir {

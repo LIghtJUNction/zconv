@@ -7,8 +7,8 @@
 //! Chat/Responses additionally have direct function-tool request conversion.
 
 use crate::ir::{
-    Context, EncodeReport, Policy, Presence, Text, METADATA_CREATED, METADATA_ITEM_ID,
-    METADATA_ITEM_STATUS,
+    Context, EncodeReport, METADATA_CREATED, METADATA_ITEM_ID, METADATA_ITEM_STATUS, Policy,
+    Presence, Text,
 };
 use crate::json::{JsonString, Kind, Token, Value, Writer};
 use crate::{Error, Format, Operation, Profile, Protocol};

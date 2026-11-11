@@ -300,7 +300,7 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
                     BlockKind::Refusal => {
                         return Err(Error::Unsupported {
                             feature: "Anthropic refusal content stream",
-                        })
+                        });
                     }
                 }
                 self.end_event();
@@ -346,7 +346,7 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
                     BlockKind::Refusal => {
                         return Err(Error::Unsupported {
                             feature: "Interactions refusal stream",
-                        })
+                        });
                     }
                 }
                 self.end_event();
@@ -678,7 +678,7 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
                     FinishReason::Other => {
                         return Err(Error::Unsupported {
                             feature: "finish reason",
-                        })
+                        });
                     }
                 });
                 self.writer.raw(b"}]}\n\n");
@@ -694,7 +694,7 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
                     FinishReason::Other => {
                         return Err(Error::Unsupported {
                             feature: "finish reason",
-                        })
+                        });
                     }
                 });
                 self.writer.raw(b"}]}\n\n");
@@ -983,7 +983,7 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                 return Err(Error::InvalidInput {
                     field: "delta index",
                     reason: "block has not started",
-                })
+                });
             }
         };
         if self.items[slot].closed {
@@ -1147,7 +1147,7 @@ impl Sink for Emitter<'_, '_, '_, '_> {
             _ => {
                 return Err(Error::Unsupported {
                     feature: "thinking signature target",
-                })
+                });
             }
         }
         Ok(())
@@ -1294,7 +1294,7 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                     FinishReason::Other => {
                         return Err(Error::Unsupported {
                             feature: "stop reason",
-                        })
+                        });
                     }
                 });
                 self.writer.raw(b",\"stop_sequence\":null},\"usage\":");
@@ -1321,7 +1321,7 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                     Completion::Cancelled => {
                         return Err(Error::Unsupported {
                             feature: "Responses SSE cancellation terminal event",
-                        })
+                        });
                     }
                     _ => b"response.completed",
                 })?;

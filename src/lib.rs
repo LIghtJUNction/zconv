@@ -41,5 +41,5 @@ pub mod protocol;
 pub mod sse;
 pub mod stream;
 mod types;
-pub use convert::{convert, Conversion, Options, Resources, Workspace};
+pub use convert::{Conversion, Options, Resources, Workspace, convert};
 pub use types::*;

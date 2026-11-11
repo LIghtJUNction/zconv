@@ -1,6 +1,6 @@
 use zconv::ir::{Context, Policy, Record};
 use zconv::json::Token;
-use zconv::{convert, Error, Format, Operation, Options, Path, Protocol, Strategy, Workspace};
+use zconv::{Error, Format, Operation, Options, Path, Protocol, Strategy, Workspace, convert};
 
 const CHAT: &[u8] = br#"{"model":"m","messages":[{"role":"user","content":"hello"}]}"#;
 

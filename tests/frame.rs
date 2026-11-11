@@ -1,7 +1,7 @@
 use zconv::json::{self, JsonString, Limits, Token};
 use zconv::stream::{
-    decode_frame_format, validate_stream_format, BlockKind, Completion, Event, EventKind,
-    InputCount, OutputCount, Usage, UsageAccumulator,
+    BlockKind, Completion, Event, EventKind, InputCount, OutputCount, Usage, UsageAccumulator,
+    decode_frame_format, validate_stream_format,
 };
 use zconv::{Error, Format, Profile, Protocol};
 
@@ -33,15 +33,17 @@ fn framed_done_is_protocol_checked_and_recovers_event_capacity() {
         );
         assert_eq!(events[0].kind, EventKind::Finish);
         assert_eq!(events[0].completion, Completion::Completed);
-        assert!(decode_frame_format(
-            protocol.into(),
-            b"response.completed",
-            b"[DONE]",
-            &mut [],
-            &mut events,
-            Limits::default(),
-        )
-        .is_err());
+        assert!(
+            decode_frame_format(
+                protocol.into(),
+                b"response.completed",
+                b"[DONE]",
+                &mut [],
+                &mut events,
+                Limits::default(),
+            )
+            .is_err()
+        );
     }
     for protocol in [
         Protocol::OpenAiResponses,
@@ -123,24 +125,30 @@ fn frame_names_match_decoded_discriminators_and_preserve_distinct_ids() {
 #[test]
 fn stream_format_can_be_checked_without_input_or_storage() {
     assert!(validate_stream_format(Protocol::AnthropicMessages.into()).is_ok());
-    assert!(validate_stream_format(Format {
-        protocol: Protocol::AnthropicMessages,
-        version: "2026-10-21",
-        profile: Profile::Standard,
-    })
-    .is_err());
-    assert!(validate_stream_format(Format {
-        protocol: Protocol::OpenAiChat,
-        version: "v1",
-        profile: Profile::OpenAiCompatible("test-provider"),
-    })
-    .is_ok());
-    assert!(validate_stream_format(Format {
-        protocol: Protocol::OpenAiChat,
-        version: "v1",
-        profile: Profile::OpenAiCompatible(""),
-    })
-    .is_err());
+    assert!(
+        validate_stream_format(Format {
+            protocol: Protocol::AnthropicMessages,
+            version: "2026-10-21",
+            profile: Profile::Standard,
+        })
+        .is_err()
+    );
+    assert!(
+        validate_stream_format(Format {
+            protocol: Protocol::OpenAiChat,
+            version: "v1",
+            profile: Profile::OpenAiCompatible("test-provider"),
+        })
+        .is_ok()
+    );
+    assert!(
+        validate_stream_format(Format {
+            protocol: Protocol::OpenAiChat,
+            version: "v1",
+            profile: Profile::OpenAiCompatible(""),
+        })
+        .is_err()
+    );
 }
 
 #[test]
@@ -224,34 +232,42 @@ fn usage_overflow_is_atomic_and_initial_context_has_canonical_basis() {
     })
     .unwrap();
     let saved = accumulator;
-    assert!(accumulator
-        .update(Usage {
-            input: Some(u64::MAX),
-            cached: Some(1),
+    assert!(
+        accumulator
+            .update(Usage {
+                input: Some(u64::MAX),
+                cached: Some(1),
+                input_basis: InputCount::Uncached,
+                ..Usage::default()
+            })
+            .is_err()
+    );
+    assert_eq!(accumulator, saved);
+    assert!(
+        accumulator
+            .update(Usage {
+                output: Some(u64::MAX),
+                reasoning: Some(1),
+                output_basis: OutputCount::Visible,
+                ..Usage::default()
+            })
+            .is_err()
+    );
+    assert_eq!(accumulator, saved);
+    assert!(
+        UsageAccumulator::new(Usage {
             input_basis: InputCount::Uncached,
             ..Usage::default()
         })
-        .is_err());
-    assert_eq!(accumulator, saved);
-    assert!(accumulator
-        .update(Usage {
-            output: Some(u64::MAX),
-            reasoning: Some(1),
+        .is_err()
+    );
+    assert!(
+        UsageAccumulator::new(Usage {
             output_basis: OutputCount::Visible,
             ..Usage::default()
         })
-        .is_err());
-    assert_eq!(accumulator, saved);
-    assert!(UsageAccumulator::new(Usage {
-        input_basis: InputCount::Uncached,
-        ..Usage::default()
-    })
-    .is_err());
-    assert!(UsageAccumulator::new(Usage {
-        output_basis: OutputCount::Visible,
-        ..Usage::default()
-    })
-    .is_err());
+        .is_err()
+    );
 }
 
 #[test]
@@ -295,16 +311,18 @@ fn scratch_capacity_is_distinct_from_token_capacity_and_retryable() {
         ),
         Err(Error::WorkspaceTooSmall { .. })
     ));
-    assert!(encode_request(
-        &request,
-        target,
-        &context,
-        Policy::default(),
-        &mut output,
-        &mut scratch,
-        &mut tokens,
-    )
-    .is_ok());
+    assert!(
+        encode_request(
+            &request,
+            target,
+            &context,
+            Policy::default(),
+            &mut output,
+            &mut scratch,
+            &mut tokens,
+        )
+        .is_ok()
+    );
     for record in request.records.iter_mut() {
         if let Record::Block(block) = record {
             if let Content::ToolCall { arguments, .. } = &mut block.content {
@@ -360,9 +378,11 @@ fn completed_empty_message_retains_an_item_without_fabricating_a_delta() {
     assert_eq!(events[1].kind, EventKind::BlockEnd);
     assert_eq!(events[0].key, events[1].key);
     let id = events[0].item_id;
-    assert!(JsonString::parse(&done[id.offset..id.offset + id.length])
-        .unwrap()
-        .eq_str("msg-empty"));
+    assert!(
+        JsonString::parse(&done[id.offset..id.offset + id.length])
+            .unwrap()
+            .eq_str("msg-empty")
+    );
     let completed = br#"{"type":"response.completed","response":{"output":[{"id":"msg-empty","type":"message","role":"assistant","content":[],"status":"completed"}]}}"#;
     let count = decode_frame_format(
         Protocol::OpenAiResponses.into(),

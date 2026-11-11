@@ -1,8 +1,8 @@
 use super::{invalid, validate_format};
 use crate::{
+    Error, Format, Profile, Protocol,
     ir::*,
     json::{self, Kind, RawValue, Token, Writer},
-    Error, Format, Profile, Protocol,
 };
 
 fn write_text(w: &mut Writer<'_>, text: Text<'_>) {
@@ -248,7 +248,7 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                         Content::Opaque { source, .. } if source != self.target => {
                             return Err(Error::Unsupported {
                                 feature: "opaque content block",
-                            })
+                            });
                         }
                         Content::Media(Media {
                             source: MediaSource::FileId { namespace, .. },
@@ -256,7 +256,7 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                         }) if namespace != self.target => {
                             return Err(Error::ContextRequired {
                                 field: "mapped provider file reference",
-                            })
+                            });
                         }
                         _ => {}
                     }
@@ -504,7 +504,7 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                         _ => {
                             return Err(Error::Unsupported {
                                 feature: "Chat audio requires inline base64",
-                            })
+                            });
                         }
                     };
                     key(&mut self.w, &mut comma, "type");
@@ -553,7 +553,7 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                         _ => {
                             return Err(Error::Unsupported {
                                 feature: "file reference target representation",
-                            })
+                            });
                         }
                     }
                     ptext(&mut self.w, &mut comma, "filename", media.filename);
@@ -662,7 +662,7 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                 _ => {
                     return Err(Error::Unsupported {
                         feature: "provider file reference in Gemini",
-                    })
+                    });
                 }
             },
             Protocol::GeminiInteractions => {
@@ -694,7 +694,7 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                     _ => {
                         return Err(Error::Unsupported {
                             feature: "provider file reference in Interactions",
-                        })
+                        });
                     }
                 }
                 ptext(&mut self.w, &mut comma, "resolution", media.detail);
@@ -702,7 +702,7 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
             _ => {
                 return Err(Error::Unsupported {
                     feature: "media in legacy Completions",
-                })
+                });
             }
         }
         self.w.byte(b'}');
@@ -890,7 +890,7 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
             _ => {
                 return Err(Error::Unsupported {
                     feature: "content representation",
-                })
+                });
             }
         }
         self.extras(block.extensions, &mut c)?;
@@ -1582,7 +1582,7 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
             _ => {
                 return Err(Error::Unsupported {
                     feature: "non-item content",
-                })
+                });
             }
         }
         if !interactions {
@@ -1744,7 +1744,7 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
         let p = self.target.protocol;
         match choice {
             ToolChoice::Missing => {
-                return Err(invalid("tool_choice", "missing choice cannot be written"))
+                return Err(invalid("tool_choice", "missing choice cannot be written"));
             }
             ToolChoice::Null => self.w.raw(b"null"),
             ToolChoice::Opaque { source, value } => {
@@ -1817,7 +1817,7 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                 _ => {
                     return Err(Error::Unsupported {
                         feature: "tool choice in Completions",
-                    })
+                    });
                 }
             },
         }
@@ -2041,7 +2041,7 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                     Presence::Null => {
                         return Err(Error::Unsupported {
                             feature: "null output constraint in Gemini",
-                        })
+                        });
                     }
                     Presence::Value(v) => {
                         if v.source != self.target && v.mode == OutputMode::JsonSchema {
@@ -2210,7 +2210,7 @@ fn data_url_header(text: Text<'_>) -> Result<(usize, usize), Error> {
             _ => {
                 return Err(Error::Unsupported {
                     feature: "data URL MIME or non-base64 encoding",
-                })
+                });
             }
         }
         end = end
@@ -2378,7 +2378,7 @@ pub fn encode_request<'a>(
                 Record::Block(_) => {
                     return Err(Error::Unsupported {
                         feature: "non-text completion prompt",
-                    })
+                    });
                 }
                 _ => {}
             }
@@ -2436,7 +2436,7 @@ pub fn encode_request<'a>(
                                 _ => {
                                     return Err(Error::Unsupported {
                                         feature: "system instruction requires single text",
-                                    })
+                                    });
                                 }
                             }
                         }
@@ -2526,7 +2526,7 @@ pub fn encode_request<'a>(
                 return Err(invalid(
                     "instruction presence",
                     "invalid instruction source",
-                ))
+                ));
             }
         };
         key(&mut e.w, &mut comma, name);
@@ -2848,7 +2848,7 @@ pub fn encode_response<'a>(
                                     _ => {
                                         return Err(Error::Unsupported {
                                             feature: "multi-block or non-text completion response",
-                                        })
+                                        });
                                     }
                                 }
                             }
@@ -3040,12 +3040,12 @@ fn status_name(finish: Finish, target: Protocol) -> Result<&'static [u8], Error>
         Finish::Safety | Finish::Refusal => {
             return Err(Error::Unsupported {
                 feature: "safety finish requires target blocking detail",
-            })
+            });
         }
         Finish::Other => {
             return Err(Error::Unsupported {
                 feature: "unknown finish reason",
-            })
+            });
         }
     })
 }
@@ -3082,7 +3082,7 @@ fn write_finish(
             _ => {
                 return Err(Error::Unsupported {
                     feature: "finish reason in Anthropic",
-                })
+                });
             }
         },
         Protocol::GeminiGenerateContent => match choice.finish {
@@ -3093,7 +3093,7 @@ fn write_finish(
             _ => {
                 return Err(Error::Unsupported {
                     feature: "finish reason in Gemini",
-                })
+                });
             }
         },
         _ => match choice.finish {
@@ -3105,7 +3105,7 @@ fn write_finish(
             _ => {
                 return Err(Error::Unsupported {
                     feature: "finish reason in Chat",
-                })
+                });
             }
         },
     };
@@ -3171,7 +3171,7 @@ fn write_usage(
                 return Err(invalid(
                     "cached_tokens",
                     "null cannot participate in usage arithmetic",
-                ))
+                ));
             }
         };
         let write = match usage.cache_write_tokens {
@@ -3183,7 +3183,7 @@ fn write_usage(
                 return Err(invalid(
                     "cache_write_tokens",
                     "null cannot participate in usage arithmetic",
-                ))
+                ));
             }
         };
         input_count = Presence::Value(Number::Unsigned(
@@ -3304,7 +3304,7 @@ fn write_usage(
             Protocol::AnthropicMessages => {
                 return Err(Error::Unsupported {
                     feature: "reasoning usage count in Anthropic",
-                })
+                });
             }
             _ => pnumber(
                 &mut e.w,

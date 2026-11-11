@@ -1,6 +1,6 @@
 use zconv::ir::{Content, Presence, Record, Text};
 use zconv::ir::{Context, Policy};
-use zconv::{direct, json, Error, Format, Operation, Protocol};
+use zconv::{Error, Format, Operation, Protocol, direct, json};
 
 fn run(
     source: Protocol,
@@ -139,20 +139,24 @@ fn six_response_directions_preserve_text_finish_and_usage() {
         let document = json::parse(&returned, &mut tokens, json::Limits::default()).unwrap();
         let root = document.root();
         let choice = root.get("choices").unwrap().array().next().unwrap();
-        assert!(choice
-            .get("finish_reason")
-            .unwrap()
-            .as_string()
-            .unwrap()
-            .eq_str("length"));
-        assert!(choice
-            .get("message")
-            .unwrap()
-            .get("content")
-            .unwrap()
-            .as_string()
-            .unwrap()
-            .eq_str("hello"));
+        assert!(
+            choice
+                .get("finish_reason")
+                .unwrap()
+                .as_string()
+                .unwrap()
+                .eq_str("length")
+        );
+        assert!(
+            choice
+                .get("message")
+                .unwrap()
+                .get("content")
+                .unwrap()
+                .as_string()
+                .unwrap()
+                .eq_str("hello")
+        );
         assert_eq!(
             root.get("usage")
                 .unwrap()

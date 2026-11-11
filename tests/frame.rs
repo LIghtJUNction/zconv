@@ -324,10 +324,10 @@ fn scratch_capacity_is_distinct_from_token_capacity_and_retryable() {
         .is_ok()
     );
     for record in request.records.iter_mut() {
-        if let Record::Block(block) = record {
-            if let Content::ToolCall { arguments, .. } = &mut block.content {
-                *arguments = Data::JsonText(Text::Utf8("{\"x\":1}"));
-            }
+        if let Record::Block(block) = record
+            && let Content::ToolCall { arguments, .. } = &mut block.content
+        {
+            *arguments = Data::JsonText(Text::Utf8("{\"x\":1}"));
         }
     }
     assert_eq!(

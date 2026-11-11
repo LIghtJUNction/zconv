@@ -133,7 +133,7 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
     fn lookup(&self, key: Key, kind: Option<BlockKind>) -> Option<usize> {
         self.items[..self.state.item_count]
             .iter()
-            .position(|item| item.key == key && kind.map_or(true, |kind| item.kind == kind))
+            .position(|item| item.key == key && kind.is_none_or(|kind| item.kind == kind))
     }
     fn write_chain(&mut self, item: ActiveItem, quoted: bool) -> Result<(), Error> {
         if quoted {
@@ -648,14 +648,14 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
                 number(&mut self.writer, value);
             }
         }
-        if protocol == Protocol::AnthropicMessages {
-            if let Some(value) = usage.cache_write {
-                if !first {
-                    self.writer.byte(b',');
-                }
-                self.writer.raw(b"\"cache_creation_input_tokens\":");
-                number(&mut self.writer, value);
+        if protocol == Protocol::AnthropicMessages
+            && let Some(value) = usage.cache_write
+        {
+            if !first {
+                self.writer.byte(b',');
             }
+            self.writer.raw(b"\"cache_creation_input_tokens\":");
+            number(&mut self.writer, value);
         }
         self.writer.byte(b'}');
         Ok(())

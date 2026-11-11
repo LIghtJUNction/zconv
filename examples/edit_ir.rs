@@ -10,10 +10,10 @@ fn main() -> Result<(), zconv::Error> {
     let request =
         protocol::decode_request(Protocol::OpenAiChat.into(), document.root(), &mut records)?;
     for record in request.records.iter_mut() {
-        if let Record::Block(block) = record {
-            if matches!(block.content, Content::Text(_)) {
-                block.content = Content::Text(Text::Utf8("After an explicit IR edit: 你好 😀"));
-            }
+        if let Record::Block(block) = record
+            && matches!(block.content, Content::Text(_))
+        {
+            block.content = Content::Text(Text::Utf8("After an explicit IR edit: 你好 😀"));
         }
     }
     let mut output = [0; 1024];

@@ -134,10 +134,10 @@ fn caller_can_edit_text_then_reuse_token_tape() {
         protocol::decode_request(Format::new(Protocol::OpenAiChat), doc.root(), &mut records)
             .unwrap();
     for record in request.records.iter_mut() {
-        if let Record::Block(b) = record {
-            if matches!(b.content, Content::Text(_)) {
-                b.content = Content::Text(Text::Utf8("edited 😀\n\""));
-            }
+        if let Record::Block(b) = record
+            && matches!(b.content, Content::Text(_))
+        {
+            b.content = Content::Text(Text::Utf8("edited 😀\n\""));
         }
     }
     let mut out = [0u8; 1024];

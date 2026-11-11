@@ -312,22 +312,24 @@ fn check_function_definition(
         keys(named, &["name", "description", "parameters", "strict"])?;
     }
     string(required(named, "name")?, "name")?;
-    if let Some(value) = named.get("description") {
-        if !value.is_null() {
-            string(value, "description")?;
-        }
+    if let Some(value) = named.get("description")
+        && !value.is_null()
+    {
+        string(value, "description")?;
     }
-    if let Some(value) = named.get("parameters") {
-        if !value.is_null() && value.kind() != Kind::Object {
-            return Err(invalid("parameters", "expected object"));
-        }
+    if let Some(value) = named.get("parameters")
+        && !value.is_null()
+        && value.kind() != Kind::Object
+    {
+        return Err(invalid("parameters", "expected object"));
     }
-    if let Some(value) = named.get("strict") {
-        if !value.is_null() && value.as_bool().is_none() {
-            return Err(invalid("strict", "expected boolean"));
-        }
+    if let Some(value) = named.get("strict")
+        && !value.is_null()
+        && value.as_bool().is_none()
+    {
+        return Err(invalid("strict", "expected boolean"));
     }
-    if source == Protocol::OpenAiResponses && named.get("strict").map_or(true, Value::is_null) {
+    if source == Protocol::OpenAiResponses && named.get("strict").is_none_or(Value::is_null) {
         // Responses can normalize schemas when strictness is implicit; Chat
         // cannot reproduce that provider operation by merely omitting a flag.
         return Err(Error::ContextRequired {
@@ -418,7 +420,7 @@ fn write_function_definition(
     }
     if source == Protocol::OpenAiChat
         && target == Protocol::OpenAiResponses
-        && definition.get("strict").map_or(true, Value::is_null)
+        && definition.get("strict").is_none_or(Value::is_null)
     {
         // Preserve Chat's non-strict default across Responses' different default.
         writer.raw(b",\"strict\":false");
@@ -488,10 +490,10 @@ fn call_id<'a>(
     name: Option<JsonString<'a>>,
     context: &Context<'a>,
 ) -> Result<Text<'a>, Error> {
-    if let Some(value) = id {
-        if !value.is_null() {
-            return Ok(Text::Json(string(value, "tool call ID")?));
-        }
+    if let Some(value) = id
+        && !value.is_null()
+    {
+        return Ok(Text::Json(string(value, "tool call ID")?));
     }
     let name = name.ok_or(Error::ContextRequired {
         field: "tool call ID",
@@ -593,10 +595,10 @@ fn check_chat_history(
                 context,
             )?;
         }
-        if let Some(content) = message.get("content") {
-            if !content.is_null() {
-                check_text(content, Protocol::OpenAiChat)?;
-            }
+        if let Some(content) = message.get("content")
+            && !content.is_null()
+        {
+            check_text(content, Protocol::OpenAiChat)?;
         }
     } else {
         check_text(required(message, "content")?, Protocol::OpenAiChat)?;
@@ -712,20 +714,19 @@ fn write_chat_history(
     }
     let modern = message.get("tool_calls");
     let legacy = message.get("function_call");
-    if let Some(content) = message.get("content") {
-        if content.kind() == Kind::String
+    if let Some(content) = message.get("content")
+        && (content.kind() == Kind::String
             || (content.kind() == Kind::Array
-                && (content.array().next().is_some() || (modern.is_none() && legacy.is_none())))
-        {
-            separate(writer, first);
-            write_message(
-                writer,
-                role,
-                content,
-                Protocol::OpenAiChat,
-                Protocol::OpenAiResponses,
-            );
-        }
+                && (content.array().next().is_some() || (modern.is_none() && legacy.is_none()))))
+    {
+        separate(writer, first);
+        write_message(
+            writer,
+            role,
+            content,
+            Protocol::OpenAiChat,
+            Protocol::OpenAiResponses,
+        );
     }
     for call in modern.into_iter().flat_map(Value::array) {
         let function = required(call, "function")?;
@@ -805,10 +806,10 @@ fn check_text(value: V<'_, '_>, source: Protocol) -> Result<(), Error> {
                 if !is(block.get("type"), "input_text") && !is(block.get("type"), "output_text") {
                     return Err(unavailable("non-text Responses block"));
                 }
-                if let Some(annotations) = block.get("annotations") {
-                    if annotations.kind() != Kind::Array || annotations.array().next().is_some() {
-                        return Err(unavailable("response annotations"));
-                    }
+                if let Some(annotations) = block.get("annotations")
+                    && (annotations.kind() != Kind::Array || annotations.array().next().is_some())
+                {
+                    return Err(unavailable("response annotations"));
                 }
             }
             _ => {
@@ -1129,17 +1130,17 @@ fn request<'a>(
     }
     writer.byte(b'[');
     let mut first = true;
-    if target == OpenAiChat {
-        if let Some(content) = instructions.or(system) {
-            writer.raw(b"{\"role\":\"system\",\"content\":");
-            if content.kind() == Kind::String {
-                writer.raw(content.raw());
-            } else {
-                write_blocks(&mut writer, content, source, target, false);
-            }
-            writer.byte(b'}');
-            first = false;
+    if target == OpenAiChat
+        && let Some(content) = instructions.or(system)
+    {
+        writer.raw(b"{\"role\":\"system\",\"content\":");
+        if content.kind() == Kind::String {
+            writer.raw(content.raw());
+        } else {
+            write_blocks(&mut writer, content, source, target, false);
         }
+        writer.byte(b'}');
+        first = false;
     }
     if source == OpenAiResponses && messages.kind() == Kind::String {
         if !first {
@@ -1178,20 +1179,20 @@ fn request<'a>(
         }
     }
     writer.byte(b']');
-    if source == OpenAiChat {
-        if let Some(content) = system {
-            if target == AnthropicMessages {
-                property(&mut writer, b"system");
-                if content.kind() == Kind::String {
-                    writer.raw(content.raw());
-                } else {
-                    write_blocks(&mut writer, content, source, target, false);
-                }
-            } else if target == GeminiGenerateContent {
-                writer.raw(b",\"systemInstruction\":{\"parts\":");
+    if source == OpenAiChat
+        && let Some(content) = system
+    {
+        if target == AnthropicMessages {
+            property(&mut writer, b"system");
+            if content.kind() == Kind::String {
+                writer.raw(content.raw());
+            } else {
                 write_blocks(&mut writer, content, source, target, false);
-                writer.byte(b'}');
             }
+        } else if target == GeminiGenerateContent {
+            writer.raw(b",\"systemInstruction\":{\"parts\":");
+            write_blocks(&mut writer, content, source, target, false);
+            writer.byte(b'}');
         }
     }
     let parameters = if source == GeminiGenerateContent {
@@ -1459,15 +1460,15 @@ fn check_usage(root: V<'_, '_>, source: Protocol, target: Protocol) -> Result<()
                 return Err(invalid("usage", "expected unsigned integer"));
             }
         }
-        if target == Protocol::AnthropicMessages {
-            if let Some(total) = usage.get(total) {
-                let calculated = usage
-                    .get(input)
-                    .and_then(Value::as_u64)
-                    .and_then(|v| v.checked_add(usage.get(output)?.as_u64()?));
-                if total.as_u64() != calculated {
-                    return Err(unavailable("non-additive total token count"));
-                }
+        if target == Protocol::AnthropicMessages
+            && let Some(total) = usage.get(total)
+        {
+            let calculated = usage
+                .get(input)
+                .and_then(Value::as_u64)
+                .and_then(|v| v.checked_add(usage.get(output)?.as_u64()?));
+            if total.as_u64() != calculated {
+                return Err(unavailable("non-additive total token count"));
             }
         }
     }
@@ -1499,19 +1500,19 @@ fn write_usage(writer: &mut Writer<'_>, root: V<'_, '_>, source: Protocol, targe
                 writer.raw(value.raw());
             }
         }
-        if target != Protocol::AnthropicMessages && usage.get(total).is_none() {
-            if let Some(value) = usage
+        if target != Protocol::AnthropicMessages
+            && usage.get(total).is_none()
+            && let Some(value) = usage
                 .get(input)
                 .and_then(Value::as_u64)
                 .and_then(|a| a.checked_add(usage.get(output)?.as_u64()?))
-            {
-                if separator {
-                    writer.byte(b',');
-                }
-                writer.string(target_total.as_bytes());
-                writer.byte(b':');
-                unsigned(writer, value);
+        {
+            if separator {
+                writer.byte(b',');
             }
+            writer.string(target_total.as_bytes());
+            writer.byte(b':');
+            unsigned(writer, value);
         }
         writer.byte(b'}');
     }
@@ -1692,10 +1693,10 @@ fn response<'a>(
             }
             keys(item, &["type", "id", "status", "role", "content"])?;
             for field in ["id", "status", "role", "type"] {
-                if let Some(value) = item.get(field) {
-                    if !value.is_null() {
-                        string(value, field)?;
-                    }
+                if let Some(value) = item.get(field)
+                    && !value.is_null()
+                {
+                    string(value, field)?;
                 }
             }
             if !is(item.get("type"), "message") || !is(item.get("role"), "assistant") {

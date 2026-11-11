@@ -53,10 +53,10 @@ impl<'a> Event<'a> {
     pub fn id(self) -> Option<&'a [u8]> {
         let mut result = None;
         for line in self.lines.split(|&b| b == b'\n') {
-            if let Some(value) = field(line, b"id") {
-                if !value.contains(&0) {
-                    result = Some(value);
-                }
+            if let Some(value) = field(line, b"id")
+                && !value.contains(&0)
+            {
+                result = Some(value);
             }
         }
         result

@@ -278,15 +278,13 @@ impl<'s, 'a> Arena<'s, 'a> {
             if self.source.protocol == Protocol::AnthropicMessages
                 && self.source.version == "2026-10-21"
                 && role == Role::User
+                && let Some(c) = v.get("citations")
+                && c.array().next().is_some()
             {
-                if let Some(c) = v.get("citations") {
-                    if c.array().next().is_some() {
-                        return Err(invalid(
-                            "citations",
-                            "user citations are disallowed in 2026-10-21",
-                        ));
-                    }
-                }
+                return Err(invalid(
+                    "citations",
+                    "user citations are disallowed in 2026-10-21",
+                ));
             }
             self.block(
                 Content::Text(req_text(v, "text")?),
@@ -716,59 +714,58 @@ impl<'s, 'a> Arena<'s, 'a> {
             if let Some(reasoning) = v
                 .get("reasoning_content")
                 .filter(|_| !matches!(self.source.profile, crate::Profile::Standard))
+                && !reasoning.is_null()
             {
-                if !reasoning.is_null() {
-                    self.block(
-                        Content::Reasoning {
-                            kind: ReasoningKind::Thought,
-                            text: Presence::Value(text(reasoning, "reasoning_content")?),
-                            signature: Presence::Missing,
-                        },
-                        None,
-                        &[],
-                        Presence::Missing,
+                self.block(
+                    Content::Reasoning {
+                        kind: ReasoningKind::Thought,
+                        text: Presence::Value(text(reasoning, "reasoning_content")?),
+                        signature: Presence::Missing,
+                    },
+                    None,
+                    &[],
+                    Presence::Missing,
+                )?;
+            }
+            if let Some(refusal) = v.get("refusal")
+                && !refusal.is_null()
+            {
+                self.block(
+                    Content::Refusal(text(refusal, "refusal")?),
+                    None,
+                    &[],
+                    Presence::Missing,
+                )?;
+            }
+            if let Some(calls) = v.get("tool_calls")
+                && !calls.is_null()
+            {
+                if r != Role::Assistant {
+                    return Err(invalid("tool_calls", "must belong to assistant"));
+                }
+                array(calls, "tool_calls")?;
+                for call in calls.array() {
+                    object(call, "tool call")?;
+                    if !req_text(call, "type")?.eq_str("function") {
+                        return Err(Error::Unsupported {
+                            feature: "non-function Chat tool call",
+                        });
+                    }
+                    reject_extra(
+                        call,
+                        &["id", "type", "function"],
+                        "tool call wrapper extension",
                     )?;
+                    self.chat_call(required(call, "function")?, ptext(call, "id")?, false)?;
                 }
             }
-            if let Some(refusal) = v.get("refusal") {
-                if !refusal.is_null() {
-                    self.block(
-                        Content::Refusal(text(refusal, "refusal")?),
-                        None,
-                        &[],
-                        Presence::Missing,
-                    )?;
+            if let Some(call) = v.get("function_call")
+                && !call.is_null()
+            {
+                if r != Role::Assistant {
+                    return Err(invalid("function_call", "must belong to assistant"));
                 }
-            }
-            if let Some(calls) = v.get("tool_calls") {
-                if !calls.is_null() {
-                    if r != Role::Assistant {
-                        return Err(invalid("tool_calls", "must belong to assistant"));
-                    }
-                    array(calls, "tool_calls")?;
-                    for call in calls.array() {
-                        object(call, "tool call")?;
-                        if !req_text(call, "type")?.eq_str("function") {
-                            return Err(Error::Unsupported {
-                                feature: "non-function Chat tool call",
-                            });
-                        }
-                        reject_extra(
-                            call,
-                            &["id", "type", "function"],
-                            "tool call wrapper extension",
-                        )?;
-                        self.chat_call(required(call, "function")?, ptext(call, "id")?, false)?;
-                    }
-                }
-            }
-            if let Some(call) = v.get("function_call") {
-                if !call.is_null() {
-                    if r != Role::Assistant {
-                        return Err(invalid("function_call", "must belong to assistant"));
-                    }
-                    self.chat_call(call, Presence::Missing, true)?;
-                }
+                self.chat_call(call, Presence::Missing, true)?;
             }
         }
         self.message_end(
@@ -1087,43 +1084,39 @@ impl<'s, 'a> Arena<'s, 'a> {
     }
 
     fn tools(&mut self, root: V<'a, '_>) -> Result<(), Error> {
-        if let Some(tools) = root.get("tools") {
-            if !tools.is_null() {
-                array(tools, "tools")?;
-                for tool in tools.array() {
-                    object(tool, "tool")?;
-                    if self.source.protocol == Protocol::GeminiGenerateContent {
-                        if let Some(decls) = tool.get("functionDeclarations") {
-                            array(decls, "functionDeclarations")?;
-                            for d in decls.array() {
-                                self.tool(d, false)?;
-                            }
-                            reject_extra(
-                                tool,
-                                &["functionDeclarations"],
-                                "Gemini tool wrapper extension",
-                            )?;
-                        } else {
-                            return Err(Error::Unsupported {
-                                feature: "Gemini built-in tool",
-                            });
+        if let Some(tools) = root.get("tools")
+            && !tools.is_null()
+        {
+            array(tools, "tools")?;
+            for tool in tools.array() {
+                object(tool, "tool")?;
+                if self.source.protocol == Protocol::GeminiGenerateContent {
+                    if let Some(decls) = tool.get("functionDeclarations") {
+                        array(decls, "functionDeclarations")?;
+                        for d in decls.array() {
+                            self.tool(d, false)?;
                         }
-                    } else if self.source.protocol == Protocol::OpenAiChat {
-                        if !req_text(tool, "type")?.eq_str("function") {
-                            return Err(Error::Unsupported {
-                                feature: "Chat built-in tool",
-                            });
-                        } else {
-                            self.tool(required(tool, "function")?, false)?;
-                            reject_extra(
-                                tool,
-                                &["type", "function"],
-                                "Chat tool wrapper extension",
-                            )?;
-                        }
+                        reject_extra(
+                            tool,
+                            &["functionDeclarations"],
+                            "Gemini tool wrapper extension",
+                        )?;
                     } else {
-                        self.tool(tool, false)?;
+                        return Err(Error::Unsupported {
+                            feature: "Gemini built-in tool",
+                        });
                     }
+                } else if self.source.protocol == Protocol::OpenAiChat {
+                    if !req_text(tool, "type")?.eq_str("function") {
+                        return Err(Error::Unsupported {
+                            feature: "Chat built-in tool",
+                        });
+                    } else {
+                        self.tool(required(tool, "function")?, false)?;
+                        reject_extra(tool, &["type", "function"], "Chat tool wrapper extension")?;
+                    }
+                } else {
+                    self.tool(tool, false)?;
                 }
             }
         }
@@ -1145,22 +1138,22 @@ impl<'s, 'a> Arena<'s, 'a> {
         {
             return Err(invalid("type", "function tool type required"));
         }
-        if let Some(ty) = v.get("type") {
-            if !text(ty, "type")?.eq_str("function") {
-                return Err(Error::Unsupported {
-                    feature: "built-in tool definition",
-                });
-            }
+        if let Some(ty) = v.get("type")
+            && !text(ty, "type")?.eq_str("function")
+        {
+            return Err(Error::Unsupported {
+                feature: "built-in tool definition",
+            });
         }
         let params = if self.source.protocol == Protocol::AnthropicMessages {
             raw_presence(v, "input_schema")
         } else {
             raw_presence(v, "parameters")
         };
-        if let Presence::Value(p) = params {
-            if p.kind() != Kind::Object {
-                return Err(invalid("parameters", "expected object"));
-            }
+        if let Presence::Value(p) = params
+            && p.kind() != Kind::Object
+        {
+            return Err(invalid("parameters", "expected object"));
         }
         let owner = self.push(Record::Empty)?;
         let extensions = self.extras(
@@ -1380,10 +1373,10 @@ fn parameters<'a, 't>(
             ("presence_penalty", params.presence_penalty),
             ("n", params.n),
         ] {
-            if let Presence::Value(v) = p {
-                if v.kind() != Kind::Number {
-                    return Err(invalid(field, "expected number"));
-                }
+            if let Presence::Value(v) = p
+                && v.kind() != Kind::Number
+            {
+                return Err(invalid(field, "expected number"));
             }
         }
         for (field, p) in [
@@ -1391,10 +1384,10 @@ fn parameters<'a, 't>(
             ("max_tokens", params.max_output_tokens),
             ("n", params.n),
         ] {
-            if let Presence::Value(v) = p {
-                if !v.raw().iter().all(u8::is_ascii_digit) {
-                    return Err(invalid(field, "expected nonnegative integer"));
-                }
+            if let Presence::Value(v) = p
+                && !v.raw().iter().all(u8::is_ascii_digit)
+            {
+                return Err(invalid(field, "expected nonnegative integer"));
             }
         }
         if let Presence::Value(v) = params.seed {
@@ -1428,11 +1421,11 @@ fn parameters<'a, 't>(
             } else {
                 "stop"
             };
-            if let Some(sv) = v.get(key) {
-                if sv.kind() == Kind::Array {
-                    for s in sv.array() {
-                        text(s, "stop")?;
-                    }
+            if let Some(sv) = v.get(key)
+                && sv.kind() == Kind::Array
+            {
+                for s in sv.array() {
+                    text(s, "stop")?;
                 }
             }
         }
@@ -1486,10 +1479,10 @@ fn parameters<'a, 't>(
         ("stream", params.stream),
         ("parallel_tool_calls", params.parallel_tool_calls),
     ] {
-        if let Presence::Value(v) = p {
-            if v.as_bool().is_none() {
-                return Err(invalid(field, "expected boolean"));
-            }
+        if let Presence::Value(v) = p
+            && v.as_bool().is_none()
+        {
+            return Err(invalid(field, "expected boolean"));
         }
     }
     Ok(params)
@@ -1753,27 +1746,27 @@ fn request_header<'a, 't>(
             } else {
                 "instructions"
             };
-            if let Some(system) = root.get(system_key) {
-                if !system.is_null() {
-                    let start = a.message_start()?;
-                    a.block(
-                        Content::Text(text(system, system_key)?),
-                        None,
-                        &[],
-                        Presence::Missing,
-                    )?;
-                    a.message_end(
-                        start,
-                        Role::System,
-                        Presence::Missing,
-                        ContentShape::String,
-                        None,
-                        &[],
-                        Presence::Missing,
-                    )?;
-                    if let Some(Record::Message(m)) = a.records.get_mut(start) {
-                        m.system_instruction = true;
-                    }
+            if let Some(system) = root.get(system_key)
+                && !system.is_null()
+            {
+                let start = a.message_start()?;
+                a.block(
+                    Content::Text(text(system, system_key)?),
+                    None,
+                    &[],
+                    Presence::Missing,
+                )?;
+                a.message_end(
+                    start,
+                    Role::System,
+                    Presence::Missing,
+                    ContentShape::String,
+                    None,
+                    &[],
+                    Presence::Missing,
+                )?;
+                if let Some(Record::Message(m)) = a.records.get_mut(start) {
+                    m.system_instruction = true;
                 }
             }
             let input = required(root, "input")?;
@@ -2272,19 +2265,18 @@ fn response_header<'a, 't>(
     if let Some(details) = root
         .get("incomplete_details")
         .filter(|_| source.protocol == Protocol::OpenAiResponses)
+        && !details.is_null()
     {
-        if !details.is_null() {
-            object(details, "incomplete_details")?;
-            let reason = req_text(details, "reason")?;
-            if reason.eq_str("max_output_tokens") {
-                status = Finish::Length;
-            } else if reason.eq_str("content_filter") {
-                status = Finish::Safety;
-            } else {
-                status = Finish::Other;
-            }
-            reject_extra(details, &["reason"], "incomplete_details extension")?;
+        object(details, "incomplete_details")?;
+        let reason = req_text(details, "reason")?;
+        if reason.eq_str("max_output_tokens") {
+            status = Finish::Length;
+        } else if reason.eq_str("content_filter") {
+            status = Finish::Safety;
+        } else {
+            status = Finish::Other;
         }
+        reject_extra(details, &["reason"], "incomplete_details extension")?;
     }
     match source.protocol {
         Protocol::OpenAiChat | Protocol::OpenAiCompletions | Protocol::GeminiGenerateContent => {
@@ -2416,10 +2408,10 @@ fn response_header<'a, 't>(
             let (finish, raw_finish) = finish(root.get("stop_reason"))?;
             if finish == Finish::Refusal && !a.count_only {
                 for record in &mut a.records[start + 1..a.used] {
-                    if let Record::Block(b) = record {
-                        if let Content::Text(t) = b.content {
-                            b.content = Content::Refusal(t);
-                        }
+                    if let Record::Block(b) = record
+                        && let Content::Text(t) = b.content
+                    {
+                        b.content = Content::Refusal(t);
                     }
                 }
             }

@@ -403,9 +403,9 @@ fn string_word_boundaries_do_not_skip_controls_or_escapes() {
         }
         for position in 0..=length {
             let mut input = Vec::from(b"\"".as_slice());
-            input.extend(std::iter::repeat(b'a').take(position));
+            input.extend(std::iter::repeat_n(b'a', position));
             input.extend_from_slice(b"\\u4e2d\\ud83d\\ude00\\n");
-            input.extend(std::iter::repeat(b'a').take(length - position));
+            input.extend(std::iter::repeat_n(b'a', length - position));
             input.push(b'"');
             let parsed = json::parse(&input, &mut tokens, json::Limits::default()).unwrap();
             assert_eq!(parsed.root().as_string().unwrap().decoded_len(), length + 8);

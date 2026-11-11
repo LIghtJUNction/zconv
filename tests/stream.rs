@@ -95,13 +95,13 @@ fn json_events(wire: &[u8]) -> Vec<Vec<u8>> {
         let progress = decoder.push(&wire[position..]);
         position += progress.consumed;
         if progress.status == zconv::sse::Status::Event {
-            if let Some(length) = decoder.event().unwrap().data_into(&mut output).unwrap() {
-                if &output[..length] != b"[DONE]" {
-                    let mut tokens = vec![Token::EMPTY; 8192];
-                    json::parse(&output[..length], &mut tokens, json::Limits::default())
-                        .expect("every output event must be valid JSON");
-                    events.push(output[..length].to_vec());
-                }
+            if let Some(length) = decoder.event().unwrap().data_into(&mut output).unwrap()
+                && &output[..length] != b"[DONE]"
+            {
+                let mut tokens = vec![Token::EMPTY; 8192];
+                json::parse(&output[..length], &mut tokens, json::Limits::default())
+                    .expect("every output event must be valid JSON");
+                events.push(output[..length].to_vec());
             }
             decoder.consume_event();
         }

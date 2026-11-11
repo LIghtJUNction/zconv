@@ -1123,17 +1123,17 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                 self.w.byte(b'[');
                 let mut bc = false;
                 for at in index + 1..m.end {
-                    if let Record::Block(b) = self.records[at] {
-                        if matches!(
+                    if let Record::Block(b) = self.records[at]
+                        && matches!(
                             b.content,
                             Content::Text(_) | Content::Media(_) | Content::Opaque { .. }
-                        ) {
-                            if bc {
-                                self.w.byte(b',');
-                            }
-                            bc = true;
-                            self.content(b, m.role, response)?;
+                        )
+                    {
+                        if bc {
+                            self.w.byte(b',');
                         }
+                        bc = true;
+                        self.content(b, m.role, response)?;
                     }
                 }
                 self.w.byte(b']');
@@ -1202,30 +1202,29 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                 self.w.byte(b'[');
                 let mut tc = false;
                 for at in index + 1..m.end {
-                    if let Record::Block(b) = self.records[at] {
-                        if let Content::ToolCall {
+                    if let Record::Block(b) = self.records[at]
+                        && let Content::ToolCall {
                             id,
                             name,
                             arguments,
                             ..
                         } = b.content
-                        {
-                            if tc {
-                                self.w.byte(b',');
-                            }
-                            tc = true;
-                            let id = self.bind_id(id, name)?;
-                            self.w.raw(b"{\"id\":");
-                            write_text(&mut self.w, id);
-                            self.w
-                                .raw(b",\"type\":\"function\",\"function\":{\"name\":");
-                            write_text(&mut self.w, name);
-                            self.w.raw(b",\"arguments\":");
-                            self.data(arguments, true, false)?;
-                            let mut ec = true;
-                            self.extras(b.extensions, &mut ec)?;
-                            self.w.raw(b"}}");
+                    {
+                        if tc {
+                            self.w.byte(b',');
                         }
+                        tc = true;
+                        let id = self.bind_id(id, name)?;
+                        self.w.raw(b"{\"id\":");
+                        write_text(&mut self.w, id);
+                        self.w
+                            .raw(b",\"type\":\"function\",\"function\":{\"name\":");
+                        write_text(&mut self.w, name);
+                        self.w.raw(b",\"arguments\":");
+                        self.data(arguments, true, false)?;
+                        let mut ec = true;
+                        self.extras(b.extensions, &mut ec)?;
+                        self.w.raw(b"}}");
                     }
                 }
                 self.w.byte(b']');
@@ -1399,22 +1398,21 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
         self.w.byte(b'[');
         let mut sc = false;
         for record in &self.records[start..end] {
-            if let Record::Block(b) = record {
-                if let Content::Reasoning {
+            if let Record::Block(b) = record
+                && let Content::Reasoning {
                     text: Presence::Value(t),
                     ..
                 } = b.content
-                {
-                    if sc {
-                        self.w.byte(b',');
-                    }
-                    sc = true;
-                    self.w.raw(b"{\"type\":\"summary_text\",\"text\":");
-                    write_text(&mut self.w, t);
-                    let mut c = true;
-                    self.extras(b.extensions, &mut c)?;
-                    self.w.byte(b'}');
+            {
+                if sc {
+                    self.w.byte(b',');
                 }
+                sc = true;
+                self.w.raw(b"{\"type\":\"summary_text\",\"text\":");
+                write_text(&mut self.w, t);
+                let mut c = true;
+                self.extras(b.extensions, &mut c)?;
+                self.w.byte(b'}');
             }
         }
         self.w.byte(b']');
@@ -2342,13 +2340,12 @@ pub fn encode_request<'a>(
     let mut system = None;
     let mut system_count = 0;
     for (i, r) in request.records.iter().enumerate() {
-        if let Record::Message(m) = r {
-            if m.role == Role::System
-                && (target.protocol != Protocol::OpenAiResponses || m.system_instruction)
-            {
-                system = Some((i, *m));
-                system_count += 1;
-            }
+        if let Record::Message(m) = r
+            && m.role == Role::System
+            && (target.protocol != Protocol::OpenAiResponses || m.system_instruction)
+        {
+            system = Some((i, *m));
+            system_count += 1;
         }
     }
     if target.protocol == Protocol::OpenAiCompletions {
@@ -2399,55 +2396,55 @@ pub fn encode_request<'a>(
                 feature: "multiple ordered system messages in target",
             });
         }
-        if target.protocol != Protocol::OpenAiChat {
-            if let Some((i, m)) = system {
-                let first_message = request
-                    .records
-                    .iter()
-                    .position(|r| matches!(r, Record::Message(_)))
-                    .unwrap_or(i);
-                if i != first_message {
-                    return Err(Error::Unsupported {
-                        feature: "non-leading system message",
-                    });
-                }
-                key(
-                    &mut e.w,
-                    &mut comma,
-                    match target.protocol {
-                        Protocol::AnthropicMessages => "system",
-                        Protocol::GeminiGenerateContent => "systemInstruction",
-                        Protocol::OpenAiResponses => "instructions",
-                        _ => "system_instruction",
-                    },
-                );
-                if target.protocol == Protocol::AnthropicMessages {
-                    e.blocks(i + 1, m.end, Role::System, false)?;
-                } else if target.protocol == Protocol::GeminiGenerateContent {
-                    e.w.raw(b"{\"parts\":");
-                    e.blocks(i + 1, m.end, Role::System, false)?;
-                    e.w.byte(b'}');
-                } else {
-                    let mut one = None;
-                    for record in &request.records[i + 1..m.end] {
-                        if let Record::Block(b) = record {
-                            match b.content {
-                                Content::Text(t) if one.is_none() => one = Some(t),
-                                _ => {
-                                    return Err(Error::Unsupported {
-                                        feature: "system instruction requires single text",
-                                    });
-                                }
+        if target.protocol != Protocol::OpenAiChat
+            && let Some((i, m)) = system
+        {
+            let first_message = request
+                .records
+                .iter()
+                .position(|r| matches!(r, Record::Message(_)))
+                .unwrap_or(i);
+            if i != first_message {
+                return Err(Error::Unsupported {
+                    feature: "non-leading system message",
+                });
+            }
+            key(
+                &mut e.w,
+                &mut comma,
+                match target.protocol {
+                    Protocol::AnthropicMessages => "system",
+                    Protocol::GeminiGenerateContent => "systemInstruction",
+                    Protocol::OpenAiResponses => "instructions",
+                    _ => "system_instruction",
+                },
+            );
+            if target.protocol == Protocol::AnthropicMessages {
+                e.blocks(i + 1, m.end, Role::System, false)?;
+            } else if target.protocol == Protocol::GeminiGenerateContent {
+                e.w.raw(b"{\"parts\":");
+                e.blocks(i + 1, m.end, Role::System, false)?;
+                e.w.byte(b'}');
+            } else {
+                let mut one = None;
+                for record in &request.records[i + 1..m.end] {
+                    if let Record::Block(b) = record {
+                        match b.content {
+                            Content::Text(t) if one.is_none() => one = Some(t),
+                            _ => {
+                                return Err(Error::Unsupported {
+                                    feature: "system instruction requires single text",
+                                });
                             }
                         }
                     }
-                    write_text(
-                        &mut e.w,
-                        one.ok_or(Error::Unsupported {
-                            feature: "empty system instruction array",
-                        })?,
-                    );
                 }
+                write_text(
+                    &mut e.w,
+                    one.ok_or(Error::Unsupported {
+                        feature: "empty system instruction array",
+                    })?,
+                );
             }
         }
         key(
@@ -2486,18 +2483,18 @@ pub fn encode_request<'a>(
                         if target.protocol == Protocol::OpenAiChat && results > 1 {
                             if request.records[at+1..m.end].iter().any(|r|matches!(r,Record::Block(Block{content, ..})if !matches!(content,Content::ToolResult{..}))){return Err(Error::Unsupported{feature:"mixed content and multiple tool results in Chat"});}
                             for bi in at + 1..m.end {
-                                if let Record::Block(b) = request.records[bi] {
-                                    if matches!(b.content, Content::ToolResult { .. }) {
-                                        if mc {
-                                            e.w.byte(b',');
-                                        }
-                                        mc = true;
-                                        let mut single = m;
-                                        single.end = b.end;
-                                        single.extensions = Span::EMPTY;
-                                        single.role = Role::Tool;
-                                        e.chat_message(bi - 1, single, false)?;
+                                if let Record::Block(b) = request.records[bi]
+                                    && matches!(b.content, Content::ToolResult { .. })
+                                {
+                                    if mc {
+                                        e.w.byte(b',');
                                     }
+                                    mc = true;
+                                    let mut single = m;
+                                    single.end = b.end;
+                                    single.extensions = Span::EMPTY;
+                                    single.role = Role::Tool;
+                                    e.chat_message(bi - 1, single, false)?;
                                 }
                             }
                         } else {

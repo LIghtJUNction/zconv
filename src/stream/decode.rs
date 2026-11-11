@@ -145,10 +145,10 @@ fn chat(
             })?;
         }
     }
-    if let Some(usage) = value.get("usage") {
-        if usage.kind() != Kind::Null {
-            sink.usage(usage_openai(usage, false)?)?;
-        }
+    if let Some(usage) = value.get("usage")
+        && usage.kind() != Kind::Null
+    {
+        sink.usage(usage_openai(usage, false)?)?;
     }
     sink.begin(
         optional(value, "id")?,
@@ -286,10 +286,10 @@ fn chat(
                 }
             }
         }
-        if let Some(reason) = choice.get("finish_reason") {
-            if reason.kind() != Kind::Null {
-                sink.choice(choice_index, finish_reason(reason, false)?)?;
-            }
+        if let Some(reason) = choice.get("finish_reason")
+            && reason.kind() != Kind::Null
+        {
+            sink.choice(choice_index, finish_reason(reason, false)?)?;
         }
     }
     Ok(())
@@ -511,23 +511,23 @@ fn anthropic(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
             fields(block, &["type", "text", "citations"])?;
             empty_only(block, "citations")?;
             sink.block(key, BlockKind::Text, None, None, None)?;
-            if let Some(text) = optional(block, "text")? {
-                if text.len() != 0 {
-                    sink.delta(key, BlockKind::Text, text)?;
-                }
+            if let Some(text) = optional(block, "text")?
+                && text.len() != 0
+            {
+                sink.delta(key, BlockKind::Text, text)?;
             }
         } else if eq(block, "type", "thinking") {
             fields(block, &["type", "thinking", "signature"])?;
             sink.block(key, BlockKind::Reasoning, None, None, None)?;
-            if let Some(text) = optional(block, "thinking")? {
-                if text.len() != 0 {
-                    sink.delta(key, BlockKind::Reasoning, text)?;
-                }
+            if let Some(text) = optional(block, "thinking")?
+                && text.len() != 0
+            {
+                sink.delta(key, BlockKind::Reasoning, text)?;
             }
-            if let Some(text) = optional(block, "signature")? {
-                if text.len() != 0 {
-                    sink.signature(key, text)?;
-                }
+            if let Some(text) = optional(block, "signature")?
+                && text.len() != 0
+            {
+                sink.signature(key, text)?;
             }
         } else {
             return Err(Error::Unsupported {
@@ -581,10 +581,10 @@ fn anthropic(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
                 feature: "stream stop_sequence",
             });
         }
-        if let Some(reason) = delta.get("stop_reason") {
-            if reason.kind() != Kind::Null {
-                sink.choice(0, finish_reason(reason, false)?)?;
-            }
+        if let Some(reason) = delta.get("stop_reason")
+            && reason.kind() != Kind::Null
+        {
+            sink.choice(0, finish_reason(reason, false)?)?;
         }
         Ok(())
     } else if event_type.eq_str("message_stop") {
@@ -630,10 +630,10 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
                 Some(string(item, "name")?),
                 optional(item, "id")?,
             )?;
-            if let Some(arguments) = optional(item, "arguments")? {
-                if arguments.len() != 0 {
-                    sink.delta(key, BlockKind::Tool, arguments)?;
-                }
+            if let Some(arguments) = optional(item, "arguments")?
+                && arguments.len() != 0
+            {
+                sink.delta(key, BlockKind::Tool, arguments)?;
             }
         } else if eq(item, "type", "message") {
             if !eq(item, "role", "assistant") {
@@ -684,10 +684,10 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
         } else {
             "refusal"
         };
-        if let Some(text) = optional(part, field)? {
-            if text.len() != 0 {
-                sink.delta(key, kind, text)?;
-            }
+        if let Some(text) = optional(part, field)?
+            && text.len() != 0
+        {
+            sink.delta(key, kind, text)?;
         }
         return Ok(());
     }
@@ -830,10 +830,10 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
     .any(|name| event_type.eq_str(name))
     {
         let response = object(value, "response")?;
-        if let Some(usage) = response.get("usage") {
-            if usage.kind() != Kind::Null {
-                sink.usage(usage_openai(usage, true)?)?;
-            }
+        if let Some(usage) = response.get("usage")
+            && usage.kind() != Kind::Null
+        {
+            sink.usage(usage_openai(usage, true)?)?;
         }
         if event_type.eq_str("response.failed") {
             let error = object(response, "error")?;
@@ -948,12 +948,12 @@ fn google(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
             "createTime",
         ],
     )?;
-    if let Some(feedback) = value.get("promptFeedback") {
-        if feedback.get("blockReason").is_some() {
-            return Err(Error::Unsupported {
-                feature: "Gemini prompt safety block",
-            });
-        }
+    if let Some(feedback) = value.get("promptFeedback")
+        && feedback.get("blockReason").is_some()
+    {
+        return Err(Error::Unsupported {
+            feature: "Gemini prompt safety block",
+        });
     }
     if let Some(usage) = value.get("usageMetadata") {
         sink.usage(usage_google(usage, false)?)?;

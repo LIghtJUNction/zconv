@@ -182,10 +182,10 @@ fn run_stream(
         position += progress.consumed;
         output_bytes += progress.written;
         if progress.written != 0 {
-            if first_write_ns.is_none() {
-                if let Some(start) = latency_start {
-                    first_write_ns = Some(start.elapsed().as_secs_f64() * 1e9);
-                }
+            if first_write_ns.is_none()
+                && let Some(start) = latency_start
+            {
+                first_write_ns = Some(start.elapsed().as_secs_f64() * 1e9);
             }
             black_box(&buffers.output[..progress.written]);
         }

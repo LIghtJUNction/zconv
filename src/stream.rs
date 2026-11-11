@@ -181,10 +181,10 @@ impl UsageAccumulator {
         };
         updated.usage.input_basis = InputCount::Total;
         updated.usage.output_basis = OutputCount::Total;
-        if updated.input_basis == InputCount::Uncached {
-            if let (Some(input), Some(output)) = (updated.usage.input, updated.usage.output) {
-                updated.usage.total = Some(input.checked_add(output).ok_or(overflow)?);
-            }
+        if updated.input_basis == InputCount::Uncached
+            && let (Some(input), Some(output)) = (updated.usage.input, updated.usage.output)
+        {
+            updated.usage.total = Some(input.checked_add(output).ok_or(overflow)?);
         }
         *self = updated;
         Ok(self.usage)

@@ -1,0 +1,37 @@
+name: Rust 2024 source formatting
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/edition-format-2026.yml
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    if: github.repository == 'LIghtJUNction/zconv'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: true
+      - run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt
+      - name: Format Rust 2024 sources
+        run: |
+          cargo +1.99.1 fmt --all
+          if test -f comparison/Cargo.toml; then cargo +1.99.1 fmt --manifest-path comparison/Cargo.toml --all; fi
+          if test -f fuzz/Cargo.toml; then cargo +1.99.1 fmt --manifest-path fuzz/Cargo.toml --all; fi
+      - name: Commit formatting
+        run: |
+          git add -u -- '*.rs'
+          if git diff --cached --quiet; then exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'style: apply Rust 2024 rustfmt'
+          git push origin HEAD:main

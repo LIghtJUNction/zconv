@@ -2,7 +2,7 @@
 name = "zconv-fuzz"
 version = "0.0.0"
 publish = false
-edition = "2021"
+edition = "2024"
 
 [package.metadata]
 cargo-fuzz = true
@@ -33,3 +33,4 @@ doc = false
 bench = false
 
 [workspace]
+resolver = "3"

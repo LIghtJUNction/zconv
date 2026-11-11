@@ -1,8 +1,8 @@
 [package]
 name = "zconv"
-version = "0.2.0"
-edition = "2021"
-rust-version = "1.74"
+version = "0.2.1"
+edition = "2024"
+rust-version = "1.99.1"
 description = "Zero-dependency, allocation-free AI protocol conversion"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/LIghtJUNction/zconv"
@@ -36,6 +36,7 @@ harness = false
 default = []
 
 [workspace]
+resolver = "3"
 members = ["."]
 exclude = ["comparison", "fuzz"]
 

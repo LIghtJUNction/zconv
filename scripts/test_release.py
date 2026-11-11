@@ -74,7 +74,7 @@ version = "1.2.3"
                 with redirect_stdout(StringIO()):
                     release.prepare()
                 cargo.assert_called_once_with(
-                    ['cargo', '+1.74.0', 'generate-lockfile', '--offline'], check=True)
+                    ['cargo', '+1.99.1', 'generate-lockfile', '--offline'], check=True)
             self.assertEqual(release.manifest()['version'], '1.2.4')
             expected = update_path_lock(self.LOCK, 'zconv', '1.2.3', '1.2.4')
             for project in ('comparison', 'fuzz'):

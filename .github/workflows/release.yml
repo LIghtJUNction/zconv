@@ -42,7 +42,7 @@ jobs:
         env:
           REF: ${{ github.ref }}
         run: test "$REF" = refs/heads/main
-      - run: rustup toolchain install 1.74.0 --profile minimal
+      - run: rustup toolchain install 1.99.1 --profile minimal
       - name: Validate and prepare the version
         id: plan
         env:
@@ -50,9 +50,9 @@ jobs:
           VERSION: ${{ inputs.version }}
           RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: python3 scripts/release.py prepare
-      - run: rustup toolchain install 1.74.0 --profile minimal
+      - run: rustup toolchain install 1.99.1 --profile minimal
       - run: rustup component add rustfmt clippy
-      - run: cargo +1.74.0 test --all-targets --locked
+      - run: cargo +1.99.1 test --all-targets --locked
       - run: cargo test --release --locked
       - run: cargo test --doc --locked
       - run: cargo fmt --all -- --check
@@ -82,7 +82,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
-      - run: rustup toolchain install 1.74.0 --profile minimal
+      - run: rustup toolchain install 1.99.1 --profile minimal
       - name: Apply exactly the verified version
         env:
           BUMP: none

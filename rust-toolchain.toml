@@ -2,3 +2,4 @@
 channel = "1.99.1"
 profile = "minimal"
 components = ["rustfmt", "clippy"]
+# Rust 2024 Edition migration release gate.

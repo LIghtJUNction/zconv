@@ -97,8 +97,8 @@ def prepare():
         if count != 1:
             raise ValueError('expected one package version field')
         path.write_text(data)
-        # MSRV writes lockfile v3; newer cargo would create a lockfile unusable by 1.74.
-        subprocess.run(['cargo', '+1.74.0', 'generate-lockfile', '--offline'], check=True)
+        # MSRV writes lockfile format selected by the project's Rust 1.99.1 toolchain.
+        subprocess.run(['cargo', '+1.99.1', 'generate-lockfile', '--offline'], check=True)
         for path, data in lock_updates.items():
             path.write_text(data)
     output = os.getenv('GITHUB_OUTPUT')

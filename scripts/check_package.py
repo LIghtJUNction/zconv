@@ -9,7 +9,7 @@ def main():
     manifest = tomllib.loads(pathlib.Path('Cargo.toml').read_text())
     package = manifest['package']
     assert package['name'] == 'zconv', 'unexpected crate name'
-    assert package['rust-version'] == '1.74'
+    assert package['rust-version'] == '1.99.1'
     assert not pathlib.Path('build.rs').exists(), 'build.rs is forbidden'
     sections = [manifest, *manifest.get('target', {}).values()]
     for section in sections:

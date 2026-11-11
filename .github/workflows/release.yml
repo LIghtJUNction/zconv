@@ -20,7 +20,8 @@ on:
   push:
     branches: [main]
     tags: ['v[0-9]*']
-    paths: [rust-toolchain.toml]
+    # Only a deliberate release request starts a branch-push publication.
+    paths: [.github/release-request.json]
 permissions:
   contents: read
 concurrency:

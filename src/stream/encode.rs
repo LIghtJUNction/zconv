@@ -51,10 +51,127 @@ fn quoted_span(writer: &mut Writer<'_>, aggregate: &[u8], value: Span) {
 }
 
 impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
+    fn provider_name(provider: Format) -> &'static [u8] {
+        match provider.protocol {
+            Protocol::AnthropicMessages => b"anthropic",
+            Protocol::GeminiGenerateContent => b"gemini",
+            Protocol::OpenAiChat => b"chat",
+            Protocol::OpenAiResponses => b"responses",
+            Protocol::OpenAiCompletions => b"completions",
+            Protocol::GeminiInteractions => b"interactions",
+        }
+    }
+    fn tool_index(&self, item: ActiveItem) -> u64 {
+        self.items[..item.wire_index as usize]
+            .iter()
+            .filter(|v| v.kind == BlockKind::Tool && v.key.choice == item.key.choice)
+            .count() as u64
+    }
+    fn provider_metadata(&mut self, item: ActiveItem) -> Result<(), Error> {
+        if let (Some(signature), Some(provider)) = (item.signature, item.signature_provider) {
+            self.writer.raw(b",\"provider_metadata\":{\"protocol\":");
+            self.writer.string(Self::provider_name(provider));
+            self.writer.raw(b",\"signature\":");
+            quoted_span(&mut self.writer, self.aggregate, signature);
+            self.writer.byte(b'}');
+        }
+        Ok(())
+    }
+    fn flush_gemini_text(&mut self, slot: usize) -> Result<(), Error> {
+        let item = self.items[slot];
+        let Some(text) = item.pending_text else {
+            return Ok(());
+        };
+        self.writer.raw(b"data: {\"candidates\":[{\"index\":");
+        number(&mut self.writer, u64::from(item.key.choice));
+        self.writer
+            .raw(b",\"content\":{\"role\":\"model\",\"parts\":[{\"text\":");
+        quoted_span(&mut self.writer, self.aggregate, text);
+        if item.kind == BlockKind::Reasoning {
+            self.writer.raw(b",\"thought\":true");
+        }
+        if let Some(signature) = item.signature {
+            self.writer.raw(b",\"thoughtSignature\":");
+            quoted_span(&mut self.writer, self.aggregate, signature);
+        }
+        self.writer.raw(b"}]}}]}\n\n");
+        let end = item
+            .signature
+            .map_or(text.start + text.length, |signature| {
+                signature.start + signature.length
+            });
+        let contiguous = item
+            .signature
+            .is_none_or(|signature| signature.start == text.start + text.length);
+        if contiguous && self.state.aggregate_used == end {
+            self.state.aggregate_used = text.start;
+        }
+        self.items[slot].pending_text = None;
+        self.items[slot].signature = None;
+        Ok(())
+    }
+    fn store_signature(
+        &mut self,
+        slot: usize,
+        text: Text<'_>,
+        provider: Format,
+    ) -> Result<(), Error> {
+        let item = self.items[slot];
+        if item
+            .signature_provider
+            .is_some_and(|old| old.protocol != provider.protocol)
+        {
+            return Err(Error::InvalidInput {
+                field: "signature provider",
+                reason: "origin changed",
+            });
+        }
+        let signature = if let Some(old) = item.signature {
+            if provider.protocol == Protocol::AnthropicMessages {
+                let start = self.state.aggregate_used;
+                let length = old
+                    .length
+                    .checked_add(text.len())
+                    .ok_or(Error::EventTooLarge { needed: usize::MAX })?;
+                let end = start
+                    .checked_add(length)
+                    .ok_or(Error::EventTooLarge { needed: usize::MAX })?;
+                if end > self.aggregate.len() {
+                    return Err(Error::EventTooLarge { needed: end });
+                }
+                self.aggregate
+                    .copy_within(old.start..old.start + old.length, start);
+                text.copy(&mut self.aggregate[start + old.length..end])?;
+                self.state.aggregate_used = end;
+                self.state.aggregate_peak = self.state.aggregate_peak.max(end);
+                Span { start, length }
+            } else {
+                let equal = match text {
+                    Text::Utf8(value) => value == span(self.aggregate, old),
+                    Text::Json(value) => {
+                        value.bytes().eq(span(self.aggregate, old).iter().copied())
+                    }
+                };
+                if !equal {
+                    return Err(Error::InvalidInput {
+                        field: "signature",
+                        reason: "conflicting signature",
+                    });
+                }
+                old
+            }
+        } else {
+            self.store(text)?
+        };
+        self.items[slot].signature = Some(signature);
+        self.items[slot].signature_provider = Some(provider);
+        Ok(())
+    }
     fn reasoning_supported(&self) -> bool {
         matches!(
             self.config.target.protocol,
             Protocol::AnthropicMessages
+                | Protocol::OpenAiResponses
                 | Protocol::GeminiGenerateContent
                 | Protocol::GeminiInteractions
         ) || (self.config.target.protocol == Protocol::OpenAiChat
@@ -173,6 +290,10 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
         Ok(())
     }
     fn item_id(&mut self, item: ActiveItem) {
+        if let Some(id) = item.output_id {
+            quoted_span(&mut self.writer, self.aggregate, id);
+            return;
+        }
         self.writer.byte(b'"');
         escaped(
             &mut self.writer,
@@ -231,6 +352,9 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
         number(&mut self.writer, self.state.created.unwrap_or(0));
         self.writer.raw(b",\"model\":");
         quoted_span(&mut self.writer, self.aggregate, self.state.model);
+        if self.config.target.profile == Profile::OpenAiCompatible("lmm") {
+            self.writer.raw(b",\"store\":false");
+        }
         self.writer.raw(b",\"status\":");
         self.writer.string(status);
         self.writer.raw(b",\"error\":null,\"incomplete_details\":");
@@ -263,7 +387,8 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
                 if item.kind == BlockKind::Tool {
                     self.choice_header(key.choice, false);
                     self.writer.raw(b",\"delta\":{\"tool_calls\":[{\"index\":");
-                    number(&mut self.writer, u64::from(item.wire_index));
+                    let index = self.tool_index(item);
+                    number(&mut self.writer, index);
                     self.writer.raw(b",\"id\":");
                     quoted_span(&mut self.writer, self.aggregate, item.id);
                     self.writer
@@ -312,6 +437,17 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
                 self.writer.raw(b",\"item\":");
                 self.response_item(item, false)?;
                 self.end_event();
+                if item.kind == BlockKind::Reasoning {
+                    self.response_event(b"response.reasoning_summary_part.added")?;
+                    self.writer.raw(b",\"output_index\":");
+                    number(&mut self.writer, u64::from(item.wire_index));
+                    self.writer.raw(b",\"item_id\":");
+                    self.item_id(item);
+                    self.writer.raw(
+                        b",\"summary_index\":0,\"part\":{\"type\":\"summary_text\",\"text\":\"\"}",
+                    );
+                    self.end_event();
+                }
                 if item.kind == BlockKind::Text || item.kind == BlockKind::Refusal {
                     self.response_event(b"response.content_part.added")?;
                     self.writer.raw(b",\"output_index\":");
@@ -376,9 +512,14 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
             }
             self.writer.byte(b']');
         } else {
-            return Err(Error::Unsupported {
-                feature: "Responses reasoning stream mapping",
-            });
+            self.writer.raw(b",\"type\":\"reasoning\",\"summary\":[");
+            if complete {
+                self.response_part(item)?;
+            }
+            self.writer.byte(b']');
+        }
+        if complete {
+            self.provider_metadata(item)?;
         }
         self.writer.raw(b",\"status\":");
         self.writer.string(if complete {
@@ -394,7 +535,9 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
         Ok(())
     }
     fn response_part(&mut self, item: ActiveItem) -> Result<(), Error> {
-        self.writer.raw(if item.kind == BlockKind::Refusal {
+        self.writer.raw(if item.kind == BlockKind::Reasoning {
+            b"{\"type\":\"summary_text\",\"text\":"
+        } else if item.kind == BlockKind::Refusal {
             b"{\"type\":\"refusal\",\"refusal\":"
         } else {
             b"{\"type\":\"output_text\",\"text\":"
@@ -410,6 +553,11 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
         if self.items[slot].closed {
             return Ok(());
         }
+        if self.config.target.protocol == Protocol::GeminiGenerateContent
+            && self.items[slot].kind != BlockKind::Tool
+        {
+            self.flush_gemini_text(slot)?;
+        }
         if self.items[slot].kind == BlockKind::Reasoning
             && self.config.policy.drop_reasoning
             && !self.reasoning_supported()
@@ -417,7 +565,10 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
             self.items[slot].closed = true;
             return Ok(());
         }
-        if self.items[slot].kind == BlockKind::Tool && self.items[slot].length == 0 {
+        if self.items[slot].kind == BlockKind::Tool
+            && self.items[slot].length == 0
+            && !self.items[slot].incomplete
+        {
             if matches!(
                 self.config.source.protocol,
                 Protocol::AnthropicMessages | Protocol::GeminiInteractions
@@ -476,6 +627,24 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
                     self.response_part(item)?;
                     self.end_event();
                 }
+                if item.kind == BlockKind::Reasoning {
+                    self.response_event(b"response.reasoning_summary_text.done")?;
+                    self.writer.raw(b",\"output_index\":");
+                    number(&mut self.writer, u64::from(item.wire_index));
+                    self.writer.raw(b",\"item_id\":");
+                    self.item_id(item);
+                    self.writer.raw(b",\"summary_index\":0,\"text\":");
+                    self.write_chain(item, true)?;
+                    self.end_event();
+                    self.response_event(b"response.reasoning_summary_part.done")?;
+                    self.writer.raw(b",\"output_index\":");
+                    number(&mut self.writer, u64::from(item.wire_index));
+                    self.writer.raw(b",\"item_id\":");
+                    self.item_id(item);
+                    self.writer.raw(b",\"summary_index\":0,\"part\":");
+                    self.response_part(item)?;
+                    self.end_event();
+                }
                 self.response_event(b"response.output_item.done")?;
                 self.writer.raw(b",\"output_index\":");
                 number(&mut self.writer, u64::from(item.wire_index));
@@ -493,7 +662,12 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
                 quoted_span(&mut self.writer, self.aggregate, item.name);
                 self.writer.raw(b",\"args\":");
                 self.write_chain(item, false)?;
-                self.writer.raw(b"}}]}}]}\n\n");
+                self.writer.byte(b'}');
+                if let Some(signature) = item.signature {
+                    self.writer.raw(b",\"thoughtSignature\":");
+                    quoted_span(&mut self.writer, self.aggregate, signature);
+                }
+                self.writer.raw(b"}]}}]}\n\n");
             }
             Protocol::GeminiInteractions => {
                 self.named(b"step.stop", b"event_type");
@@ -506,28 +680,68 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
         self.items[slot].closed = true;
         Ok(())
     }
+    fn uncached_input(&self) -> Result<Option<u64>, Error> {
+        let accumulator = &self.state.usage;
+        if accumulator.input_basis == InputCount::Uncached {
+            return Ok(accumulator.input_base);
+        }
+        let usage = accumulator.usage();
+        if let Some(input) = usage.uncached_input {
+            return Ok(Some(input));
+        }
+        usage
+            .input
+            .map(|input| {
+                input
+                    .checked_sub(usage.cached.unwrap_or(0))
+                    .and_then(|input| input.checked_sub(usage.cache_write.unwrap_or(0)))
+                    .ok_or(Error::InvalidInput {
+                        field: "usage",
+                        reason: "cached tokens exceed canonical input",
+                    })
+            })
+            .transpose()
+    }
     fn write_usage(&mut self, protocol: Protocol) -> Result<(), Error> {
         let mut usage = self.state.usage.usage();
-        if protocol == Protocol::AnthropicMessages {
-            usage.input = usage
-                .input
-                .map(|input| {
-                    input
-                        .checked_sub(usage.cached.unwrap_or(0))
-                        .and_then(|input| input.checked_sub(usage.cache_write.unwrap_or(0)))
-                        .ok_or(Error::InvalidInput {
-                            field: "usage",
-                            reason: "cached tokens exceed canonical input",
-                        })
-                })
-                .transpose()?;
-        } else if usage.cache_write.is_some() {
-            self.extension(DroppedField::CacheCreationTokens)?;
+        if usage == Usage::default() {
+            self.writer.raw(b"null");
+            return Ok(());
         }
-        if matches!(
+        decode::validate_lifetimes(usage)?;
+        let openai = matches!(
+            protocol,
+            Protocol::OpenAiChat | Protocol::OpenAiResponses | Protocol::OpenAiCompletions
+        );
+        let vendor = openai && matches!(self.config.target.profile, Profile::OpenAiCompatible(_));
+        let anthropic = protocol == Protocol::AnthropicMessages;
+        let google = matches!(
             protocol,
             Protocol::GeminiGenerateContent | Protocol::GeminiInteractions
-        ) {
+        );
+        let anthropic_details = usage.anthropic_cache_details
+            || usage.cache_write_5m.is_some()
+            || usage.cache_write_1h.is_some();
+        let openai_details = usage.openai_cache_details
+            || usage.cache_write_30m.is_some()
+            || usage.cache_write_12h.is_some();
+        if (anthropic_details && !(anthropic || vendor))
+            || (openai_details && !vendor)
+            || (usage.cache_miss.is_some() && !vendor)
+            || (usage.cost.is_some() && !vendor)
+            || (usage.tool_use_prompt.is_some() && protocol != Protocol::GeminiGenerateContent)
+        {
+            return Err(Error::Unsupported {
+                feature: "target usage extensions",
+            });
+        }
+        if anthropic {
+            usage.input = self.uncached_input()?;
+        } else if usage.cache_write.is_some() && !vendor {
+            self.extension(DroppedField::CacheCreationTokens)?;
+            usage.cache_write = None;
+        }
+        if google {
             usage.output = usage
                 .output
                 .map(|output| {
@@ -540,125 +754,158 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
                 })
                 .transpose()?;
         }
-        if protocol == Protocol::AnthropicMessages
-            && (usage.input.is_none() || usage.output.is_none())
-        {
-            return Err(Error::ContextRequired {
-                field: "final usage input/output",
-            });
-        }
-        if matches!(
-            protocol,
-            Protocol::OpenAiChat | Protocol::OpenAiCompletions | Protocol::OpenAiResponses
-        ) && (usage.input.is_none() || usage.output.is_none() || usage.total.is_none())
-        {
-            if usage == Usage::default() {
-                self.writer.raw(b"null");
-                return Ok(());
+        if !self.config.allow_partial_usage {
+            if anthropic && (usage.input.is_none() || usage.output.is_none()) {
+                return Err(Error::ContextRequired {
+                    field: "final usage input/output",
+                });
             }
-            return Err(Error::ContextRequired {
-                field: "usage total (not derivable across all token-accounting schemes)",
-            });
+            if openai && (usage.input.is_none() || usage.output.is_none() || usage.total.is_none())
+            {
+                if usage == Usage::default() {
+                    self.writer.raw(b"null");
+                    return Ok(());
+                }
+                return Err(Error::ContextRequired {
+                    field: "usage total (not derivable across all token-accounting schemes)",
+                });
+            }
         }
-        let names = match protocol {
-            Protocol::OpenAiChat | Protocol::OpenAiCompletions => [
-                b"prompt_tokens".as_slice(),
-                b"completion_tokens",
-                b"total_tokens",
-                b"cached_tokens",
-                b"reasoning_tokens",
-            ],
-            Protocol::OpenAiResponses => [
-                b"input_tokens".as_slice(),
-                b"output_tokens",
-                b"total_tokens",
-                b"cached_tokens",
-                b"reasoning_tokens",
-            ],
-            Protocol::AnthropicMessages => [
-                b"input_tokens".as_slice(),
-                b"output_tokens",
-                b"",
-                b"cache_read_input_tokens",
-                b"",
-            ],
-            Protocol::GeminiGenerateContent => [
-                b"promptTokenCount".as_slice(),
-                b"candidatesTokenCount",
-                b"totalTokenCount",
-                b"cachedContentTokenCount",
-                b"thoughtsTokenCount",
-            ],
-            Protocol::GeminiInteractions => [
-                b"total_input_tokens".as_slice(),
-                b"total_output_tokens",
-                b"total_tokens",
-                b"total_cached_tokens",
-                b"total_thought_tokens",
-            ],
+        let (input, output, total, cached, reasoning) = match protocol {
+            Protocol::OpenAiChat | Protocol::OpenAiCompletions => (
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+                "cached_tokens",
+                "reasoning_tokens",
+            ),
+            Protocol::OpenAiResponses => (
+                "input_tokens",
+                "output_tokens",
+                "total_tokens",
+                "cached_tokens",
+                "reasoning_tokens",
+            ),
+            Protocol::AnthropicMessages => (
+                "input_tokens",
+                "output_tokens",
+                "",
+                "cache_read_input_tokens",
+                "",
+            ),
+            Protocol::GeminiGenerateContent => (
+                "promptTokenCount",
+                "candidatesTokenCount",
+                "totalTokenCount",
+                "cachedContentTokenCount",
+                "thoughtsTokenCount",
+            ),
+            Protocol::GeminiInteractions => (
+                "total_input_tokens",
+                "total_output_tokens",
+                "total_tokens",
+                "total_cached_tokens",
+                "total_thought_tokens",
+            ),
         };
         self.writer.byte(b'{');
         let mut first = true;
-        for (index, value) in [
-            usage.input,
-            usage.output,
-            usage.total,
-            usage.cached,
-            usage.reasoning,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let Some(value) = value else {
-                continue;
-            };
-            if names[index].is_empty() {
-                if value != 0 && index == 4 {
-                    return Err(Error::Unsupported {
-                        feature: "target reasoning-token accounting",
-                    });
-                }
+        for (name, value) in [
+            (input, usage.input),
+            (output, usage.output),
+            (total, usage.total),
+            (if openai { "" } else { cached }, usage.cached),
+            (if openai { "" } else { reasoning }, usage.reasoning),
+        ] {
+            if name.is_empty() {
                 continue;
             }
-            if !first {
-                self.writer.byte(b',');
-            }
-            first = false;
-            if index >= 3
-                && matches!(
-                    protocol,
-                    Protocol::OpenAiChat | Protocol::OpenAiResponses | Protocol::OpenAiCompletions
-                )
-            {
-                let detail = match (protocol, index) {
-                    (Protocol::OpenAiResponses, 3) => b"input_tokens_details".as_slice(),
-                    (Protocol::OpenAiResponses, _) => b"output_tokens_details",
-                    (_, 3) => b"prompt_tokens_details",
-                    _ => b"completion_tokens_details",
-                };
-                self.writer.string(detail);
-                self.writer.raw(b":{");
-                self.writer.string(names[index]);
-                self.writer.byte(b':');
-                number(&mut self.writer, value);
-                self.writer.byte(b'}');
+            self.usage_counter(&mut first, name, value);
+        }
+        if openai {
+            let details = if protocol == Protocol::OpenAiResponses {
+                "input_tokens_details"
             } else {
-                self.writer.string(names[index]);
-                self.writer.byte(b':');
-                number(&mut self.writer, value);
+                "prompt_tokens_details"
+            };
+            if usage.cached.is_some() || (vendor && (usage.cache_write.is_some() || openai_details))
+            {
+                self.usage_key(&mut first, details);
+                self.writer.byte(b'{');
+                let mut nested = true;
+                self.usage_counter(&mut nested, cached, usage.cached);
+                if vendor {
+                    self.usage_counter(&mut nested, "cache_write_tokens", usage.cache_write);
+                    if openai_details {
+                        self.usage_key(&mut nested, "cache_write_tokens_details");
+                        self.writer.byte(b'{');
+                        let mut ttl = true;
+                        self.usage_counter(&mut ttl, "ttl_30m_tokens", usage.cache_write_30m);
+                        self.usage_counter(&mut ttl, "ttl_12h_tokens", usage.cache_write_12h);
+                        self.writer.byte(b'}');
+                    }
+                }
+                self.writer.byte(b'}');
+            }
+            if usage.reasoning.is_some() {
+                self.usage_key(
+                    &mut first,
+                    if protocol == Protocol::OpenAiResponses {
+                        "output_tokens_details"
+                    } else {
+                        "completion_tokens_details"
+                    },
+                );
+                self.writer.byte(b'{');
+                let mut nested = true;
+                self.usage_counter(&mut nested, reasoning, usage.reasoning);
+                self.writer.byte(b'}');
             }
         }
-        if protocol == Protocol::AnthropicMessages
-            && let Some(value) = usage.cache_write
-        {
-            if !first {
-                self.writer.byte(b',');
+        if anthropic || vendor {
+            self.usage_counter(&mut first, "cache_creation_input_tokens", usage.cache_write);
+            if anthropic_details {
+                self.usage_key(
+                    &mut first,
+                    if anthropic {
+                        "cache_creation"
+                    } else {
+                        "cache_creation_details"
+                    },
+                );
+                self.writer.byte(b'{');
+                let mut ttl = true;
+                self.usage_counter(&mut ttl, "ephemeral_5m_input_tokens", usage.cache_write_5m);
+                self.usage_counter(&mut ttl, "ephemeral_1h_input_tokens", usage.cache_write_1h);
+                self.writer.byte(b'}');
             }
-            self.writer.raw(b"\"cache_creation_input_tokens\":");
-            number(&mut self.writer, value);
+        }
+        if vendor {
+            self.usage_counter(&mut first, "prompt_cache_miss_tokens", usage.cache_miss);
+            if let Some(cost) = usage.cost {
+                self.usage_key(&mut first, "cost");
+                self.writer.raw(cost.raw());
+            }
+        }
+        if protocol == Protocol::GeminiGenerateContent {
+            self.usage_counter(&mut first, "toolUsePromptTokenCount", usage.tool_use_prompt);
         }
         self.writer.byte(b'}');
         Ok(())
+    }
+    fn usage_key(&mut self, first: &mut bool, name: &str) {
+        if !*first {
+            self.writer.byte(b',');
+        }
+        *first = false;
+        self.writer.string(name.as_bytes());
+        self.writer.byte(b':');
+    }
+    fn usage_counter(&mut self, first: &mut bool, name: &str, value: Option<u64>) {
+        if let Some(value) = value {
+            self.usage_key(first, name);
+            number(&mut self.writer, value);
+        }
     }
     fn emit_choice(&mut self, choice: u32, reason: FinishReason) -> Result<(), Error> {
         match self.config.target.protocol {
@@ -675,7 +922,7 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
                     FinishReason::Length => b"length",
                     FinishReason::ToolCalls => b"tool_calls",
                     FinishReason::Safety => b"content_filter",
-                    FinishReason::Other => {
+                    FinishReason::Continuation | FinishReason::Other => {
                         return Err(Error::Unsupported {
                             feature: "finish reason",
                         });
@@ -684,6 +931,11 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
                 self.writer.raw(b"}]}\n\n");
             }
             Protocol::GeminiGenerateContent => {
+                if reason == FinishReason::Continuation && self.state.continuation.is_none() {
+                    return Err(Error::ContextRequired {
+                        field: "continuationToken",
+                    });
+                }
                 self.writer.raw(b"data: {\"candidates\":[{\"index\":");
                 number(&mut self.writer, u64::from(choice));
                 self.writer.raw(b",\"finishReason\":");
@@ -691,12 +943,24 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
                     FinishReason::Stop | FinishReason::ToolCalls => b"STOP",
                     FinishReason::Length => b"MAX_TOKENS",
                     FinishReason::Safety => b"SAFETY",
+                    FinishReason::Continuation => b"CONTINUATION",
                     FinishReason::Other => {
                         return Err(Error::Unsupported {
                             feature: "finish reason",
                         });
                     }
                 });
+                if let Some((owner, token)) = self.state.continuation {
+                    if owner != choice || reason != FinishReason::Continuation {
+                        return Err(Error::InvalidInput {
+                            field: "continuationToken",
+                            reason: "choice/finish mismatch",
+                        });
+                    }
+                    self.writer.raw(b",\"continuationToken\":");
+                    quoted_span(&mut self.writer, self.aggregate, token);
+                    self.state.continuation = None;
+                }
                 self.writer.raw(b"}]}\n\n");
             }
             _ => {}
@@ -768,41 +1032,44 @@ impl Sink for Emitter<'_, '_, '_, '_> {
             Protocol::OpenAiChat => {}
             Protocol::OpenAiCompletions => {}
             Protocol::AnthropicMessages => {
-                let input = self
-                    .state
-                    .usage
-                    .usage()
-                    .input
-                    .ok_or(Error::ContextRequired {
+                let input = self.uncached_input()?;
+                if input.is_none() && !self.config.allow_partial_usage {
+                    return Err(Error::ContextRequired {
                         field: "initial_usage.input",
-                    })?;
-                let input = input
-                    .checked_sub(self.state.usage.usage().cached.unwrap_or(0))
-                    .and_then(|input| {
-                        input.checked_sub(self.state.usage.usage().cache_write.unwrap_or(0))
-                    })
-                    .ok_or(Error::InvalidInput {
-                        field: "usage",
-                        reason: "cached tokens exceed canonical input",
-                    })?;
+                    });
+                }
                 self.named(b"message_start", b"type");
                 self.writer.raw(b",\"message\":{\"id\":");
                 quoted_span(&mut self.writer, self.aggregate, self.state.id);
                 self.writer
                     .raw(b",\"type\":\"message\",\"role\":\"assistant\",\"model\":");
                 quoted_span(&mut self.writer, self.aggregate, self.state.model);
-                self.writer.raw(b",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":");
-                number(&mut self.writer, input);
-                self.writer.raw(b",\"output_tokens\":");
-                number(
-                    &mut self.writer,
-                    self.state.usage.usage().output.unwrap_or(0),
-                );
-                self.writer.raw(b"}}");
+                self.writer
+                    .raw(b",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":");
+                let output = if self.config.allow_partial_usage {
+                    self.state.usage.usage().output
+                } else {
+                    Some(self.state.usage.usage().output.unwrap_or(0))
+                };
+                if input.is_none() && output.is_none() {
+                    self.writer.raw(b"null");
+                } else {
+                    self.writer.byte(b'{');
+                    let mut first = true;
+                    self.usage_counter(&mut first, "input_tokens", input);
+                    self.usage_counter(&mut first, "output_tokens", output);
+                    self.writer.byte(b'}');
+                }
+                self.writer.byte(b'}');
                 self.end_event();
             }
             Protocol::OpenAiResponses => {
                 self.response_event(b"response.created")?;
+                self.writer.raw(b",\"response\":");
+                self.response_object_header(b"in_progress");
+                self.writer.raw(b",\"output\":[],\"usage\":null}");
+                self.end_event();
+                self.response_event(b"response.in_progress")?;
                 self.writer.raw(b",\"response\":");
                 self.response_object_header(b"in_progress");
                 self.writer.raw(b",\"output\":[],\"usage\":null}");
@@ -834,7 +1101,7 @@ impl Sink for Emitter<'_, '_, '_, '_> {
         kind: BlockKind,
         id: Option<Text<'_>>,
         name: Option<Text<'_>>,
-        _item_id: Option<Text<'_>>,
+        item_id: Option<Text<'_>>,
     ) -> Result<(), Error> {
         if !self.state.begun || self.state.ended {
             return Err(Error::InvalidInput {
@@ -947,8 +1214,10 @@ impl Sink for Emitter<'_, '_, '_, '_> {
         } else {
             (Span::EMPTY, Span::EMPTY)
         };
+        let output_id = item_id.map(|id| self.store(id)).transpose()?;
         self.items[slot] = ActiveItem {
             used: true,
+            output_id,
             key,
             kind,
             wire_index: slot as u32,
@@ -1011,6 +1280,12 @@ impl Sink for Emitter<'_, '_, '_, '_> {
         {
             self.append(slot, text)?;
         }
+        if self.config.target.protocol == Protocol::GeminiGenerateContent && kind != BlockKind::Tool
+        {
+            self.flush_gemini_text(slot)?;
+            self.items[slot].pending_text = Some(self.store(text)?);
+            return Ok(());
+        }
         let item = self.items[slot];
         match self.config.target.protocol {
             Protocol::OpenAiChat => {
@@ -1018,7 +1293,8 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                 self.writer.raw(b",\"delta\":{");
                 if kind == BlockKind::Tool {
                     self.writer.raw(b"\"tool_calls\":[{\"index\":");
-                    number(&mut self.writer, u64::from(item.wire_index));
+                    let index = self.tool_index(item);
+                    number(&mut self.writer, index);
                     self.writer.raw(b",\"function\":{\"arguments\":");
                     text.write(&mut self.writer);
                     self.writer.raw(b"}}]");
@@ -1057,13 +1333,16 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                 self.response_event(match kind {
                     BlockKind::Tool => b"response.function_call_arguments.delta",
                     BlockKind::Refusal => b"response.refusal.delta",
+                    BlockKind::Reasoning => b"response.reasoning_summary_text.delta",
                     _ => b"response.output_text.delta",
                 })?;
                 self.writer.raw(b",\"item_id\":");
                 self.item_id(item);
                 self.writer.raw(b",\"output_index\":");
                 number(&mut self.writer, u64::from(item.wire_index));
-                if kind != BlockKind::Tool {
+                if kind == BlockKind::Reasoning {
+                    self.writer.raw(b",\"summary_index\":0");
+                } else if kind != BlockKind::Tool {
                     self.writer.raw(b",\"content_index\":0");
                 }
                 self.writer.raw(b",\"delta\":");
@@ -1104,19 +1383,62 @@ impl Sink for Emitter<'_, '_, '_, '_> {
         }
         Ok(())
     }
-    fn signature(&mut self, key: Key, text: Text<'_>) -> Result<(), Error> {
+    fn signature(
+        &mut self,
+        key: Key,
+        text: Text<'_>,
+        provider: Option<Format>,
+    ) -> Result<(), Error> {
         let slot = self.lookup(key, None).ok_or(Error::InvalidInput {
             field: "signature",
             reason: "block missing",
         })?;
-        let item = self.items[slot];
-        if self.config.source != self.config.target {
+        if self.items[slot].closed {
+            return Err(Error::InvalidInput {
+                field: "signature",
+                reason: "block closed",
+            });
+        }
+        let provider = provider.unwrap_or(self.config.source);
+        let target = self.config.target;
+        let openai = matches!(
+            target.protocol,
+            Protocol::OpenAiChat | Protocol::OpenAiResponses
+        ) && matches!(target.profile, Profile::OpenAiCompatible(_));
+        if !openai && provider.protocol != target.protocol {
             return Err(Error::Unsupported {
                 feature: "provider-bound thinking signature",
             });
         }
-        match self.config.target.protocol {
-            Protocol::AnthropicMessages => {
+        self.store_signature(slot, text, provider)?;
+        let item = self.items[slot];
+        match target.protocol {
+            Protocol::OpenAiChat if openai => {
+                self.choice_header(key.choice, false);
+                self.writer.raw(b",\"delta\":{");
+                if item.kind == BlockKind::Tool {
+                    self.writer.raw(b"\"tool_calls\":[{\"index\":");
+                    let index = self.tool_index(item);
+                    number(&mut self.writer, index);
+                    self.provider_metadata(item)?;
+                    self.writer.raw(b"}]");
+                } else {
+                    self.writer.raw(if item.kind == BlockKind::Reasoning {
+                        b"\"reasoning_details\":[{\"type\":\"signature_delta\",\"index\":"
+                    } else {
+                        b"\"content_details\":[{\"type\":\"signature_delta\",\"index\":"
+                    });
+                    number(&mut self.writer, u64::from(item.wire_index));
+                    self.writer.raw(b",\"protocol\":");
+                    self.writer.string(Self::provider_name(provider));
+                    self.writer.raw(b",\"signature\":");
+                    text.write(&mut self.writer);
+                    self.writer.raw(b"}]");
+                }
+                self.writer.raw(b"},\"finish_reason\":null}]}\n\n");
+            }
+            Protocol::OpenAiResponses if openai => {} // Retained in completed item and terminal snapshot.
+            Protocol::AnthropicMessages if item.kind == BlockKind::Reasoning => {
                 self.named(b"content_block_delta", b"type");
                 self.writer.raw(b",\"index\":");
                 number(&mut self.writer, u64::from(item.wire_index));
@@ -1127,12 +1449,9 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                 self.end_event();
             }
             Protocol::GeminiGenerateContent => {
-                self.writer.raw(b"data: {\"candidates\":[{\"index\":");
-                number(&mut self.writer, u64::from(key.choice));
-                self.writer
-                    .raw(b",\"content\":{\"role\":\"model\",\"parts\":[{\"thoughtSignature\":");
-                text.write(&mut self.writer);
-                self.writer.raw(b"}]}}]}\n\n");
+                if item.kind != BlockKind::Tool {
+                    self.flush_gemini_text(slot)?;
+                }
             }
             Protocol::GeminiInteractions => {
                 self.named(b"step.delta", b"event_type");
@@ -1179,7 +1498,91 @@ impl Sink for Emitter<'_, '_, '_, '_> {
         }
         Ok(())
     }
+    fn images(&mut self, choice: u32, value: json::RawValue<'_>) -> Result<(), Error> {
+        if !self.state.begun || self.state.seen_finish {
+            return Err(Error::InvalidInput {
+                field: "images",
+                reason: "invalid lifecycle",
+            });
+        }
+        if self.config.target.protocol != Protocol::OpenAiChat {
+            return Err(Error::Unsupported {
+                feature: "Chat image output target",
+            });
+        }
+        self.choice_header(choice, false);
+        self.writer.raw(b",\"delta\":{\"images\":");
+        self.writer.raw(value.raw());
+        self.writer.raw(b"},\"finish_reason\":null}]}\n\n");
+        Ok(())
+    }
+    fn grounding(&mut self, choice: u32, value: json::RawValue<'_>) -> Result<(), Error> {
+        if !self.state.begun || self.state.seen_finish {
+            return Err(Error::InvalidInput {
+                field: "groundingMetadata",
+                reason: "invalid lifecycle",
+            });
+        }
+        if self.config.target.protocol != Protocol::GeminiGenerateContent {
+            return Err(Error::Unsupported {
+                feature: "Gemini grounding target",
+            });
+        }
+        self.writer.raw(b"data: {\"candidates\":[{\"index\":");
+        number(&mut self.writer, u64::from(choice));
+        self.writer.raw(b",\"groundingMetadata\":");
+        self.writer.raw(value.raw());
+        self.writer.raw(b"}]}\n\n");
+        Ok(())
+    }
+    fn continuation(&mut self, choice: u32, token: Text<'_>) -> Result<(), Error> {
+        if !self.state.begun || self.state.seen_finish || token.len() == 0 {
+            return Err(Error::InvalidInput {
+                field: "continuationToken",
+                reason: "invalid lifecycle or empty token",
+            });
+        }
+        if self.config.target.protocol != Protocol::GeminiGenerateContent {
+            return Err(Error::Unsupported {
+                feature: "Gemini continuation target",
+            });
+        }
+        if self.state.continuation.is_some() {
+            return Err(Error::InvalidInput {
+                field: "continuationToken",
+                reason: "duplicate token",
+            });
+        }
+        self.state.continuation = Some((choice, self.store(token)?));
+        Ok(())
+    }
+    fn stop_sequence(&mut self, sequence: Text<'_>) -> Result<(), Error> {
+        if !self.state.begun
+            || self.state.seen_finish
+            || sequence.len() == 0
+            || sequence.len() > 1024
+        {
+            return Err(Error::InvalidInput {
+                field: "stop_sequence",
+                reason: "invalid lifecycle or length",
+            });
+        }
+        if self.config.target.protocol != Protocol::AnthropicMessages {
+            return Err(Error::Unsupported {
+                feature: "Anthropic stop sequence target",
+            });
+        }
+        if self.state.stop_sequence.is_some() {
+            return Err(Error::InvalidInput {
+                field: "stop_sequence",
+                reason: "duplicate sequence",
+            });
+        }
+        self.state.stop_sequence = Some(self.store(sequence)?);
+        Ok(())
+    }
     fn usage(&mut self, usage: Usage) -> Result<(), Error> {
+        self.state.usage_seen = true;
         self.state.usage.update(usage)?;
         Ok(())
     }
@@ -1205,9 +1608,22 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                 found = true;
                 self.items[slot].reason = reason;
                 if !self.items[slot].closed
-                    && matches!(reason, FinishReason::Length | FinishReason::Safety)
+                    && matches!(
+                        reason,
+                        FinishReason::Length | FinishReason::Safety | FinishReason::Continuation
+                    )
                 {
                     self.items[slot].incomplete = true;
+                }
+                if self.items[slot].kind == BlockKind::Tool
+                    && !matches!(
+                        self.config.target.protocol,
+                        Protocol::OpenAiChat
+                            | Protocol::OpenAiResponses
+                            | Protocol::OpenAiCompletions
+                    )
+                {
+                    self.items[slot].incomplete = false;
                 }
                 self.close_slot(slot)?;
                 self.items[slot].finished = true;
@@ -1228,8 +1644,10 @@ impl Sink for Emitter<'_, '_, '_, '_> {
             )?;
             let slot = self.state.item_count - 1;
             self.items[slot].reason = reason;
-            self.items[slot].incomplete =
-                matches!(reason, FinishReason::Length | FinishReason::Safety);
+            self.items[slot].incomplete = matches!(
+                reason,
+                FinishReason::Length | FinishReason::Safety | FinishReason::Continuation
+            );
             self.close_slot(slot)?;
             self.items[slot].finished = true;
             self.items[slot].reason = reason;
@@ -1259,7 +1677,10 @@ impl Sink for Emitter<'_, '_, '_, '_> {
             .filter(|item| item.used)
             .map_or(FinishReason::Stop, |item| item.reason);
         if completion == Completion::Completed
-            && matches!(reason, FinishReason::Length | FinishReason::Safety)
+            && matches!(
+                reason,
+                FinishReason::Length | FinishReason::Safety | FinishReason::Continuation
+            )
         {
             completion = Completion::Incomplete;
         }
@@ -1270,7 +1691,7 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                         feature: "cancelled/failed terminal status without error payload",
                     });
                 }
-                if self.state.usage.usage() != Usage::default() {
+                if self.state.usage_seen {
                     self.chat_header(self.config.target.protocol == Protocol::OpenAiCompletions);
                     self.writer.raw(b",\"choices\":[],\"usage\":");
                     self.write_usage(self.config.target.protocol)?;
@@ -1287,17 +1708,24 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                 self.named(b"message_delta", b"type");
                 self.writer.raw(b",\"delta\":{\"stop_reason\":");
                 self.writer.string(match reason {
+                    FinishReason::Stop if self.state.stop_sequence.is_some() => b"stop_sequence",
                     FinishReason::Stop => b"end_turn",
                     FinishReason::Length => b"max_tokens",
                     FinishReason::ToolCalls => b"tool_use",
                     FinishReason::Safety => b"refusal",
-                    FinishReason::Other => {
+                    FinishReason::Continuation | FinishReason::Other => {
                         return Err(Error::Unsupported {
                             feature: "stop reason",
                         });
                     }
                 });
-                self.writer.raw(b",\"stop_sequence\":null},\"usage\":");
+                self.writer.raw(b",\"stop_sequence\":");
+                if let Some(sequence) = self.state.stop_sequence {
+                    quoted_span(&mut self.writer, self.aggregate, sequence);
+                } else {
+                    self.writer.raw(b"null");
+                }
+                self.writer.raw(b"},\"usage\":");
                 self.write_usage(Protocol::AnthropicMessages)?;
                 self.end_event();
                 self.named(b"message_stop", b"type");
@@ -1345,7 +1773,7 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                         feature: "Gemini cancelled/failed status without error payload",
                     });
                 }
-                if self.state.usage.usage() != Usage::default() {
+                if self.state.usage_seen {
                     self.writer
                         .raw(b"data: {\"candidates\":[],\"usageMetadata\":");
                     self.write_usage(Protocol::GeminiGenerateContent)?;
@@ -1447,6 +1875,7 @@ impl Sink for Emitter<'_, '_, '_, '_> {
         id: Option<Text<'_>>,
         name: Text<'_>,
         arguments: Text<'_>,
+        signature: Option<Text<'_>>,
     ) -> Result<(), Error> {
         let id = id.or_else(|| {
             self.config
@@ -1465,7 +1894,33 @@ impl Sink for Emitter<'_, '_, '_, '_> {
         };
         self.block(key, BlockKind::Tool, id, Some(name), None)?;
         self.delta(key, BlockKind::Tool, arguments)?;
-        self.close(key)
+        if let Some(signature) = signature {
+            if self.config.source != self.config.target
+                || self.config.target.protocol != Protocol::GeminiGenerateContent
+            {
+                return Err(Error::Unsupported {
+                    feature: "provider-bound tool signature target",
+                });
+            }
+            let slot = self.state.item_count - 1;
+            let item = self.items[slot];
+            self.writer.raw(b"data: {\"candidates\":[{\"index\":");
+            number(&mut self.writer, u64::from(key.choice));
+            self.writer
+                .raw(b",\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"id\":");
+            quoted_span(&mut self.writer, self.aggregate, item.id);
+            self.writer.raw(b",\"name\":");
+            quoted_span(&mut self.writer, self.aggregate, item.name);
+            self.writer.raw(b",\"args\":");
+            self.write_chain(item, false)?;
+            self.writer.raw(b"},\"thoughtSignature\":");
+            signature.write(&mut self.writer);
+            self.writer.raw(b"}]}}]}\n\n");
+            self.items[slot].closed = true;
+            Ok(())
+        } else {
+            self.close(key)
+        }
     }
     fn snapshot(&mut self, key: Key, kind: BlockKind, text: Text<'_>) -> Result<(), Error> {
         let slot = self.lookup(key, Some(kind)).ok_or(Error::InvalidInput {

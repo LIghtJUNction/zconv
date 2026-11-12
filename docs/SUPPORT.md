@@ -69,11 +69,25 @@ details are retained as extensions or rejected/reported under the explicit polic
 | Interactions | interaction.created, step.start/delta/stop, interaction lifecycle/error | interaction terminal event | Separate v1 step lifecycle, independent of GenerateContent |
 
 Text, tool calls/arguments, reasoning in declared profiles, usage, choices,
-errors and terminal state have event-level implementations and tests. Streamed
-media generation blocks, server-executed tools, grounding event families and
-provider-specific event families outside this matrix fail explicitly. A caller
-can continue to use the original protocol for those events; zconv does not invent
-an approximate event representation.
+errors and terminal state have event-level implementations and tests. Version
+0.3 adds explicit event representations for Chat-compatible image URL arrays,
+GenerateContent grounding metadata and continuation tokens, and Anthropic matched
+stop sequences. These are source-owned extensions: a target without an equivalent
+must reject them or use an explicit loss policy, never silently approximate them.
+Other streamed media generation blocks, server-executed tools and provider event
+families outside this matrix remain unsupported.
+
+Usage includes observed cache lifetime buckets and compatible-provider receipt
+fields without assigning prices, granting authority or deciding charges. Missing
+counters remain unknown. Applications retain financial policy and any deliberately
+chosen partial-usage presentation.
+
+`EventEncoderState` offers the same event encoder with non-borrowing persistent
+state. The caller retains and may grow item/aggregate storage between calls;
+capacity retries discard provisional output and restore committed state. This
+API performs no allocation and does not schedule tasks. Successful terminal
+emission remains an explicit caller action, so an application can settle before
+submitting choice-end and finish events.
 
 ## Direct paths
 

@@ -12,6 +12,8 @@ use crate::{Error, Format, Path, Profile, Protocol, Strategy};
 
 mod decode;
 mod encode;
+mod owned;
+pub use owned::{EventEncoderBuffers, EventEncoderState};
 
 const NONE: usize = usize::MAX;
 const HEADER: usize = core::mem::size_of::<usize>() * 2;
@@ -40,6 +42,7 @@ pub enum FinishReason {
     Length,
     ToolCalls,
     Safety,
+    Continuation,
     Other,
 }
 
@@ -53,16 +56,61 @@ pub enum Completion {
     Cancelled,
 }
 
+/// An exact JSON number observed on the wire, without monetary interpretation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WireNumber {
+    bytes: [u8; 96],
+    len: u8,
+}
+impl WireNumber {
+    pub fn parse(raw: &[u8]) -> Result<Self, Error> {
+        if raw.len() > 96 {
+            return Err(Error::Unsupported {
+                feature: "usage number longer than 96 bytes",
+            });
+        }
+        let mut tokens = [Token::EMPTY; 1];
+        let document = json::parse(raw, &mut tokens, json::Limits::default())?;
+        if document.root().kind() != json::Kind::Number {
+            return Err(Error::InvalidInput {
+                field: "cost",
+                reason: "expected JSON number",
+            });
+        }
+        let mut number = Self {
+            bytes: [0; 96],
+            len: raw.len() as u8,
+        };
+        number.bytes[..raw.len()].copy_from_slice(raw);
+        Ok(number)
+    }
+    pub fn raw(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+}
+
 /// Cumulative counters. Absence is preserved; updates replace present fields.
 /// `input_basis` makes cache accounting explicit even outside an adapter.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Usage {
     pub input: Option<u64>,
+    /// Observed uncached source count, independent of canonical inclusive input.
+    pub uncached_input: Option<u64>,
     pub output: Option<u64>,
     pub total: Option<u64>,
     pub cached: Option<u64>,
     pub reasoning: Option<u64>,
     pub cache_write: Option<u64>,
+    pub cache_write_5m: Option<u64>,
+    pub cache_write_1h: Option<u64>,
+    pub cache_write_30m: Option<u64>,
+    pub cache_write_12h: Option<u64>,
+    pub cache_miss: Option<u64>,
+    pub tool_use_prompt: Option<u64>,
+    pub cost: Option<WireNumber>,
+    /// Preserve a present lifetime object even when every bucket is unknown.
+    pub anthropic_cache_details: bool,
+    pub openai_cache_details: bool,
     pub input_basis: InputCount,
     pub output_basis: OutputCount,
 }
@@ -84,6 +132,32 @@ pub enum OutputCount {
 }
 impl Usage {
     fn update(&mut self, next: Self) {
+        if next.cache_write_5m.is_some() {
+            self.cache_write_5m = next.cache_write_5m;
+        }
+        if next.cache_write_1h.is_some() {
+            self.cache_write_1h = next.cache_write_1h;
+        }
+        if next.cache_write_30m.is_some() {
+            self.cache_write_30m = next.cache_write_30m;
+        }
+        if next.cache_write_12h.is_some() {
+            self.cache_write_12h = next.cache_write_12h;
+        }
+        if next.cache_miss.is_some() {
+            self.cache_miss = next.cache_miss;
+        }
+        if next.tool_use_prompt.is_some() {
+            self.tool_use_prompt = next.tool_use_prompt;
+        }
+        if next.cost.is_some() {
+            self.cost = next.cost;
+        }
+        self.anthropic_cache_details |= next.anthropic_cache_details;
+        self.openai_cache_details |= next.openai_cache_details;
+        if next.uncached_input.is_some() {
+            self.uncached_input = next.uncached_input;
+        }
         if next.input.is_some() {
             self.input = next.input;
         }
@@ -161,6 +235,11 @@ impl UsageAccumulator {
             reason: "counter overflow",
         };
         updated.usage.input = match (updated.input_base, updated.input_basis) {
+            (Some(_), InputCount::Uncached)
+                if updated.usage.anthropic_cache_details && updated.usage.cache_write.is_none() =>
+            {
+                None
+            }
             (Some(input), InputCount::Uncached) => Some(
                 input
                     .checked_add(updated.usage.cached.unwrap_or(0))
@@ -242,6 +321,8 @@ pub struct StreamConfig<'a> {
     /// False keeps deltas authoritative and checks snapshot lengths/lifecycle.
     /// Targets requiring snapshots always aggregate and verify them.
     pub validate_snapshots: bool,
+    /// Encode only observed counters instead of requiring complete terminal usage.
+    pub allow_partial_usage: bool,
 }
 impl<'a> StreamConfig<'a> {
     pub fn new(source: Protocol, target: Protocol) -> Self {
@@ -253,6 +334,7 @@ impl<'a> StreamConfig<'a> {
             context: StreamContext::default(),
             policy: StreamPolicy::default(),
             validate_snapshots: false,
+            allow_partial_usage: false,
         }
     }
 }
@@ -283,6 +365,10 @@ pub enum EventKind {
     ToolComplete,
     Snapshot,
     BlockIncomplete,
+    Images,
+    Grounding,
+    Continuation,
+    StopSequence,
 }
 
 /// Compact event IR. All spans refer to the associated payload, never a cache.
@@ -292,11 +378,16 @@ pub struct Event {
     pub key: Key,
     pub block: BlockKind,
     pub a: EventText,
+    /// Begin: model; ToolComplete: name; Signature: optional origin label.
+    /// Signature origins are `anthropic`, `gemini`, `chat`, or `responses`.
+    /// An absent Signature origin uses StreamConfig.source, never the target.
     pub b: EventText,
     pub c: EventText,
-    /// Source output item identity, separate from the tool call ID in `a`.
-    /// The target encoder continues to use caller-chosen target item IDs.
+    /// Explicit output item identity, separate from the tool call ID in `a`.
+    /// The encoder preserves this ID; absent IDs use the context prefix.
     pub item_id: EventText,
+    /// Signature bound to an atomic tool call, distinct from an item ID.
+    pub signature: EventText,
     pub created: Option<u64>,
     pub usage: Usage,
     pub reason: FinishReason,
@@ -336,14 +427,30 @@ impl Event {
             quoted: false,
             present: false,
         },
+        signature: EventText {
+            offset: 0,
+            length: 0,
+            quoted: false,
+            present: false,
+        },
         created: None,
         usage: Usage {
             input: None,
+            uncached_input: None,
             output: None,
             total: None,
             cached: None,
             reasoning: None,
             cache_write: None,
+            cache_write_5m: None,
+            cache_write_1h: None,
+            cache_write_30m: None,
+            cache_write_12h: None,
+            cache_miss: None,
+            tool_use_prompt: None,
+            cost: None,
+            anthropic_cache_details: false,
+            openai_cache_details: false,
             input_basis: InputCount::Total,
             output_basis: OutputCount::Total,
         },
@@ -384,6 +491,10 @@ pub struct ActiveItem {
     validated: bool,
     content_length: usize,
     incomplete: bool,
+    output_id: Option<Span>,
+    pending_text: Option<Span>,
+    signature: Option<Span>,
+    signature_provider: Option<Format>,
 }
 impl ActiveItem {
     pub const EMPTY: Self = Self {
@@ -407,6 +518,10 @@ impl ActiveItem {
         validated: false,
         content_length: 0,
         incomplete: false,
+        output_id: None,
+        pending_text: None,
+        signature: None,
+        signature_provider: None,
     };
 }
 impl Default for ActiveItem {
@@ -505,6 +620,9 @@ struct State {
     item_count: usize,
     sequence: u64,
     report: Report,
+    stop_sequence: Option<Span>,
+    continuation: Option<(u32, Span)>,
+    usage_seen: bool,
 }
 impl State {
     fn new(context: StreamContext<'_>) -> Result<Self, Error> {
@@ -522,6 +640,9 @@ impl State {
             item_count: 0,
             sequence: 0,
             report: Report::default(),
+            stop_sequence: None,
+            continuation: None,
+            usage_seen: false,
         })
     }
 }
@@ -713,45 +834,22 @@ impl<'a, 'c> StreamConverter<'a, 'c> {
                 reason: "drain pending conversion first",
             }));
         }
-        if self.state.ended {
-            return Err(Status::Failed(Error::AlreadyFinished));
-        }
-        let saved = self.state;
-        self.checkpoints[..self.items.len()].copy_from_slice(self.items);
-        let result = (|| {
-            let mut emitter = encode::Emitter::new(
-                self.config,
-                Writer::new(self.pending),
-                &mut self.state,
-                self.items,
-                self.aggregate,
-            );
-            for event in events {
-                replay(*event, payload, &mut emitter)?;
-            }
-            emitter.state.report.ir_events =
-                emitter.state.report.ir_events.saturating_add(events.len());
-            let length = emitter.writer.finish()?;
-            validate_arguments(
-                self.config.json_limits,
-                &mut self.state,
-                self.items,
-                self.aggregate,
-                self.tokens,
-            )?;
-            Ok(length)
-        })();
-        match result {
-            Ok(length) => {
-                self.pending_len = length;
-                self.pending_peak = self.pending_peak.max(length);
-                Ok(())
-            }
-            Err(error) => {
-                self.rollback(saved);
-                Err(capacity_status(error))
-            }
-        }
+        let length = owned::stage(
+            self.config,
+            payload,
+            events,
+            EventEncoderBuffers {
+                tokens: self.tokens,
+                items: self.items,
+                checkpoints: self.checkpoints,
+                aggregate: self.aggregate,
+            },
+            self.pending,
+            &mut self.state,
+        )?;
+        self.pending_len = length;
+        self.pending_peak = self.pending_peak.max(length);
+        Ok(())
     }
 
     /// `eof` applies after all supplied input has been consumed. When output is
@@ -1011,6 +1109,13 @@ enum Text<'a> {
     Json(JsonString<'a>),
 }
 impl<'a> Text<'a> {
+    fn eq_str(self, expected: &str) -> bool {
+        match self {
+            Self::Utf8(value) => value == expected.as_bytes(),
+            Self::Json(value) => value.eq_str(expected),
+        }
+    }
+
     fn len(self) -> usize {
         match self {
             Self::Utf8(bytes) => bytes.len(),
@@ -1061,9 +1166,18 @@ trait Sink {
         item_id: Option<Text<'_>>,
     ) -> Result<(), Error>;
     fn delta(&mut self, key: Key, kind: BlockKind, text: Text<'_>) -> Result<(), Error>;
-    fn signature(&mut self, key: Key, text: Text<'_>) -> Result<(), Error>;
+    fn signature(
+        &mut self,
+        key: Key,
+        text: Text<'_>,
+        provider: Option<Format>,
+    ) -> Result<(), Error>;
     fn close(&mut self, key: Key) -> Result<(), Error>;
     fn usage(&mut self, usage: Usage) -> Result<(), Error>;
+    fn images(&mut self, choice: u32, value: json::RawValue<'_>) -> Result<(), Error>;
+    fn grounding(&mut self, choice: u32, value: json::RawValue<'_>) -> Result<(), Error>;
+    fn continuation(&mut self, choice: u32, token: Text<'_>) -> Result<(), Error>;
+    fn stop_sequence(&mut self, sequence: Text<'_>) -> Result<(), Error>;
     fn choice(&mut self, choice: u32, reason: FinishReason) -> Result<(), Error>;
     fn finish(&mut self, completion: Completion) -> Result<(), Error>;
     fn failure(&mut self, code: Option<Text<'_>>, message: Text<'_>) -> Result<(), Error>;
@@ -1074,6 +1188,7 @@ trait Sink {
         id: Option<Text<'_>>,
         name: Text<'_>,
         arguments: Text<'_>,
+        signature: Option<Text<'_>>,
     ) -> Result<(), Error>;
     fn snapshot(&mut self, key: Key, kind: BlockKind, text: Text<'_>) -> Result<(), Error>;
     fn incomplete(&mut self, key: Key) -> Result<(), Error>;
@@ -1128,7 +1243,7 @@ fn process(
     if path == Path::Ir {
         let length = decode_ir_value(config.source, payload, root, events)?;
         for event in &events[..length] {
-            replay(*event, payload, &mut emitter)?;
+            replay(*event, payload, &mut emitter, tokens, config.json_limits)?;
         }
         emitter.state.report.ir_events = emitter.state.report.ir_events.saturating_add(length);
     } else {
@@ -1151,6 +1266,15 @@ fn validate_arguments(
         .iter_mut()
         .filter(|item| item.used && item.closed && item.kind == BlockKind::Tool && !item.validated)
     {
+        if item.incomplete
+            && item.finished
+            && matches!(
+                item.reason,
+                FinishReason::Length | FinishReason::Safety | FinishReason::Continuation
+            )
+        {
+            continue;
+        }
         if item.head == NONE {
             return Err(Error::InvalidInput {
                 field: "tool arguments",
@@ -1328,7 +1452,10 @@ pub fn validate_stream_format(format: Format) -> Result<(), Error> {
     let profile = match format.profile {
         Profile::Standard => true,
         Profile::OpenAiCompatible(name) => {
-            format.protocol == Protocol::OpenAiChat && !name.is_empty()
+            matches!(
+                format.protocol,
+                Protocol::OpenAiChat | Protocol::OpenAiResponses
+            ) && !name.is_empty()
         }
     };
     if format.version != Format::new(format.protocol).version || !profile {
@@ -1367,6 +1494,22 @@ impl Collector<'_, '_> {
             length: raw.len(),
             quoted: matches!(text, Text::Json(_)),
             present: true,
+        })
+    }
+    fn raw_event(
+        &mut self,
+        kind: EventKind,
+        choice: u32,
+        value: json::RawValue<'_>,
+    ) -> Result<(), Error> {
+        self.add(Event {
+            kind,
+            key: Key {
+                choice,
+                ..Key::default()
+            },
+            a: self.text(Some(Text::Utf8(value.raw())))?,
+            ..Event::EMPTY
         })
     }
     fn add(&mut self, event: Event) -> Result<(), Error> {
@@ -1420,7 +1563,12 @@ impl Sink for Collector<'_, '_> {
             ..Event::EMPTY
         })
     }
-    fn signature(&mut self, key: Key, text: Text<'_>) -> Result<(), Error> {
+    fn signature(
+        &mut self,
+        key: Key,
+        text: Text<'_>,
+        _provider: Option<Format>,
+    ) -> Result<(), Error> {
         self.add(Event {
             kind: EventKind::Signature,
             key,
@@ -1481,6 +1629,7 @@ impl Sink for Collector<'_, '_> {
         id: Option<Text<'_>>,
         name: Text<'_>,
         arguments: Text<'_>,
+        signature: Option<Text<'_>>,
     ) -> Result<(), Error> {
         self.add(Event {
             kind: EventKind::ToolComplete,
@@ -1488,6 +1637,7 @@ impl Sink for Collector<'_, '_> {
             a: self.text(id)?,
             b: self.text(Some(name))?,
             c: self.text(Some(arguments))?,
+            signature: self.text(signature)?,
             ..Event::EMPTY
         })
     }
@@ -1497,6 +1647,30 @@ impl Sink for Collector<'_, '_> {
             key,
             block,
             a: self.text(Some(text))?,
+            ..Event::EMPTY
+        })
+    }
+    fn images(&mut self, choice: u32, value: json::RawValue<'_>) -> Result<(), Error> {
+        self.raw_event(EventKind::Images, choice, value)
+    }
+    fn grounding(&mut self, choice: u32, value: json::RawValue<'_>) -> Result<(), Error> {
+        self.raw_event(EventKind::Grounding, choice, value)
+    }
+    fn continuation(&mut self, choice: u32, token: Text<'_>) -> Result<(), Error> {
+        self.add(Event {
+            kind: EventKind::Continuation,
+            key: Key {
+                choice,
+                ..Key::default()
+            },
+            a: self.text(Some(token))?,
+            ..Event::EMPTY
+        })
+    }
+    fn stop_sequence(&mut self, sequence: Text<'_>) -> Result<(), Error> {
+        self.add(Event {
+            kind: EventKind::StopSequence,
+            a: self.text(Some(sequence))?,
             ..Event::EMPTY
         })
     }
@@ -1544,10 +1718,36 @@ fn required_text(text: Option<Text<'_>>) -> Result<Text<'_>, Error> {
         reason: "missing text",
     })
 }
-fn replay(event: Event, payload: &[u8], sink: &mut impl Sink) -> Result<(), Error> {
+fn replay(
+    event: Event,
+    payload: &[u8],
+    sink: &mut impl Sink,
+    tokens: &mut [Token],
+    limits: json::Limits,
+) -> Result<(), Error> {
     let a = event_text(event.a, payload)?;
     let b = event_text(event.b, payload)?;
     match event.kind {
+        EventKind::Images | EventKind::Grounding => {
+            let raw = required_text(a)?;
+            let Text::Utf8(raw) = raw else {
+                return Err(Error::InvalidInput {
+                    field: "event IR raw JSON",
+                    reason: "must be unquoted JSON",
+                });
+            };
+            let document = json::parse(raw, tokens, limits)?;
+            let root = document.root();
+            if event.kind == EventKind::Images {
+                decode::validate_images(root)?;
+                sink.images(event.key.choice, root.raw_value())
+            } else {
+                decode::validate_grounding(root)?;
+                sink.grounding(event.key.choice, root.raw_value())
+            }
+        }
+        EventKind::Continuation => sink.continuation(event.key.choice, required_text(a)?),
+        EventKind::StopSequence => sink.stop_sequence(required_text(a)?),
         EventKind::Begin => sink.begin(a, b, event.created),
         EventKind::BlockStart => sink.block(
             event.key,
@@ -1557,7 +1757,28 @@ fn replay(event: Event, payload: &[u8], sink: &mut impl Sink) -> Result<(), Erro
             event_text(event.item_id, payload)?,
         ),
         EventKind::Delta => sink.delta(event.key, event.block, required_text(a)?),
-        EventKind::Signature => sink.signature(event.key, required_text(a)?),
+        EventKind::Signature => {
+            let provider = b
+                .map(|name| {
+                    let protocol = if name.eq_str("anthropic") {
+                        Protocol::AnthropicMessages
+                    } else if name.eq_str("gemini") {
+                        Protocol::GeminiGenerateContent
+                    } else if name.eq_str("chat") {
+                        Protocol::OpenAiChat
+                    } else if name.eq_str("responses") {
+                        Protocol::OpenAiResponses
+                    } else {
+                        return Err(Error::InvalidInput {
+                            field: "signature provider",
+                            reason: "unknown origin label",
+                        });
+                    };
+                    Ok(Format::new(protocol))
+                })
+                .transpose()?;
+            sink.signature(event.key, required_text(a)?, provider)
+        }
         EventKind::BlockEnd => sink.close(event.key),
         EventKind::Usage => sink.usage(event.usage),
         EventKind::ChoiceEnd => sink.choice(event.key.choice, event.reason),
@@ -1569,6 +1790,7 @@ fn replay(event: Event, payload: &[u8], sink: &mut impl Sink) -> Result<(), Erro
             a,
             required_text(b)?,
             required_text(event_text(event.c, payload)?)?,
+            event_text(event.signature, payload)?,
         ),
         EventKind::Snapshot => sink.snapshot(event.key, event.block, required_text(a)?),
         EventKind::BlockIncomplete => sink.incomplete(event.key),

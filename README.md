@@ -12,12 +12,22 @@ background work in the library.
 **MSRV: Rust 1.74.0.** The same crate builds for Linux, macOS, Windows, aarch64,
 WASM and bare-metal targets. Benchmarks, examples and tests may use `std`.
 
+## Own stream state without borrowing buffers
+
+`stream::EventEncoderState` keeps protocol state without storing references to the
+caller's buffers. Pass `EventEncoderBuffers` and response identity context to
+`encode` for each event batch. After a capacity error, grow the indicated buffer
+while preserving its contents and retry the same batch; discard provisional
+output on error. This supports application-owned growable buffers without unsafe
+lifetime tricks or another dependency. Supply choice-end and finish events only
+when the application is ready to publish a successful terminal response.
+
 ## Start here
 
 Use the repository source until the first registry release is available:
 
 ```sh
-cargo add zconv --git https://github.com/LIghtJUNction/zconv
+cargo add zconv@0.3
 ```
 
 This complete request conversion is also available as

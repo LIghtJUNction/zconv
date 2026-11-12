@@ -12,6 +12,130 @@ fn write_text(w: &mut Writer<'_>, text: Text<'_>) {
     }
 }
 
+// Traverse schema positions only. Defaults, examples, enum objects and
+// property names are business JSON, even when they contain a field named type.
+fn json_schema(w: &mut Writer<'_>, value: json::Value<'_, '_>) -> Result<(), Error> {
+    if value.kind() != Kind::Object {
+        w.raw(value.raw());
+        return Ok(());
+    }
+    let nullable = value
+        .get("nullable")
+        .map(|v| {
+            v.as_bool()
+                .ok_or_else(|| invalid("nullable", "expected boolean"))
+        })
+        .transpose()?
+        .unwrap_or(false);
+    if nullable && value.get("type").is_none() {
+        return Err(Error::Unsupported {
+            feature: "nullable typed schema without explicit type",
+        });
+    }
+    w.byte(b'{');
+    let mut comma = false;
+    for (name, child) in value.object() {
+        if name.eq_str("nullable") {
+            continue;
+        }
+        if comma {
+            w.byte(b',');
+        }
+        comma = true;
+        w.json_string(name);
+        w.byte(b':');
+        if name.eq_str("type") {
+            let t = child
+                .as_string()
+                .ok_or_else(|| invalid("type", "typed schema requires string type"))?;
+            let mapped = [
+                ("OBJECT", "object"),
+                ("ARRAY", "array"),
+                ("STRING", "string"),
+                ("NUMBER", "number"),
+                ("INTEGER", "integer"),
+                ("BOOLEAN", "boolean"),
+                ("NULL", "null"),
+            ]
+            .iter()
+            .find(|(upper, lower)| t.eq_str(upper) || t.eq_str(lower))
+            .map(|(_, lower)| *lower)
+            .ok_or(Error::Unsupported {
+                feature: "unknown typed schema type",
+            })?;
+            if nullable {
+                w.byte(b'[');
+            }
+            w.string(mapped.as_bytes());
+            if nullable {
+                w.raw(b",\"null\"]");
+            }
+        } else if ["properties", "$defs", "definitions", "patternProperties"]
+            .iter()
+            .any(|key| name.eq_str(key))
+        {
+            if child.kind() != Kind::Object {
+                return Err(invalid("schema map", "expected object"));
+            }
+            w.byte(b'{');
+            let mut c = false;
+            for (property, schema) in child.object() {
+                if c {
+                    w.byte(b',');
+                }
+                c = true;
+                w.json_string(property);
+                w.byte(b':');
+                json_schema(w, schema)?;
+            }
+            w.byte(b'}');
+        } else if ["items", "additionalProperties", "not", "contains"]
+            .iter()
+            .any(|key| name.eq_str(key))
+            && child.kind() != Kind::Array
+        {
+            json_schema(w, child)?;
+        } else if ["anyOf", "oneOf", "allOf", "prefixItems", "items"]
+            .iter()
+            .any(|key| name.eq_str(key))
+            && child.kind() == Kind::Array
+        {
+            w.byte(b'[');
+            let mut c = false;
+            for schema in child.array() {
+                if c {
+                    w.byte(b',');
+                }
+                c = true;
+                json_schema(w, schema)?;
+            }
+            w.byte(b']');
+        } else {
+            w.raw(child.raw());
+        }
+    }
+    w.byte(b'}');
+    Ok(())
+}
+
+fn native_instruction(target: Protocol, m: Message<'_>) -> bool {
+    if matches!(
+        target,
+        Protocol::AnthropicMessages | Protocol::GeminiGenerateContent
+    ) {
+        matches!(m.role, Role::System | Role::Developer)
+    } else {
+        m.role == Role::System && (target != Protocol::OpenAiResponses || m.system_instruction)
+    }
+}
+fn anthropic_role(role: Role) -> Role {
+    if role == Role::Assistant {
+        Role::Assistant
+    } else {
+        Role::User
+    }
+}
+
 fn number(w: &mut Writer<'_>, number: Number<'_>) -> Result<(), Error> {
     match number {
         Number::Json(v) => {
@@ -216,13 +340,47 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                     {
                         self.metadata_loss(true, "response item status")?;
                     }
+                    if !(matches!(b.content, Content::Reasoning { .. })
+                        && self.policy.drop_reasoning)
+                    {
+                        if let Presence::Value(signature) = b.signature {
+                            if signature.source != self.target {
+                                return Err(Error::PolicyViolation {
+                                    feature: "signature belongs to provider",
+                                });
+                            }
+                            if self.target.protocol != Protocol::GeminiGenerateContent
+                                && !(self.target.protocol == Protocol::AnthropicMessages
+                                    && matches!(b.content, Content::Reasoning { .. }))
+                            {
+                                return Err(Error::Unsupported {
+                                    feature: "provider signature in target block",
+                                });
+                            }
+                        } else if b.signature.is_null() {
+                            return Err(invalid("signature", "null replay signature"));
+                        }
+                    }
+                    if let (
+                        Presence::Value(provider),
+                        Content::Reasoning {
+                            signature: Presence::Value(value),
+                            ..
+                        },
+                    ) = (b.signature, b.content)
+                        && !text_bytes(provider.value).eq(text_bytes(value))
+                    {
+                        return Err(invalid("signature", "conflicting provider replay material"));
+                    }
+                    let content_source =
+                        b.signature.value().map(|s| s.source).unwrap_or(self.source);
                     match b.content {
                         Content::Reasoning {
                             signature, kind, ..
                         } => {
                             if self.policy.drop_reasoning {
                                 self.report.dropped_reasoning += 1;
-                            } else if self.source != self.target
+                            } else if content_source != self.target
                                 && ((kind == ReasoningKind::Thought
                                     && matches!(
                                         self.target.protocol,
@@ -239,7 +397,7 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                                 return Err(Error::Unsupported {
                                     feature: "reasoning summary and provider thought differ",
                                 });
-                            } else if self.source != self.target && !signature.is_missing() {
+                            } else if content_source != self.target && !signature.is_missing() {
                                 return Err(Error::PolicyViolation {
                                     feature: "reasoning signature belongs to source",
                                 });
@@ -336,6 +494,29 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
         }
         Ok(())
     }
+    fn call_extras(&mut self, span: Span, comma: &mut bool, wrapper: bool) -> Result<(), Error> {
+        self.records
+            .get(span.start..span.end)
+            .ok_or_else(|| invalid("IR extensions", "invalid arena range"))?;
+        for at in span.start..span.end {
+            let Record::Extension(extension) = self.records[at] else {
+                return Err(invalid(
+                    "IR extensions",
+                    "range contains a non-extension record",
+                ));
+            };
+            if (extension.location == "tool_call") == wrapper {
+                self.extras(
+                    Span {
+                        start: at,
+                        end: at + 1,
+                    },
+                    comma,
+                )?;
+            }
+        }
+        Ok(())
+    }
     fn bind_id(&self, id: Presence<Text<'a>>, name: Text<'a>) -> Result<Text<'a>, Error> {
         if let Presence::Value(id) = id {
             return Ok(id);
@@ -364,12 +545,23 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
             return Ok(name);
         }
         if let Presence::Value(id) = id {
+            let mut found = None;
             for binding in self.context.tool_calls.iter().take(64) {
                 if equivalent_text(id, binding.id) {
-                    return Ok(Text::Utf8(binding.name));
+                    if let Some(previous) = found
+                        && !text_bytes(previous).eq(text_bytes(Text::Utf8(binding.name)))
+                    {
+                        return Err(Error::ContextRequired {
+                            field: "unambiguous tool function name",
+                        });
+                    }
+                    found = Some(Text::Utf8(binding.name));
                 }
             }
-            for record in self.records.iter().take(256) {
+            if let Some(name) = found {
+                return Ok(name);
+            }
+            for record in self.records {
                 if let Record::Block(Block {
                     content:
                         Content::ToolCall {
@@ -379,19 +571,18 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                         },
                     ..
                 }) = record
+                    && text_bytes(id).eq(text_bytes(*call_id))
                 {
-                    let same = match (id, *call_id) {
-                        (Text::Json(a), Text::Json(b)) => a.bytes().eq(b.bytes()),
-                        _ => id
-                            .as_str()
-                            .zip(call_id.as_str())
-                            .map(|(a, b)| a == b)
-                            .unwrap_or(false),
-                    };
-                    if same {
-                        return Ok(*name);
+                    if found.is_some() {
+                        return Err(Error::ContextRequired {
+                            field: "unambiguous tool function name",
+                        });
                     }
+                    found = Some(*name);
                 }
+            }
+            if let Some(name) = found {
+                return Ok(name);
             }
         }
         Err(Error::ContextRequired {
@@ -405,6 +596,39 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
         object_required: bool,
     ) -> Result<(), Error> {
         match data {
+            Data::ObjectOrText { text, key: wrapper } => {
+                if !object_required {
+                    return self.data(Data::Text(text), stringify, false);
+                }
+                let len = match text {
+                    Text::Json(value) => value.decode_into(self.scratch).map_err(|e| match e {
+                        Error::OutputTooSmall { needed } => Error::ScratchTooSmall { needed },
+                        e => e,
+                    })?,
+                    Text::Utf8(value) => {
+                        if value.len() > self.scratch.len() {
+                            return Err(Error::ScratchTooSmall {
+                                needed: value.len(),
+                            });
+                        }
+                        self.scratch[..value.len()].copy_from_slice(value.as_bytes());
+                        value.len()
+                    }
+                };
+                match json::parse(&self.scratch[..len], self.tokens, json::Limits::default()) {
+                    Ok(document) if document.root().kind() == Kind::Object => {
+                        self.w.raw(document.root().raw())
+                    }
+                    Ok(_) | Err(Error::InvalidJson { .. }) => {
+                        self.w.byte(b'{');
+                        write_text(&mut self.w, wrapper);
+                        self.w.byte(b':');
+                        write_text(&mut self.w, text);
+                        self.w.byte(b'}');
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             Data::EmptyObject => {
                 if stringify {
                     self.w.string(b"{}");
@@ -466,8 +690,25 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
         }
         Ok(())
     }
-    fn media(&mut self, media: Media<'a>, response: bool) -> Result<(), Error> {
+    fn media(&mut self, media: Media<'a>, response: bool, block: Block<'a>) -> Result<(), Error> {
         let p = self.target.protocol;
+        if matches!(
+            p,
+            Protocol::AnthropicMessages | Protocol::GeminiGenerateContent
+        ) {
+            if !media.detail.is_missing()
+                && !matches!(media.detail, Presence::Value(v) if v.eq_str("auto"))
+            {
+                return Err(Error::Unsupported {
+                    feature: "media detail in native target",
+                });
+            }
+            if !media.filename.is_missing() {
+                return Err(Error::Unsupported {
+                    feature: "media filename in native target",
+                });
+            }
+        }
         let mut comma = false;
         self.w.byte(b'{');
         match p {
@@ -618,7 +859,10 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                     }
                 }
                 self.w.byte(b'}');
-                if !media.detail.is_missing() || !media.filename.is_missing() {
+                if (!media.detail.is_missing()
+                    && !matches!(media.detail, Presence::Value(v) if v.eq_str("auto")))
+                    || !media.filename.is_missing()
+                {
                     return Err(Error::Unsupported {
                         feature: "Anthropic media detail or filename",
                     });
@@ -705,6 +949,22 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                 });
             }
         }
+        // Inner OpenAI media objects are closed above; extras belong to
+        // the outer block, including cache_control and Gemini signatures.
+        let mut outer_comma = true;
+        self.extras(block.extensions, &mut outer_comma)?;
+        if p == Protocol::GeminiGenerateContent {
+            ptext(
+                &mut self.w,
+                &mut outer_comma,
+                "thoughtSignature",
+                block
+                    .signature
+                    .value()
+                    .map(|s| Presence::Value(s.value))
+                    .unwrap_or(Presence::Missing),
+            );
+        }
         self.w.byte(b'}');
         Ok(())
     }
@@ -739,7 +999,7 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
             });
         }
         if let Content::Media(media) = block.content {
-            self.media(media, response)?;
+            self.media(media, response, block)?;
             return Ok(true);
         }
         self.w.byte(b'{');
@@ -762,9 +1022,14 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                 write_text(&mut self.w, t);
             }
             Content::Refusal(t) => {
-                if p == Protocol::AnthropicMessages {
-                    key(&mut self.w, &mut c, "type");
-                    self.w.string(b"text");
+                if matches!(
+                    p,
+                    Protocol::AnthropicMessages | Protocol::GeminiGenerateContent
+                ) {
+                    if p != Protocol::GeminiGenerateContent {
+                        key(&mut self.w, &mut c, "type");
+                        self.w.string(b"text");
+                    }
                     key(&mut self.w, &mut c, "text");
                     write_text(&mut self.w, t);
                 } else {
@@ -782,6 +1047,11 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
             Content::Reasoning {
                 text, signature, ..
             } => {
+                let signature = block
+                    .signature
+                    .value()
+                    .map(|s| Presence::Value(s.value))
+                    .unwrap_or(signature);
                 if p == Protocol::AnthropicMessages {
                     key(&mut self.w, &mut c, "type");
                     self.w.string(if text.is_missing() {
@@ -894,6 +1164,20 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
             }
         }
         self.extras(block.extensions, &mut c)?;
+        if p == Protocol::GeminiGenerateContent
+            && !matches!(block.content, Content::Reasoning { .. })
+        {
+            ptext(
+                &mut self.w,
+                &mut c,
+                "thoughtSignature",
+                block
+                    .signature
+                    .value()
+                    .map(|s| Presence::Value(s.value))
+                    .unwrap_or(Presence::Missing),
+            );
+        }
         self.w.byte(b'}');
         Ok(true)
     }
@@ -1045,20 +1329,10 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                     Content::ToolCall { .. } => calls += 1,
                     Content::ToolResult { .. } => result = Some(*b),
                     Content::Refusal(t) => {
-                        if refusal.is_some() {
-                            return Err(Error::Unsupported {
-                                feature: "multiple refusal blocks in Chat",
-                            });
-                        }
                         refusal = Some(t);
                     }
                     Content::Reasoning { text, .. } => {
-                        if !self.policy.drop_reasoning {
-                            if reasoning.is_some() {
-                                return Err(Error::Unsupported {
-                                    feature: "multiple reasoning blocks in Chat",
-                                });
-                            }
+                        if !self.policy.drop_reasoning && text.value().is_some() {
                             reasoning = text.value();
                         }
                     }
@@ -1100,7 +1374,7 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                 )?;
             }
         } else {
-            if response && plain > 1 && other == 0 {
+            if (response || m.shape == ContentShape::String) && plain > 1 && other == 0 {
                 key(&mut self.w, &mut c, "content");
                 self.w.byte(b'"');
                 for record in &self.records[index + 1..m.end] {
@@ -1158,18 +1432,42 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                 key(&mut self.w, &mut c, "reasoning_content");
                 self.w.raw(b"null");
             }
-            if let Some(r) = refusal {
+            if refusal.is_some() {
                 key(&mut self.w, &mut c, "refusal");
-                write_text(&mut self.w, r);
+                self.w.byte(b'"');
+                for record in &self.records[index + 1..m.end] {
+                    if let Record::Block(Block {
+                        content: Content::Refusal(t),
+                        ..
+                    }) = record
+                    {
+                        text_inner(&mut self.w, *t);
+                    }
+                }
+                self.w.byte(b'"');
             }
-            if let Some(r) = reasoning {
+            if reasoning.is_some() {
                 if matches!(self.target.profile, Profile::Standard) {
                     return Err(Error::Unsupported {
                         feature: "reasoning_content requires explicit vendor profile",
                     });
                 }
                 key(&mut self.w, &mut c, "reasoning_content");
-                write_text(&mut self.w, r);
+                self.w.byte(b'"');
+                for record in &self.records[index + 1..m.end] {
+                    if let Record::Block(Block {
+                        content:
+                            Content::Reasoning {
+                                text: Presence::Value(t),
+                                ..
+                            },
+                        ..
+                    }) = record
+                    {
+                        text_inner(&mut self.w, *t);
+                    }
+                }
+                self.w.byte(b'"');
             }
             if calls > 0
                 && matches!(m.function_call, Presence::Value(()))
@@ -1223,8 +1521,10 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                         self.w.raw(b",\"arguments\":");
                         self.data(arguments, true, false)?;
                         let mut ec = true;
-                        self.extras(b.extensions, &mut ec)?;
-                        self.w.raw(b"}}");
+                        self.call_extras(b.extensions, &mut ec, false)?;
+                        self.w.byte(b'}');
+                        self.call_extras(b.extensions, &mut ec, true)?;
+                        self.w.byte(b'}');
                     }
                 }
                 self.w.byte(b']');
@@ -1444,9 +1744,9 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
         *comma = true;
         self.w.byte(b'{');
         let mut c = false;
-        key(&mut self.w, &mut c, "type");
         let interactions = self.target.protocol == Protocol::GeminiInteractions;
         if interactions {
+            key(&mut self.w, &mut c, "type");
             if !matches!(m.role, Role::User | Role::Assistant) {
                 return Err(Error::Unsupported {
                     feature: "role in Interactions",
@@ -1458,7 +1758,12 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                 b"user_input"
             });
         } else {
-            self.w.string(b"message");
+            // Responses input messages use the default item type; only
+            // response output items spell out "message".
+            if response {
+                key(&mut self.w, &mut c, "type");
+                self.w.string(b"message");
+            }
             key(&mut self.w, &mut c, "role");
             self.w.string(role_name(m.role));
             let item_id = self.output_id(m.item_id, response)?;
@@ -1686,16 +1991,31 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                 key(&mut self.w, &mut c, "name");
                 write_text(&mut self.w, tool.name);
                 ptext(&mut self.w, &mut c, "description", tool.description);
-                praw(
-                    &mut self.w,
-                    &mut c,
-                    if self.target.protocol == Protocol::AnthropicMessages {
-                        "input_schema"
-                    } else {
-                        "parameters"
-                    },
-                    tool.parameters,
-                );
+                let schema_key = if google && tool.schema_dialect == SchemaDialect::JsonSchema {
+                    if self.target.version != "v1beta" && !tool.parameters.is_missing() {
+                        return Err(Error::Unsupported {
+                            feature: "JSON Schema function parameters require Gemini v1beta",
+                        });
+                    }
+                    "parametersJsonSchema"
+                } else if self.target.protocol == Protocol::AnthropicMessages {
+                    "input_schema"
+                } else {
+                    "parameters"
+                };
+                if !google && tool.schema_dialect == SchemaDialect::GeminiSchema {
+                    match tool.parameters {
+                        Presence::Value(schema) => {
+                            key(&mut self.w, &mut c, schema_key);
+                            let document =
+                                json::parse(schema.raw(), self.tokens, json::Limits::default())?;
+                            json_schema(&mut self.w, document.root())?;
+                        }
+                        v => praw(&mut self.w, &mut c, schema_key, v),
+                    }
+                } else {
+                    praw(&mut self.w, &mut c, schema_key, tool.parameters);
+                }
                 // Responses may normalize an implicit schema into strict mode.
                 // Other providers' best-effort defaults must not enable that
                 // normalization. In the reverse direction only the caller can
@@ -2054,7 +2374,17 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                             b"application/json"
                         });
                         if v.mode == OutputMode::JsonSchema {
-                            key(&mut self.w, &mut c, "responseJsonSchema");
+                            let field = if v.schema_dialect == SchemaDialect::GeminiSchema {
+                                "responseSchema"
+                            } else {
+                                if self.target.version != "v1beta" {
+                                    return Err(Error::Unsupported {
+                                        feature: "JSON response schema requires Gemini v1beta",
+                                    });
+                                }
+                                "responseJsonSchema"
+                            };
+                            key(&mut self.w, &mut c, field);
                             self.w.raw(
                                 v.schema
                                     .value()
@@ -2088,20 +2418,69 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
         } else {
             praw(&mut self.w, comma, "stream", p.stream);
         }
-        if !p.parallel_tool_calls.is_missing() {
-            if matches!(target, Protocol::OpenAiChat | Protocol::OpenAiResponses) {
-                praw(
-                    &mut self.w,
-                    comma,
-                    "parallel_tool_calls",
-                    p.parallel_tool_calls,
-                );
-            } else {
-                return Err(Error::Unsupported {
-                    feature: "parallel_tool_calls in target",
-                });
+        if !p.reasoning_effort.is_missing() {
+            match target {
+                Protocol::OpenAiChat => {
+                    ptext(&mut self.w, comma, "reasoning_effort", p.reasoning_effort)
+                }
+                Protocol::OpenAiResponses => {
+                    key(&mut self.w, comma, "reasoning");
+                    self.w.byte(b'{');
+                    let mut c = false;
+                    ptext(&mut self.w, &mut c, "effort", p.reasoning_effort);
+                    self.w.byte(b'}');
+                }
+                _ => {
+                    return Err(Error::Unsupported {
+                        feature: "reasoning effort in target",
+                    });
+                }
             }
         }
+        let parallel = match p.parallel_tool_calls {
+            Presence::Value(v) => Presence::Value(
+                v.as_bool()
+                    .ok_or_else(|| invalid("parallel_tool_calls", "expected boolean"))?,
+            ),
+            Presence::Null => Presence::Null,
+            Presence::Missing => match p.serial_tool_calls {
+                Presence::Value(serial) => Presence::Value(!serial),
+                Presence::Null => Presence::Null,
+                Presence::Missing => Presence::Missing,
+            },
+        };
+        if let (Presence::Value(parallel), Presence::Value(serial)) =
+            (parallel, p.serial_tool_calls)
+            && parallel == serial
+        {
+            return Err(invalid(
+                "tool concurrency",
+                "conflicting parallel and serial controls",
+            ));
+        }
+        if !parallel.is_missing()
+            && matches!(target, Protocol::OpenAiChat | Protocol::OpenAiResponses)
+        {
+            pbool(&mut self.w, comma, "parallel_tool_calls", parallel);
+        } else if !parallel.is_missing() && target == Protocol::GeminiGenerateContent {
+            if !matches!(parallel, Presence::Value(true)) {
+                return Err(Error::Unsupported {
+                    feature: "serial tool calls in Gemini",
+                });
+            }
+        } else if !parallel.is_missing() && target != Protocol::AnthropicMessages {
+            return Err(Error::Unsupported {
+                feature: "parallel_tool_calls in target",
+            });
+        }
+        let choice = if target == Protocol::AnthropicMessages
+            && !parallel.is_missing()
+            && matches!(choice, ToolChoice::Missing)
+        {
+            ToolChoice::Auto
+        } else {
+            choice
+        };
         if !interactions && !matches!(choice, ToolChoice::Missing) {
             if google {
                 key(&mut self.w, comma, "toolConfig");
@@ -2118,7 +2497,46 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                         "tool_choice"
                     },
                 );
-                if legacy_choice && target == Protocol::OpenAiChat {
+                if target == Protocol::AnthropicMessages && !parallel.is_missing() {
+                    self.w.byte(b'{');
+                    let mut c = false;
+                    match choice {
+                        ToolChoice::Auto => {
+                            key(&mut self.w, &mut c, "type");
+                            self.w.string(b"auto");
+                        }
+                        ToolChoice::None => {
+                            key(&mut self.w, &mut c, "type");
+                            self.w.string(b"none");
+                        }
+                        ToolChoice::Required => {
+                            key(&mut self.w, &mut c, "type");
+                            self.w.string(b"any");
+                        }
+                        ToolChoice::Named(name) => {
+                            key(&mut self.w, &mut c, "type");
+                            self.w.string(b"tool");
+                            key(&mut self.w, &mut c, "name");
+                            write_text(&mut self.w, name);
+                        }
+                        _ => {
+                            return Err(Error::Unsupported {
+                                feature: "tool concurrency with opaque or null choice",
+                            });
+                        }
+                    }
+                    pbool(
+                        &mut self.w,
+                        &mut c,
+                        "disable_parallel_tool_use",
+                        match parallel {
+                            Presence::Value(v) => Presence::Value(!v),
+                            Presence::Null => Presence::Null,
+                            _ => Presence::Missing,
+                        },
+                    );
+                    self.w.byte(b'}');
+                } else if legacy_choice && target == Protocol::OpenAiChat {
                     if let ToolChoice::Named(name) = choice {
                         self.w.raw(b"{\"name\":");
                         write_text(&mut self.w, name);
@@ -2337,15 +2755,38 @@ pub fn encode_request<'a>(
         }
         ptext(&mut e.w, &mut comma, "model", model);
     }
-    let mut system = None;
+    let mut system: Option<(usize, Message<'a>)> = None;
     let mut system_count = 0;
+    let mut conversation_seen = false;
     for (i, r) in request.records.iter().enumerate() {
-        if let Record::Message(m) = r
-            && m.role == Role::System
-            && (target.protocol != Protocol::OpenAiResponses || m.system_instruction)
-        {
-            system = Some((i, *m));
-            system_count += 1;
+        if let Record::Message(m) = r {
+            if native_instruction(target.protocol, *m) {
+                if matches!(
+                    target.protocol,
+                    Protocol::AnthropicMessages | Protocol::GeminiGenerateContent
+                ) {
+                    if conversation_seen {
+                        return Err(Error::Unsupported {
+                            feature: "non-leading system message",
+                        });
+                    }
+                    if m.extensions.start != m.extensions.end {
+                        return Err(Error::Unsupported {
+                            feature: "instruction message extensions in merged system section",
+                        });
+                    }
+                    if let Some((_, previous)) = &mut system {
+                        previous.end = m.end;
+                    } else {
+                        system = Some((i, *m));
+                    }
+                } else {
+                    system = Some((i, *m));
+                }
+                system_count += 1;
+            } else {
+                conversation_seen = true;
+            }
         }
     }
     if target.protocol == Protocol::OpenAiCompletions {
@@ -2391,7 +2832,11 @@ pub fn encode_request<'a>(
             content.ok_or_else(|| invalid("prompt", "text missing"))?,
         );
     } else {
-        if target.protocol != Protocol::OpenAiChat && system_count > 1 {
+        if !matches!(
+            target.protocol,
+            Protocol::OpenAiChat | Protocol::AnthropicMessages | Protocol::GeminiGenerateContent
+        ) && system_count > 1
+        {
             return Err(Error::Unsupported {
                 feature: "multiple ordered system messages in target",
             });
@@ -2466,8 +2911,29 @@ pub fn encode_request<'a>(
             let mut mc = false;
             let mut at = 0;
             while at < request.records.len() {
-                if let Record::Message(m) = request.records[at] {
-                    if m.role != Role::System || target.protocol == Protocol::OpenAiChat {
+                if let Record::Message(mut m) = request.records[at] {
+                    if !native_instruction(target.protocol, m)
+                        || target.protocol == Protocol::OpenAiChat
+                    {
+                        if target.protocol == Protocol::AnthropicMessages {
+                            // Merge in arena order without modifying caller-owned IR.
+                            let role = anthropic_role(m.role);
+                            while let Some(Record::Message(next)) = request.records.get(m.end) {
+                                if native_instruction(target.protocol, *next)
+                                    || anthropic_role(next.role) != role
+                                {
+                                    break;
+                                }
+                                if next.extensions.start != next.extensions.end
+                                    || m.extensions.start != m.extensions.end
+                                {
+                                    return Err(Error::Unsupported {
+                                        feature: "message extensions across adjacent-role merge",
+                                    });
+                                }
+                                m.end = next.end;
+                            }
+                        }
                         let results = request.records[at + 1..m.end]
                             .iter()
                             .filter(|r| {

@@ -15,10 +15,10 @@ Third-party GitHub Actions are pinned to reviewed commit SHAs. Pull-request CI
 never receives the publishing token. Release jobs are serialized and are not
 cancelled midway by a newer release run.
 
-## Manual first release
+## Manual release
 
 1. Open GitHub Actions → Release → Run workflow on `main`.
-2. Choose `bump=none` for the existing 0.1.0 manifest, or supply an explicit version
+2. Choose `bump=none` for the version already prepared in the manifest, or supply an explicit version
    with `bump=none`.
 3. Leave `publish=false` to verify code, package contents and registry state and
    build the package. The final Git-reference preflight runs in the publish job.
@@ -28,7 +28,7 @@ Later releases support `patch`, `minor`, or `major`. An explicit stable SemVer
 also works with `bump=none`; conflicting inputs, decreasing versions, leading
 zeroes, invalid tags and shell-shaped values are rejected by the Python gate.
 Version text is received through environment variables, never interpolated into
-shell source. Rust 1.74 writes the lockfile so it remains usable by the MSRV.
+shell source. Rust 1.99.1 writes the lockfile so it remains usable by the MSRV.
 The local zconv entries in the independent comparison and fuzz lockfiles are
 updated at the same time, without changing their registry dependencies.
 
@@ -59,7 +59,7 @@ The registry gate deliberately rejects duplicate publication attempts.
 ## Local release verification
 
 ```sh
-cargo +1.74.0 test --lib --tests --examples
+cargo +1.99.1 test --all-targets --locked
 cargo test --release
 cargo test --doc
 cargo fmt --all -- --check

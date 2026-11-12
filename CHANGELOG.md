@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0
+
+- Add caller-owned `EventEncoderState` and per-call `EventEncoderBuffers`; buffer growth no longer requires a self-referential application object. Capacity retries roll back state without replaying committed output.
+- Add rollback-only `preview` encoding for applications that must prepare terminal bytes before committing an external operation. Committed completion still rejects further events.
+- Preserve block signature provenance, Responses reasoning lifecycle and output identity, and Gemini signatures and continuation in their original parts.
+- Decode Chat reasoning before text and refusal in responses, accept omitted response assistant roles, tolerate null `tool_calls`/`function_call` deltas, and close Responses content parts whose `done` event carries no part payload. Out-of-range sparse tool indexes fail as resource bounds instead of driving allocation.
+- Extend explicit compatible profiles with cache lifetime buckets, raw uncached input, observed cost numbers, Chat image URL arrays, grounding and continuation metadata. Missing usage counters remain unknown. See the support matrix and tests for exact representability.
+- Keep the core allocation-free, dependency-free, no_std and safe Rust on Rust 1.99.1.
+
+Compatibility: new public event and usage fields require consumers with exhaustive literals or matches to update. This release uses the next minor version; the stream encoder remains explicit about capacities, terminal events and policy.
+
 ## 0.2.0
 
 - Add `decode_frame_format` and `validate_stream_format` for consumers of the public event IR. SSE discriminator and terminal-marker validation use the same implementation as `StreamConverter`.

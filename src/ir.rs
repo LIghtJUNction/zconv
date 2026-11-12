@@ -87,6 +87,12 @@ pub enum Data<'a> {
     /// The decoded string must itself be a valid JSON value before object output.
     JsonText(Text<'a>),
     Text(Text<'a>),
+    /// Use an object encoded in text, or explicitly wrap non-object text in
+    /// a caller-named field when the target requires a JSON object.
+    ObjectOrText {
+        text: Text<'a>,
+        key: Text<'a>,
+    },
     EmptyObject,
 }
 
@@ -196,9 +202,25 @@ pub struct Message<'a> {
     pub item_status: Presence<Text<'a>>,
 }
 
+/// Provider-owned replay material, independent of the enclosing wire format.
+#[derive(Clone, Copy, Debug)]
+pub struct ProviderSignature<'a> {
+    pub source: Format,
+    pub value: Text<'a>,
+}
+
+/// The JSON Schema and Gemini typed Schema fields are distinct contracts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SchemaDialect {
+    #[default]
+    JsonSchema,
+    GeminiSchema,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Block<'a> {
     pub content: Content<'a>,
+    pub signature: Presence<ProviderSignature<'a>>,
     pub extensions: Span,
     pub end: usize,
     pub item_id: Presence<Text<'a>>,
@@ -210,6 +232,7 @@ pub struct Tool<'a> {
     pub name: Text<'a>,
     pub description: Presence<Text<'a>>,
     pub parameters: Presence<RawValue<'a>>,
+    pub schema_dialect: SchemaDialect,
     pub strict: Presence<bool>,
     pub extensions: Span,
     pub legacy: bool,
@@ -311,6 +334,8 @@ pub struct Parameters<'a> {
     pub n: Presence<RawValue<'a>>,
     pub stream: Presence<RawValue<'a>>,
     pub parallel_tool_calls: Presence<RawValue<'a>>,
+    pub serial_tool_calls: Presence<bool>,
+    pub reasoning_effort: Presence<Text<'a>>,
     pub extensions: Span,
 }
 
@@ -326,6 +351,7 @@ pub struct OutputConstraint<'a> {
     pub value: RawValue<'a>,
     pub mode: OutputMode,
     pub schema: Presence<RawValue<'a>>,
+    pub schema_dialect: SchemaDialect,
     pub name: Presence<Text<'a>>,
     pub description: Presence<Text<'a>>,
     pub strict: Presence<bool>,

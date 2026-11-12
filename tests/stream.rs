@@ -921,6 +921,7 @@ fn anthropic_cached_token_translation_is_reversible_without_double_counting() {
             cache_write: None,
             input_basis: InputCount::Total,
             output_basis: OutputCount::Total,
+            ..Usage::default()
         }
     );
 }

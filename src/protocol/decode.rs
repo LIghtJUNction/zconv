@@ -157,7 +157,11 @@ impl<'s, 'a> Arena<'s, 'a> {
     ) -> Result<Span, Error> {
         let start = self.used;
         for (key, value) in v.object() {
-            if !known.iter().any(|name| key.eq_str(name)) {
+            if !known.iter().any(|name| key.eq_str(name))
+                && !(location == "content"
+                    && self.source.protocol == Protocol::GeminiGenerateContent
+                    && key.eq_str("thoughtSignature"))
+            {
                 self.push(Record::Extension(Extension {
                     source: self.source,
                     key,
@@ -188,6 +192,18 @@ impl<'s, 'a> Arena<'s, 'a> {
         self.set(
             owner,
             Record::Block(Block {
+                signature: if self.source.protocol == Protocol::GeminiGenerateContent {
+                    match raw.map(|v| ptext(v, "thoughtSignature")).transpose()? {
+                        Some(Presence::Value(value)) => Presence::Value(ProviderSignature {
+                            source: self.source,
+                            value,
+                        }),
+                        Some(Presence::Null) => Presence::Null,
+                        _ => Presence::Missing,
+                    }
+                } else {
+                    Presence::Missing
+                },
                 content,
                 extensions,
                 end: self.used,
@@ -674,10 +690,15 @@ impl<'s, 'a> Arena<'s, 'a> {
         }
     }
 
-    fn chat_message(&mut self, v: V<'a, '_>) -> Result<(), Error> {
+    fn chat_message(&mut self, v: V<'a, '_>, response: bool) -> Result<(), Error> {
         object(v, "message")?;
-        let r = role(v)?;
-        if req_text(v, "role")?.eq_str("model") {
+        // Completion responses may omit the assistant role; requests may not.
+        let r = if response && v.get("role").is_none() {
+            Role::Assistant
+        } else {
+            role(v)?
+        };
+        if v.get("role").is_some() && req_text(v, "role")?.eq_str("model") {
             return Err(invalid("role", "Chat has no model role"));
         }
         let start = self.message_start()?;
@@ -708,9 +729,6 @@ impl<'s, 'a> Arena<'s, 'a> {
                 Presence::Missing,
             )?;
         } else {
-            if let Some(content) = v.get("content") {
-                self.content(content, r)?;
-            }
             if let Some(reasoning) = v
                 .get("reasoning_content")
                 .filter(|_| !matches!(self.source.profile, crate::Profile::Standard))
@@ -726,6 +744,9 @@ impl<'s, 'a> Arena<'s, 'a> {
                     &[],
                     Presence::Missing,
                 )?;
+            }
+            if let Some(content) = v.get("content") {
+                self.content(content, r)?;
             }
             if let Some(refusal) = v.get("refusal")
                 && !refusal.is_null()
@@ -1145,7 +1166,24 @@ impl<'s, 'a> Arena<'s, 'a> {
                 feature: "built-in tool definition",
             });
         }
-        let params = if self.source.protocol == Protocol::AnthropicMessages {
+        if self.source.protocol == Protocol::GeminiGenerateContent
+            && v.get("parameters").is_some()
+            && v.get("parametersJsonSchema").is_some()
+        {
+            return Err(invalid("parameters", "mutually exclusive schema dialects"));
+        }
+        let schema_dialect = if self.source.protocol == Protocol::GeminiGenerateContent
+            && v.get("parametersJsonSchema").is_none()
+        {
+            SchemaDialect::GeminiSchema
+        } else {
+            SchemaDialect::JsonSchema
+        };
+        let params = if self.source.protocol == Protocol::GeminiGenerateContent
+            && v.get("parametersJsonSchema").is_some()
+        {
+            raw_presence(v, "parametersJsonSchema")
+        } else if self.source.protocol == Protocol::AnthropicMessages {
             raw_presence(v, "input_schema")
         } else {
             raw_presence(v, "parameters")
@@ -1164,6 +1202,7 @@ impl<'s, 'a> Arena<'s, 'a> {
                 "description",
                 "parameters",
                 "input_schema",
+                "parametersJsonSchema",
                 "strict",
             ],
             "tool",
@@ -1175,6 +1214,7 @@ impl<'s, 'a> Arena<'s, 'a> {
                 name: req_text(v, "name")?,
                 description: ptext(v, "description")?,
                 parameters: params,
+                schema_dialect,
                 strict: pbool(v, "strict")?,
                 extensions,
                 legacy,
@@ -1243,6 +1283,13 @@ fn tool_choice<'a, 't>(source: Format, v: Option<V<'a, 't>>) -> Result<ToolChoic
         });
     }
     object(v, "tool_choice")?;
+    if source.protocol == Protocol::AnthropicMessages {
+        reject_extra(
+            v,
+            &["type", "name", "disable_parallel_tool_use"],
+            "Anthropic tool choice extension",
+        )?;
+    }
     let name = v
         .get("name")
         .or_else(|| v.get("function").and_then(|f| f.get("name")));
@@ -1475,6 +1522,27 @@ fn parameters<'a, 't>(
     } else {
         Presence::Missing
     };
+    params.serial_tool_calls = if source.protocol == Protocol::AnthropicMessages {
+        match root.get("tool_choice") {
+            Some(v) => pbool(v, "disable_parallel_tool_use")?,
+            None => Presence::Missing,
+        }
+    } else {
+        Presence::Missing
+    };
+    params.reasoning_effort = match source.protocol {
+        Protocol::OpenAiChat => ptext(root, "reasoning_effort")?,
+        Protocol::OpenAiResponses => match root.get("reasoning") {
+            Some(v) if !v.is_null() => {
+                object(v, "reasoning")?;
+                reject_extra(v, &["effort"], "reasoning controls beyond effort")?;
+                ptext(v, "effort")?
+            }
+            Some(_) => return Err(invalid("reasoning", "expected object")),
+            None => Presence::Missing,
+        },
+        _ => Presence::Missing,
+    };
     for (field, p) in [
         ("stream", params.stream),
         ("parallel_tool_calls", params.parallel_tool_calls),
@@ -1553,6 +1621,7 @@ pub(super) fn request_keys(source: Protocol) -> &'static [&'static str] {
             "presence_penalty",
             "parallel_tool_calls",
             "response_format",
+            "reasoning_effort",
         ],
         Protocol::OpenAiResponses => &[
             "model",
@@ -1567,6 +1636,7 @@ pub(super) fn request_keys(source: Protocol) -> &'static [&'static str] {
             "parallel_tool_calls",
             "previous_response_id",
             "text",
+            "reasoning",
         ],
         Protocol::AnthropicMessages => &[
             "model",
@@ -1696,7 +1766,7 @@ fn request_header<'a, 't>(
             let messages = required(root, "messages")?;
             array(messages, "messages")?;
             for m in messages.array() {
-                a.chat_message(m)?;
+                a.chat_message(m, false)?;
             }
         }
         Protocol::AnthropicMessages => {
@@ -1880,6 +1950,7 @@ fn request_header<'a, 't>(
                 value: value.raw_value(),
                 mode: OutputMode::Opaque,
                 schema: Presence::Missing,
+                schema_dialect: SchemaDialect::JsonSchema,
                 name: Presence::Missing,
                 description: Presence::Missing,
                 strict: Presence::Missing,
@@ -1888,6 +1959,17 @@ fn request_header<'a, 't>(
                 let config = root
                     .get("generationConfig")
                     .ok_or_else(|| invalid("generationConfig", "missing config"))?;
+                if config.get("responseJsonSchema").is_some()
+                    && config.get("responseSchema").is_some()
+                {
+                    return Err(invalid(
+                        "response schema",
+                        "mutually exclusive schema dialects",
+                    ));
+                }
+                if config.get("responseSchema").is_some() {
+                    constraint.schema_dialect = SchemaDialect::GeminiSchema;
+                }
                 if let Some(schema) = config
                     .get("responseJsonSchema")
                     .or_else(|| config.get("responseSchema"))
@@ -2300,10 +2382,10 @@ fn response_header<'a, 't>(
                         }
                     } else if source.protocol == Protocol::OpenAiChat {
                         let message = required(c, "message")?;
-                        if role(message)? != Role::Assistant {
+                        if message.get("role").is_some() && role(message)? != Role::Assistant {
                             return Err(invalid("message.role", "response must be assistant"));
                         }
-                        a.chat_message(message)?;
+                        a.chat_message(message, true)?;
                     } else {
                         let start = a.message_start()?;
                         a.block(

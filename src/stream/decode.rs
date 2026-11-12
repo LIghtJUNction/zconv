@@ -35,6 +35,7 @@ fn object<'a, 't>(value: Value<'a, 't>, name: &'static str) -> Result<Value<'a, 
 fn number(value: Value<'_, '_>, name: &'static str) -> Result<Option<u64>, Error> {
     match value.get(name) {
         None => Ok(None),
+        Some(value) if value.is_null() => Ok(None),
         Some(value) => value.as_u64().map(Some).ok_or_else(|| invalid(name)),
     }
 }
@@ -195,10 +196,29 @@ fn chat(
                     "refusal",
                     "reasoning_content",
                     "reasoning",
+                    "images",
                 ],
             )?;
             if delta.get("role").is_some() && !eq(delta, "role", "assistant") {
                 return Err(invalid("delta.role"));
+            }
+            for name in ["reasoning_content", "reasoning"] {
+                if let Some(text) = optional(delta, name)? {
+                    if !matches!(profile, Profile::OpenAiCompatible(_)) {
+                        return Err(Error::Unsupported {
+                            feature: "vendor reasoning requires OpenAiCompatible profile",
+                        });
+                    }
+                    sink.delta(
+                        Key {
+                            choice: choice_index,
+                            index: u32::MAX - 2,
+                            part: 0,
+                        },
+                        BlockKind::Reasoning,
+                        text,
+                    )?;
+                }
             }
             if let Some(text) = optional(delta, "content")? {
                 sink.delta(
@@ -222,25 +242,13 @@ fn chat(
                     text,
                 )?;
             }
-            for name in ["reasoning_content", "reasoning"] {
-                if let Some(text) = optional(delta, name)? {
-                    if !matches!(profile, Profile::OpenAiCompatible(_)) {
-                        return Err(Error::Unsupported {
-                            feature: "vendor reasoning requires OpenAiCompatible profile",
-                        });
-                    }
-                    sink.delta(
-                        Key {
-                            choice: choice_index,
-                            index: u32::MAX - 2,
-                            part: 0,
-                        },
-                        BlockKind::Reasoning,
-                        text,
-                    )?;
+            if let Some(images) = delta.get("images").filter(|v| !v.is_null()) {
+                validate_images(images)?;
+                if images.array().next().is_some() {
+                    sink.images(choice_index, images.raw_value())?;
                 }
             }
-            if let Some(calls) = delta.get("tool_calls") {
+            if let Some(calls) = delta.get("tool_calls").filter(|v| v.kind() != Kind::Null) {
                 if calls.kind() != Kind::Array {
                     return Err(invalid("tool_calls"));
                 }
@@ -253,7 +261,18 @@ fn chat(
                     }
                     let key = Key {
                         choice: choice_index,
-                        index: index(call, "index")?,
+                        // Sparse indexes must not force unbounded allocation;
+                        // an unrepresentable index is a resource bound, not a
+                        // malformed message.
+                        index: match number(call, "index")? {
+                            Some(number) => {
+                                u32::try_from(number).map_err(|_| Error::LimitExceeded {
+                                    kind: "tool index",
+                                    limit: u32::MAX as usize,
+                                })?
+                            }
+                            None => return Err(invalid("index")),
+                        },
                         part: 0,
                     };
                     let function = object(call, "function")?;
@@ -268,8 +287,14 @@ fn chat(
                     }
                 }
             }
-            if let Some(function) = delta.get("function_call") {
-                if delta.get("tool_calls").is_some() {
+            if let Some(function) = delta
+                .get("function_call")
+                .filter(|v| v.kind() != Kind::Null)
+            {
+                if delta
+                    .get("tool_calls")
+                    .is_some_and(|v| v.kind() != Kind::Null)
+                {
                     return Err(invalid("function_call and tool_calls"));
                 }
                 fields(function, &["name", "arguments"])?;
@@ -296,10 +321,7 @@ fn chat(
 }
 
 fn usage_openai(value: Value<'_, '_>, responses: bool) -> Result<Usage, Error> {
-    if value.kind() != Kind::Object {
-        return Err(invalid("usage"));
-    }
-    let (input_name, output_name, input_details, output_details) = if responses {
+    let (input, output, input_details, output_details) = if responses {
         (
             "input_tokens",
             "output_tokens",
@@ -317,30 +339,195 @@ fn usage_openai(value: Value<'_, '_>, responses: bool) -> Result<Usage, Error> {
     fields(
         value,
         &[
-            input_name,
-            output_name,
+            input,
+            output,
             "total_tokens",
             input_details,
             output_details,
+            "prompt_cache_hit_tokens",
+            "prompt_cache_miss_tokens",
+            "cache_creation_input_tokens",
+            "cache_creation_details",
+            "cost",
         ],
     )?;
     let mut usage = Usage {
-        input: number(value, input_name)?,
-        output: number(value, output_name)?,
+        input: number(value, input)?,
+        output: number(value, output)?,
         total: number(value, "total_tokens")?,
+        cache_write: number(value, "cache_creation_input_tokens")?,
+        cache_miss: number(value, "prompt_cache_miss_tokens")?,
+        cost: value
+            .get("cost")
+            .filter(|v| !v.is_null())
+            .map(|v| WireNumber::parse(v.raw()))
+            .transpose()?,
         ..Usage::default()
     };
-    if let Some(details) = value.get(input_details) {
-        fields(details, &["cached_tokens"])?;
+    if let Some(details) = value.get(input_details).filter(|v| !v.is_null()) {
+        fields(
+            details,
+            &[
+                "cached_tokens",
+                "cached_creation_tokens",
+                "cache_write_tokens",
+                "cache_creation_input_tokens",
+                "cache_write_tokens_details",
+            ],
+        )?;
         usage.cached = number(details, "cached_tokens")?;
+        let alias = number(details, "cached_creation_tokens")?
+            .max(number(details, "cache_write_tokens")?)
+            .max(number(details, "cache_creation_input_tokens")?);
+        if let Some(alias) = alias {
+            let effective = match (
+                usage.input,
+                usage.uncached_input,
+                usage.cached,
+                usage.input_basis,
+            ) {
+                (Some(input), Some(uncached), cached, InputCount::Total) => Some(
+                    input
+                        .checked_sub(uncached)
+                        .and_then(|v| v.checked_sub(cached.unwrap_or(0)))
+                        .ok_or_else(|| invalid("input partition"))?,
+                ),
+                _ => usage.cache_write,
+            };
+            if effective.is_some_and(|v| v != alias) {
+                return Err(invalid("cache creation aliases"));
+            }
+            usage.cache_write = Some(alias);
+        }
+        if let Some(ttl) = details
+            .get("cache_write_tokens_details")
+            .filter(|v| !v.is_null())
+        {
+            fields(ttl, &["ttl_30m_tokens", "ttl_12h_tokens"])?;
+            usage.openai_cache_details = true;
+            usage.cache_write_30m = number(ttl, "ttl_30m_tokens")?;
+            usage.cache_write_12h = number(ttl, "ttl_12h_tokens")?;
+        }
     }
-    if let Some(details) = value.get(output_details) {
+    if let Some(details) = value.get(output_details).filter(|v| !v.is_null()) {
         fields(details, &["reasoning_tokens"])?;
         usage.reasoning = number(details, "reasoning_tokens")?;
     }
+    if let Some(hit) = number(value, "prompt_cache_hit_tokens")? {
+        if usage.cached.is_some_and(|v| v != hit) {
+            return Err(invalid("cache read aliases"));
+        }
+        usage.cached = Some(hit);
+    }
+    if let Some(ttl) = value.get("cache_creation_details").filter(|v| !v.is_null()) {
+        fields(
+            ttl,
+            &["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"],
+        )?;
+        usage.anthropic_cache_details = true;
+        usage.cache_write_5m = number(ttl, "ephemeral_5m_input_tokens")?;
+        usage.cache_write_1h = number(ttl, "ephemeral_1h_input_tokens")?;
+    }
+    validate_usage(usage)?;
     Ok(usage)
 }
+
+fn validate_usage(usage: Usage) -> Result<(), Error> {
+    let add = |a: u64, b: u64| a.checked_add(b).ok_or_else(|| invalid("usage overflow"));
+    if let (Some(input), Some(cached)) = (usage.input, usage.cached)
+        && usage.input_basis == InputCount::Total
+        && cached > input
+    {
+        return Err(invalid("cache usage"));
+    }
+    if let Some(miss) = usage.cache_miss {
+        if usage.input.is_some_and(|v| miss > v) {
+            return Err(invalid("cache miss usage"));
+        }
+        if let Some(hit) = usage.cached {
+            let total = add(hit, miss)?;
+            if usage.input.is_some_and(|v| v != total) {
+                return Err(invalid("cache partition"));
+            }
+        }
+    }
+    for (short, long) in [
+        (usage.cache_write_5m, usage.cache_write_1h),
+        (usage.cache_write_30m, usage.cache_write_12h),
+    ] {
+        let known = add(short.unwrap_or(0), long.unwrap_or(0))?;
+        let _ = known; // Raw receipt observations are not a selected accounting contract.
+    }
+    if let (Some(input), Some(output)) = (usage.input, usage.output) {
+        let output = if usage.output_basis == OutputCount::Visible {
+            add(output, usage.reasoning.unwrap_or(0))?
+        } else {
+            output
+        };
+        let known = add(add(input, output)?, usage.tool_use_prompt.unwrap_or(0))?;
+        if usage.input_basis == InputCount::Total
+            && usage
+                .total
+                .is_some_and(|v| known > v || (usage.tool_use_prompt.is_some() && known != v))
+        {
+            return Err(invalid("usage total"));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_lifetimes(usage: Usage) -> Result<(), Error> {
+    for (short, long) in [
+        (usage.cache_write_5m, usage.cache_write_1h),
+        (usage.cache_write_30m, usage.cache_write_12h),
+    ] {
+        let known = short
+            .unwrap_or(0)
+            .checked_add(long.unwrap_or(0))
+            .ok_or_else(|| invalid("usage overflow"))?;
+        let effective = match (usage.input, usage.uncached_input, usage.input_basis) {
+            (Some(input), Some(uncached), InputCount::Total) => Some(
+                input
+                    .checked_sub(uncached)
+                    .and_then(|v| v.checked_sub(usage.cached.unwrap_or(0)))
+                    .ok_or_else(|| invalid("input partition"))?,
+            ),
+            _ => usage.cache_write,
+        };
+        if effective.is_some_and(|v| known > v || (short.is_some() && long.is_some() && known != v))
+        {
+            return Err(invalid("cache lifetime totals"));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_images(value: Value<'_, '_>) -> Result<(), Error> {
+    if value.kind() != Kind::Array {
+        return Err(invalid("images"));
+    }
+    for image in value.array() {
+        if !eq(image, "type", "image_url") {
+            return Err(invalid("image.type"));
+        }
+        let url = string(object(image, "image_url")?, "url")?;
+        if url.len() == 0 {
+            return Err(invalid("image_url.url"));
+        }
+        if let Text::Json(url) = url
+            && url.bytes().any(|b| b < 32 || b == 127)
+        {
+            return Err(invalid("image_url.url"));
+        }
+        number(image, "index")?;
+    }
+    Ok(())
+}
+
 fn usage_anthropic(value: Value<'_, '_>) -> Result<Usage, Error> {
+    if value.is_null() {
+        return Ok(Usage::default());
+    }
     fields(
         value,
         &[
@@ -355,7 +542,7 @@ fn usage_anthropic(value: Value<'_, '_>) -> Result<Usage, Error> {
             "iterations",
         ],
     )?;
-    for field in ["cache_creation", "server_tool_use", "iterations"] {
+    for field in ["server_tool_use", "iterations"] {
         if value
             .get(field)
             .is_some_and(|value| !is_null_or_empty(value) && value.as_u64() != Some(0))
@@ -365,16 +552,37 @@ fn usage_anthropic(value: Value<'_, '_>) -> Result<Usage, Error> {
             });
         }
     }
-    Ok(Usage {
+    let ttl = value.get("cache_creation").filter(|v| !v.is_null());
+    if let Some(ttl) = ttl {
+        fields(
+            ttl,
+            &["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"],
+        )?;
+    }
+    let usage = Usage {
+        cache_write_5m: ttl
+            .map(|v| number(v, "ephemeral_5m_input_tokens"))
+            .transpose()?
+            .flatten(),
+        cache_write_1h: ttl
+            .map(|v| number(v, "ephemeral_1h_input_tokens"))
+            .transpose()?
+            .flatten(),
+        anthropic_cache_details: ttl.is_some(),
         input: number(value, "input_tokens")?,
         output: number(value, "output_tokens")?,
         cached: number(value, "cache_read_input_tokens")?,
         cache_write: number(value, "cache_creation_input_tokens")?,
         input_basis: InputCount::Uncached,
         ..Usage::default()
-    })
+    };
+    validate_usage(usage)?;
+    Ok(usage)
 }
 fn usage_google(value: Value<'_, '_>, interactions: bool) -> Result<Usage, Error> {
+    if value.is_null() {
+        return Ok(Usage::default());
+    }
     let names = if interactions {
         [
             "total_input_tokens",
@@ -392,8 +600,12 @@ fn usage_google(value: Value<'_, '_>, interactions: bool) -> Result<Usage, Error
             "thoughtsTokenCount",
         ]
     };
-    fields(value, &names)?;
-    Ok(Usage {
+    let mut allowed = [""; 6];
+    allowed[..5].copy_from_slice(&names);
+    allowed[5] = "toolUsePromptTokenCount";
+    fields(value, &allowed)?;
+    let usage = Usage {
+        tool_use_prompt: number(value, "toolUsePromptTokenCount")?,
         input: number(value, names[0])?,
         output: number(value, names[1])?,
         total: number(value, names[2])?,
@@ -402,7 +614,10 @@ fn usage_google(value: Value<'_, '_>, interactions: bool) -> Result<Usage, Error
         cache_write: None,
         input_basis: InputCount::Total,
         output_basis: OutputCount::Visible,
-    })
+        ..Usage::default()
+    };
+    validate_usage(usage)?;
+    Ok(usage)
 }
 
 fn finish_reason(value: Value<'_, '_>, google: bool) -> Result<FinishReason, Error> {
@@ -412,6 +627,8 @@ fn finish_reason(value: Value<'_, '_>, google: bool) -> Result<FinishReason, Err
         .any(|name| value.eq_str(name))
     {
         Ok(FinishReason::Stop)
+    } else if value.eq_str("CONTINUATION") && google {
+        Ok(FinishReason::Continuation)
     } else if ["length", "max_tokens", "MAX_TOKENS"]
         .iter()
         .any(|name| value.eq_str(name))
@@ -426,6 +643,8 @@ fn finish_reason(value: Value<'_, '_>, google: bool) -> Result<FinishReason, Err
         "content_filter",
         "refusal",
         "SAFETY",
+        "RECITATION",
+        "IMAGE_SAFETY",
         "BLOCKLIST",
         "PROHIBITED_CONTENT",
         "SPII",
@@ -468,20 +687,20 @@ fn anthropic(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
                 "usage",
             ],
         )?;
-        array(message, "content")?;
+        if message.get("content").is_some() {
+            array(message, "content")?;
+        }
         if message.get("type").is_some() && !eq(message, "type", "message") {
             return Err(invalid("message.type"));
         }
-        if !eq(message, "role", "assistant") {
+        if message.get("role").is_some() && !eq(message, "role", "assistant") {
             return Err(invalid("message.role"));
         }
         empty_only(message, "content")?;
-        sink.usage(usage_anthropic(object(message, "usage")?)?)?;
-        return sink.begin(
-            Some(string(message, "id")?),
-            Some(string(message, "model")?),
-            None,
-        );
+        if let Some(usage) = message.get("usage") {
+            sink.usage(usage_anthropic(usage)?)?;
+        }
+        return sink.begin(optional(message, "id")?, optional(message, "model")?, None);
     }
     if event_type.eq_str("content_block_start") {
         fields(value, &["type", "index", "content_block"])?;
@@ -527,7 +746,7 @@ fn anthropic(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
             if let Some(text) = optional(block, "signature")?
                 && text.len() != 0
             {
-                sink.signature(key, text)?;
+                sink.signature(key, text, None)?;
             }
         } else {
             return Err(Error::Unsupported {
@@ -554,7 +773,7 @@ fn anthropic(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
             sink.delta(key, BlockKind::Reasoning, string(delta, "thinking")?)
         } else if eq(delta, "type", "signature_delta") {
             fields(delta, &["type", "signature"])?;
-            sink.signature(key, string(delta, "signature")?)
+            sink.signature(key, string(delta, "signature")?, None)
         } else {
             Err(Error::Unsupported {
                 feature: "Anthropic stream delta",
@@ -573,13 +792,15 @@ fn anthropic(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
         }
         let delta = object(value, "delta")?;
         fields(delta, &["stop_reason", "stop_sequence"])?;
-        if delta
-            .get("stop_sequence")
-            .is_some_and(|value| value.kind() != Kind::Null)
-        {
-            return Err(Error::Unsupported {
-                feature: "stream stop_sequence",
-            });
+        let sequence = optional(delta, "stop_sequence")?;
+        if eq(delta, "stop_reason", "stop_sequence") {
+            let sequence = sequence.ok_or_else(|| invalid("stop_sequence"))?;
+            if sequence.len() == 0 || sequence.len() > 1024 {
+                return Err(invalid("stop_sequence"));
+            }
+            sink.stop_sequence(sequence)?;
+        } else if sequence.is_some() {
+            return Err(invalid("stop_sequence without matching reason"));
         }
         if let Some(reason) = delta.get("stop_reason")
             && reason.kind() != Kind::Null
@@ -607,9 +828,6 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
     }
     if event_type.eq_str("response.created") || event_type.eq_str("response.in_progress") {
         let response = object(value, "response")?;
-        if event_type.eq_str("response.in_progress") {
-            return Ok(());
-        }
         return sink.begin(
             optional(response, "id")?,
             optional(response, "model")?,
@@ -636,18 +854,13 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
                 sink.delta(key, BlockKind::Tool, arguments)?;
             }
         } else if eq(item, "type", "message") {
-            if !eq(item, "role", "assistant") {
+            if item.get("role").is_some() && !eq(item, "role", "assistant") {
                 return Err(invalid("item.role"));
             }
             empty_only(item, "content")?;
         } else if eq(item, "type", "reasoning") {
-            sink.block(
-                key,
-                BlockKind::Reasoning,
-                optional(item, "id")?,
-                None,
-                optional(item, "id")?,
-            )?;
+            // Summary parts have independently indexed block lifecycles.
+            empty_only(item, "encrypted_content")?;
         } else {
             return Err(Error::Unsupported {
                 feature: "Responses output item",
@@ -751,6 +964,14 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
         );
     }
     if event_type.eq_str("response.content_part.done") {
+        if value.get("part").is_none() {
+            // A bare done closes the already indexed content block.
+            return sink.close(Key {
+                index: index(value, "output_index")?,
+                part: index(value, "content_index")?,
+                choice: 0,
+            });
+        }
         let part = object(value, "part")?;
         let kind = if eq(part, "type", "refusal") {
             BlockKind::Refusal
@@ -778,17 +999,44 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
             )?,
         );
     }
-    if [
-        "response.reasoning_summary_part.added",
-        "response.reasoning_summary_part.done",
-        "response.reasoning_summary_text.done",
-    ]
-    .iter()
-    .any(|name| event_type.eq_str(name))
+    if event_type.eq_str("response.reasoning_summary_part.added") {
+        let part = object(value, "part")?;
+        let key = Key {
+            choice: 0,
+            index: index(value, "output_index")?,
+            part: index(value, "summary_index")?,
+        };
+        sink.block(
+            key,
+            BlockKind::Reasoning,
+            None,
+            None,
+            optional(value, "item_id")?,
+        )?;
+        if let Some(text) = optional(part, "text")?
+            && text.len() != 0
+        {
+            sink.delta(key, BlockKind::Reasoning, text)?;
+        }
+        return Ok(());
+    }
+    if event_type.eq_str("response.reasoning_summary_part.done")
+        || event_type.eq_str("response.reasoning_summary_text.done")
     {
-        return Err(Error::Unsupported {
-            feature: "Responses reasoning snapshot",
-        });
+        let text = if event_type.eq_str("response.reasoning_summary_part.done") {
+            string(object(value, "part")?, "text")?
+        } else {
+            string(value, "text")?
+        };
+        return sink.snapshot(
+            Key {
+                choice: 0,
+                index: index(value, "output_index")?,
+                part: index(value, "summary_index")?,
+            },
+            BlockKind::Reasoning,
+            text,
+        );
     }
     if event_type.eq_str("response.output_item.done") {
         let key = Key {
@@ -830,6 +1078,12 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
     .any(|name| event_type.eq_str(name))
     {
         let response = object(value, "response")?;
+        let id = optional(response, "id")?;
+        let model = optional(response, "model")?;
+        let created = number(response, "created_at")?;
+        if id.is_some() || model.is_some() || created.is_some() {
+            sink.begin(id, model, created)?;
+        }
         if let Some(usage) = response.get("usage")
             && usage.kind() != Kind::Null
         {
@@ -931,6 +1185,27 @@ fn response_snapshot(
         }
         return Ok(());
     }
+    if eq(item, "type", "reasoning") {
+        empty_only(item, "encrypted_content")?;
+        array(item, "summary")?;
+        for (part, summary) in item
+            .get("summary")
+            .ok_or_else(|| invalid("summary"))?
+            .array()
+            .enumerate()
+        {
+            sink.snapshot(
+                Key {
+                    choice: 0,
+                    index: output_index,
+                    part: u32::try_from(part).map_err(|_| invalid("summary_index"))?,
+                },
+                BlockKind::Reasoning,
+                string(summary, "text")?,
+            )?;
+        }
+        return Ok(());
+    }
     Err(Error::Unsupported {
         feature: "Responses final item",
     })
@@ -951,9 +1226,16 @@ fn google(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
     if let Some(feedback) = value.get("promptFeedback")
         && feedback.get("blockReason").is_some()
     {
-        return Err(Error::Unsupported {
-            feature: "Gemini prompt safety block",
-        });
+        string(feedback, "blockReason")?;
+        sink.begin(
+            optional(value, "responseId")?,
+            optional(value, "modelVersion")?,
+            None,
+        )?;
+        if let Some(usage) = value.get("usageMetadata") {
+            sink.usage(usage_google(usage, false)?)?;
+        }
+        return sink.choice(0, FinishReason::Safety);
     }
     if let Some(usage) = value.get("usageMetadata") {
         sink.usage(usage_google(usage, false)?)?;
@@ -983,9 +1265,10 @@ fn google(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
                 "avgLogprobs",
                 "logprobsResult",
                 "finishMessage",
+                "continuationToken",
             ],
         )?;
-        for name in ["citationMetadata", "groundingMetadata", "logprobsResult"] {
+        for name in ["citationMetadata", "logprobsResult"] {
             empty_only(candidate, name)?;
         }
         for (name, field) in [
@@ -1002,6 +1285,10 @@ fn google(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
         }
         let choice = number(candidate, "index")?.unwrap_or(0);
         let choice = u32::try_from(choice).map_err(|_| invalid("index"))?;
+        if let Some(metadata) = candidate.get("groundingMetadata") {
+            validate_grounding(metadata)?;
+            sink.grounding(choice, metadata.raw_value())?;
+        }
         if let Some(content) = candidate.get("content") {
             fields(content, &["role", "parts"])?;
             if content.get("role").is_some() && !eq(content, "role", "model") {
@@ -1045,14 +1332,9 @@ fn google(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
                     };
                     sink.delta(key, kind, text)?;
                     if let Some(signature) = optional(part, "thoughtSignature")? {
-                        sink.signature(key, signature)?;
+                        sink.signature(key, signature, None)?;
                     }
                 } else if let Some(function) = part.get("functionCall") {
-                    if part.get("thoughtSignature").is_some() {
-                        return Err(Error::Unsupported {
-                            feature: "Gemini function-bound signature",
-                        });
-                    }
                     fields(function, &["id", "name", "args"])?;
                     let key = Key {
                         choice,
@@ -1065,6 +1347,7 @@ fn google(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
                         optional(function, "id")?,
                         string(function, "name")?,
                         Text::Utf8(arguments.raw()),
+                        optional(part, "thoughtSignature")?,
                     )?;
                 } else if let Some(signature) = optional(part, "thoughtSignature")? {
                     sink.signature(
@@ -1074,6 +1357,7 @@ fn google(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
                             part: 0,
                         },
                         signature,
+                        None,
                     )?;
                 } else {
                     return Err(Error::Unsupported {
@@ -1081,6 +1365,12 @@ fn google(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
                     });
                 }
             }
+        }
+        if let Some(token) = optional(candidate, "continuationToken")? {
+            if token.len() == 0 {
+                return Err(invalid("continuationToken"));
+            }
+            sink.continuation(choice, token)?;
         }
         if let Some(reason) = candidate.get("finishReason") {
             sink.choice(choice, finish_reason(reason, true)?)?;
@@ -1163,7 +1453,7 @@ fn interactions(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error>
                 string(object(delta, "content")?, "text")?,
             )
         } else if eq(delta, "type", "thought_signature") {
-            sink.signature(key, string(delta, "signature")?)
+            sink.signature(key, string(delta, "signature")?, None)
         } else {
             Err(Error::Unsupported {
                 feature: "Interactions media delta",
@@ -1211,4 +1501,31 @@ fn interactions(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error>
             feature: "Interactions stream event",
         })
     }
+}
+
+pub(super) fn validate_grounding(value: Value<'_, '_>) -> Result<(), Error> {
+    if value.kind() != Kind::Object {
+        return Err(invalid("groundingMetadata"));
+    }
+    if let Some(queries) = value.get("webSearchQueries") {
+        if queries.kind() != Kind::Array {
+            return Err(invalid("webSearchQueries"));
+        }
+        for query in queries.array() {
+            if query.as_string().is_none() {
+                return Err(invalid("webSearchQueries"));
+            }
+        }
+    }
+    if let Some(chunks) = value.get("groundingChunks") {
+        if chunks.kind() != Kind::Array {
+            return Err(invalid("groundingChunks"));
+        }
+        for chunk in chunks.array() {
+            if let Some(web) = chunk.get("web") {
+                string(web, "uri")?;
+            }
+        }
+    }
+    Ok(())
 }

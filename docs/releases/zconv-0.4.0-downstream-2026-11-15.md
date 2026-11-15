@@ -1,17 +1,17 @@
 # zconv 0.4.0 与下游迁移发布记录
 
-核对日期：2026-11-15 UTC。此记录覆盖本次发现并可操作的 6 个仓库：zconv、zcall、zharness、zmcpio、lmm-api-source 与 lmm-api。公开依赖关系和本次已检查仓库构成范围依据，不能据此证明不存在其他第三方或私有消费者。
+核对时间：2026-11-15 09:52 UTC。此记录覆盖本次发现并可操作的 6 个仓库：zconv、zcall、zharness、zmcpio、lmm-api-source 与 lmm-api。公开依赖关系和本次已检查仓库构成范围依据，不能据此证明不存在其他第三方或私有消费者。
 
 ## 1. 发布状态
 
-zconv 0.4.0、zcall 0.3.0 与 zmcpio 0.4.0 已完成 GitHub Release 和 crates.io 发布。zharness 0.5.0 已通过全部本地发布检查，远端资格检查正在执行。LMM 的协议迁移和发布器已推送，但源码发布工作流尚无运行记录；父配方发布依赖源码发布完成。
+zconv 0.4.0、zcall 0.3.0、zharness 0.5.0 与 zmcpio 0.4.0 已完成 GitHub Release 和 crates.io 发布。四个 Rust 库的发布与依赖升级已完成。LMM 的协议迁移和发布器已推送，但源码发布工作流尚无运行记录；父配方发布依赖源码发布完成。
 
 | 仓库 / 发布单元 | 本轮版本 | 可证明状态 | 主要证据 |
 | --- | --- | --- | --- |
 | zconv | 0.4.0 | 正式 GitHub Release 与 crates.io 包已发布 | [Release](https://github.com/LIghtJUNction/zconv/releases/tag/v0.4.0)、[crates.io](https://crates.io/crates/zconv/0.4.0)、[发布流程](https://github.com/LIghtJUNction/zconv/actions/runs/43696550506) |
 | zcall | 0.3.0 | 正式 GitHub Release 与 crates.io 包已发布；后续 macOS 测试夹具修复的主线 CI 全部通过 | [Release](https://github.com/LIghtJUNction/zcall/releases/tag/v0.3.0)、[crates.io](https://crates.io/crates/zcall/0.3.0)、[当前主线 CI](https://github.com/LIghtJUNction/zcall/actions/runs/43699181060) |
 | zmcpio | 0.4.0 | 正式 GitHub Release 与 crates.io 包已发布；CI、传输回归、性能证据和发布流程均通过 | [Release](https://github.com/LIghtJUNction/zmcpio/releases/tag/v0.4.0)、[crates.io](https://crates.io/crates/zmcpio/0.4.0)、[发布流程](https://github.com/LIghtJUNction/zmcpio/actions/runs/43699182713) |
-| zharness | 0.5.0 | 本地资格检查、最低版本检查、包校验与发布演练通过；main 已提交发布请求，远端流程进行中 | [候选提交](https://github.com/LIghtJUNction/zharness/commit/e6b3a9746ab0d414121836129242d75e4b950890)、[发布流程](https://github.com/LIghtJUNction/zharness/actions/runs/43700355281) |
+| zharness | 0.5.0 | 正式 GitHub Release 与 crates.io 包已发布；CI、性能证据和发布流程均通过 | [Release](https://github.com/LIghtJUNction/zharness/releases/tag/v0.5.0)、[crates.io](https://crates.io/crates/zharness/0.5.0)、[发布流程](https://github.com/LIghtJUNction/zharness/actions/runs/43700355281) |
 | lmm-api-source | 顶层 VERSION 0.1.20 | 协议迁移、registry 锁文件、发布器和请求已推送；未创建 v0.1.20 Release | [源码候选](https://github.com/TokenNotIncluded/lmm-api-source/commit/28eedde22963b1be92964bd2bf2325d65664d339)、[Actions](https://github.com/TokenNotIncluded/lmm-api-source/actions) |
 | lmm-api 配方 | API 0.1.23 / Core 0.1.18 | 发布器已推送；两项版本更新已在工作区准备，等待已发布 source SHA 后更新 gitlink 与来源记录 | [发布器提交](https://github.com/TokenNotIncluded/lmm-api/commit/ac27f20914a38daa8720c17834deeed933178001) |
 
@@ -35,7 +35,9 @@ zconv 的职责是校验、读取和重写协议字节。它把输入中的字�
 | Embeddings | 类型化单文本/文本数组/token IDs/token batches 输入，float/base64 响应、索引、维度参数及用量 | 不做分词、向量计算、base64 解码或模型维度保证 |
 | Images | 生成 JSON、编辑 JSON/multipart、图片响应以及 partial/completed SSE 契约 | 不生成或解码图片；legacy variation 的格式兼容不表示对应服务仍可用 |
 
-资源模块包含 **15 种 schema 和 13 种 endpoint 变体**。已知字段被校验，未知字段保持借用并可原样编码；保留字段并不等于理解其语义。端点 ID 按单个路径段编码，JSONL 压缩不改动字符串内容，multipart 文件部分保持二进制字节，容量不足报告精确所需大小。
+资源模块包含 **15 种 schema 和 13 种 endpoint 变体**。已知字段被校验，未知字段保持借用并可原样编码；保留字段并不等于理解其语义。端点 ID 按单个路径段编码，JSONL 压缩不改动字符串内容，multipart 文件部分保持二进制字节。编码输出缓冲区不足时报告精确所需字节数；解析 token 工作区不足时的数量仍可能只是下界。
+
+`StreamOptions` 表达请求偏好，流式编码器的连续用量策略仍由应用显式选择和连接。请求里出现该字段不保证远端服务实际发送用量；转换器只处理观察到的计数。
 
 对应实现和边界可在发布提交的 [CHANGELOG](https://github.com/LIghtJUNction/zconv/blob/1488f0abab5c4f926f6ac258f62108a5cb7f4ff9/CHANGELOG.md)、[资源契约](https://github.com/LIghtJUNction/zconv/blob/1488f0abab5c4f926f6ac258f62108a5cb7f4ff9/docs/RESOURCE_APIS.md)、[协议支持矩阵](https://github.com/LIghtJUNction/zconv/blob/1488f0abab5c4f926f6ac258f62108a5cb7f4ff9/docs/SUPPORT.md) 与 [流式说明](https://github.com/LIghtJUNction/zconv/blob/1488f0abab5c4f926f6ac258f62108a5cb7f4ff9/docs/STREAMING.md) 中核对。
 
@@ -64,7 +66,8 @@ LMM 的消费范围比 zconv 的格式保留能力窄。Core 不能表示的 pro
 | zcall | MSRV debug 与 stable release 各 127 项测试、2 项文档测试、29 项 Python 测试、包校验与发布演练 | 全部通过；新增回归覆盖连续用量、嵌套内容编辑、跨度迁移和服务端工具隔离 |
 | zcall 当前主线 | [CI 43699181060](https://github.com/LIghtJUNction/zcall/actions/runs/43699181060) 的 12/12 jobs，包含 Miri 和六组 OS/toolchain 测试 | 全部成功；原 macOS 1.99.1 HTTP 夹具在 debug/release 均 2 passed |
 | zmcpio | 独立 MSRV all-features/all-targets 209 passed、0 failed、2 ignored；strict Clippy、debug/release、真实 stdio/client/HTTP smoke、Wasm、发布包检查 | 本地与远端发布门禁通过；两项 ignored 是由父测试实际执行的子进程夹具 |
-| zharness 候选 | stable 完整 scripts/check.py；独立 MSRV all-targets/all-features 116 passed、0 failed；Wasm/Thumb/Thumb+Wasm-host；native/Wasm/mixed；24 例 benchmark smoke；30 项 Python 门禁 | 全部通过；干净归档来源、all-features 提取包、publish dry-run、两次打包字节一致也已通过 |
+| zharness | stable 完整 scripts/check.py；独立 MSRV all-targets/all-features 116 passed、0 failed；Wasm/Thumb/Thumb+Wasm-host；native/Wasm/mixed；24 例 benchmark smoke；30 项 Python 门禁 | 全部通过；干净归档来源、all-features 提取包、publish dry-run、两次打包字节一致也已通过 |
+| zharness 远端 | [CI](https://github.com/LIghtJUNction/zharness/actions/runs/43700355257)、[性能证据](https://github.com/LIghtJUNction/zharness/actions/runs/43700355224)、[Release](https://github.com/LIghtJUNction/zharness/actions/runs/43700355281) | 全部 success；Release 的 plan、六组 OS/toolchain 测试、portability 和 publish 共 9 个 jobs 成功 |
 | LMM source 候选 | production `cargo clippy --locked --lib -- -D warnings`；16 项 workflow topology、4 项 source release guard、docs checker、actionlint | 已通过；Core 新增 8 项回归尚无成功执行证据 |
 | LMM source 本地 libtest | 两次 libtest 代码生成被 SIGKILL；后续 metadata 类型检查主动停止 | 没有把编译尝试计为测试通过；保留失败日志，等待真正的 source qualify job |
 | LMM 父发布器 | 4 项 guard tests；两个配方目录及归档的 Recipkg 检查；recursive prompt 生成；YAML/Python/Bash 与 actionlint | 发布器准备检查通过；不能代替最终源码 SHA 固定后的发布验证 |
@@ -82,8 +85,9 @@ zharness 发布规划修复要求候选 SemVer 严格高于既有发布 tag，�
 | zconv 0.4.0 | `1488f0abab5c4f926f6ac258f62108a5cb7f4ff9` | `fb4c2c557b09be10a449b44d4034059837ab1980e8f89b830aedefcc9d0bbc15` |
 | zcall 0.3.0 | `9fbae3b620edec76e35803b2b8ecb2d8190136c0` | `82a8650e8302ae5e0ebd861e9062809c9d9162d0a839c7e8f9b6e54afbd2d20d` |
 | zmcpio 0.4.0 | `bc89d7fa3b0249b3a9037748e2113b31615e8c89` | `1530747e76256c89865b521c407c520766fc93badae9c8b573e5a4e0c4e820ad` |
+| zharness 0.5.0 | `e6b3a9746ab0d414121836129242d75e4b950890` | `76dcd53a4d6ff3f64e6788eadc5d31ce2875e284d3793de7679070833c86b1e9` |
 
-zmcpio 实际下载归档为 151,699 bytes，其 `.cargo_vcs_info.json`、tag、Release run HEAD 三者一致；包内 lock 的 zcall/zconv checksum 与 registry 一致。可从 [zconv index](https://index.crates.io/zc/on/zconv)、[zcall index](https://index.crates.io/zc/al/zcall)、[zmcpio index](https://index.crates.io/zm/cp/zmcpio) 复核各版本记录。
+zmcpio 实际下载归档为 151,699 bytes，其 `.cargo_vcs_info.json`、tag、Release run HEAD 三者一致；包内 lock 的 zcall/zconv checksum 与 registry 一致。zharness 实际下载包的 SHA-256 与 registry API、sparse index 三者一致，包内 VCS 与 tag / Release run 一致；包内 manifest 精确依赖 zcall 0.3.0，lock 锁定正式 zconv 0.4.0。可从 [zconv index](https://index.crates.io/zc/on/zconv)、[zcall index](https://index.crates.io/zc/al/zcall)、[zmcpio index](https://index.crates.io/zm/cp/zmcpio)、[zharness index](https://index.crates.io/zh/ar/zharness) 复核各版本记录。
 
 ## 6. LMM 的剩余发布条件
 

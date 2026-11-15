@@ -1,0 +1,39 @@
+assistant_no_id_status_annotations:identity	OK Identity	{"model":"m","input":[{"role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}
+assistant_no_id_status_annotations:ir_same	OK Ir	{"model":"m","input":[{"role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}
+assistant_no_id_status_annotations:chat_auto	OK Direct	{"model":"m","messages":[{"role":"assistant","content":[{"type":"text","text":"ok"}]}]}
+assistant_content_missing:identity	ERR	InvalidInput { field: "content", reason: "required field missing" }
+assistant_content_missing:ir_same	ERR	InvalidInput { field: "content", reason: "required field missing" }
+assistant_content_missing:chat_auto	ERR	InvalidInput { field: "content", reason: "missing field" }
+assistant_content_null:identity	OK Identity	{"model":"m","input":[{"type":"message","role":"assistant","content":null}]}
+assistant_content_null:ir_same	ERR	Unsupported { feature: "missing or null content in target item" }
+assistant_content_null:chat_auto	OK Ir	{"model":"m","messages":[{"role":"assistant","content":null}]}
+output_text_annotations_null:identity	OK Identity	{"model":"m","input":[{"role":"assistant","content":[{"type":"output_text","text":"ok","annotations":null}]}]}
+output_text_annotations_null:ir_same	OK Ir	{"model":"m","input":[{"role":"assistant","content":[{"type":"output_text","text":"ok","annotations":null}]}]}
+output_text_annotations_null:chat_auto	ERR	PolicyViolation { feature: "source-owned extension" }
+output_text_annotations_empty:identity	OK Identity	{"model":"m","input":[{"role":"assistant","content":[{"type":"output_text","text":"ok","annotations":[]}]}]}
+output_text_annotations_empty:ir_same	OK Ir	{"model":"m","input":[{"role":"assistant","content":[{"type":"output_text","text":"ok","annotations":[]}]}]}
+output_text_annotations_empty:chat_auto	OK Direct	{"model":"m","messages":[{"role":"assistant","content":[{"type":"text","text":"ok"}]}]}
+reasoning_id_summary_missing:identity	OK Identity	{"model":"m","input":[{"type":"reasoning","encrypted_content":"opaque"}]}
+reasoning_id_summary_missing:ir_same	OK Ir	{"model":"m","input":[{"type":"reasoning","summary":[],"encrypted_content":"opaque"}]}
+reasoning_id_summary_missing:chat_auto	ERR	Unsupported { feature: "reasoning summary and provider thought differ" }
+reasoning_summary_null:identity	ERR	InvalidInput { field: "summary", reason: "expected array" }
+reasoning_summary_null:ir_same	ERR	InvalidInput { field: "summary", reason: "expected array" }
+reasoning_summary_null:chat_auto	ERR	InvalidInput { field: "summary", reason: "expected array" }
+image_detail_missing:identity	OK Identity	{"model":"m","input":[{"role":"user","content":[{"type":"input_image","image_url":"https://example.org/a.png"}]}]}
+image_detail_missing:ir_same	OK Ir	{"model":"m","input":[{"role":"user","content":[{"type":"input_image","image_url":"https://example.org/a.png"}]}]}
+image_detail_missing:chat_auto	OK Ir	{"model":"m","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.org/a.png"}}]}]}
+image_detail_null:identity	OK Identity	{"model":"m","input":[{"role":"user","content":[{"type":"input_image","image_url":"https://example.org/a.png","detail":null}]}]}
+image_detail_null:ir_same	OK Ir	{"model":"m","input":[{"role":"user","content":[{"type":"input_image","image_url":"https://example.org/a.png","detail":null}]}]}
+image_detail_null:chat_auto	OK Ir	{"model":"m","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.org/a.png","detail":null}}]}]}
+function_tool_roundtrip:identity	OK Identity	{"model":"m","input":[{"type":"function_call","call_id":"c1","name":"lookup","arguments":"{}"},{"role":"assistant","content":[{"type":"output_text","text":"checking"}]},{"type":"function_call_output","call_id":"c1","output":"ok"}]}
+function_tool_roundtrip:ir_same	OK Ir	{"model":"m","input":[{"type":"function_call","call_id":"c1","name":"lookup","arguments":"{}"},{"role":"assistant","content":[{"type":"output_text","text":"checking"}]},{"type":"function_call_output","call_id":"c1","output":"ok"}]}
+function_tool_roundtrip:chat_auto	OK Direct	{"model":"m","messages":[{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"assistant","content":[{"type":"text","text":"checking"}]},{"role":"tool","tool_call_id":"c1","content":"ok"}]}
+function_result_image:identity	OK Identity	{"model":"m","input":[{"type":"function_call_output","call_id":"c1","output":[{"type":"input_image","image_url":"https://example.org/a.png"}]}]}
+function_result_image:ir_same	OK Ir	{"model":"m","input":[{"type":"function_call_output","call_id":"c1","output":[{"type":"input_image","image_url":"https://example.org/a.png"}]}]}
+function_result_image:chat_auto	ERR	Unsupported { feature: "typed tool-result content array across protocols" }
+text_verbosity:identity	ERR	Unsupported { feature: "Responses text configuration extension" }
+text_verbosity:ir_same	ERR	Unsupported { feature: "Responses text configuration extension" }
+text_verbosity:chat_auto	ERR	Unsupported { feature: "Responses text configuration extension" }
+previous_response_id:identity	OK Identity	{"model":"m","input":"hello","previous_response_id":"resp_previous"}
+previous_response_id:ir_same	OK Ir	{"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}],"previous_response_id":"resp_previous"}
+previous_response_id:chat_auto	ERR	ContextRequired { field: "resolved source conversation history" }

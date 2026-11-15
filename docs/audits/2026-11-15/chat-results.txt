@@ -1,0 +1,41 @@
+CUMULATIVE Direct: final_output=Some(7) total=Some(12), output_usage_objects=1
+data: {"id":"r1","object":"chat.completion.chunk","created":7,"model":"m","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"r1","object":"chat.completion.chunk","created":7,"model":"m","choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}
+
+data: {"id":"r1","object":"chat.completion.chunk","created":7,"model":"m","choices":[{"index":0,"delta":{"content":"y"},"finish_reason":null}]}
+
+data: {"id":"r1","object":"chat.completion.chunk","created":7,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"r1","object":"chat.completion.chunk","created":7,"model":"m","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}}
+
+data: [DONE]
+
+
+CUMULATIVE Ir: final_output=Some(7) total=Some(12), output_usage_objects=1
+data: {"id":"r1","object":"chat.completion.chunk","created":7,"model":"m","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"r1","object":"chat.completion.chunk","created":7,"model":"m","choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}
+
+data: {"id":"r1","object":"chat.completion.chunk","created":7,"model":"m","choices":[{"index":0,"delta":{"content":"y"},"finish_reason":null}]}
+
+data: {"id":"r1","object":"chat.completion.chunk","created":7,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"r1","object":"chat.completion.chunk","created":7,"model":"m","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}}
+
+data: [DONE]
+
+
+STREAM_OPTIONS_IDENTITY: OK Identity {"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true,"stream_options":{"include_usage":true,"continuous_usage_stats":true}}
+STREAM_OPTIONS_IR_SAME: OK Ir {"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true,"stream_options":{"include_usage":true,"continuous_usage_stats":true}}
+STREAM_OPTIONS_RESPONSES: ERR PolicyViolation { feature: "source-owned extension" }
+OBJECT_TOOL_ARGUMENTS_SAME: ERR InvalidInput { field: "arguments", reason: "expected string" }
+OBJECT_TOOL_ARGUMENTS_RESPONSES: ERR InvalidInput { field: "arguments", reason: "expected a string" }
+REASONING_STANDARD_SAME: OK Identity {"model":"m","messages":[{"role":"assistant","content":"answer","reasoning_content":"thought"}]}
+REASONING_STANDARD_ANTHROPIC: ERR PolicyViolation { feature: "source-owned extension" }
+REASONING_VENDOR_ANTHROPIC: OK Ir {"model":"m","messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"thought"},{"type":"text","text":"answer"}]}],"max_tokens":32}
+REASONING_VENDOR_RESPONSES: ERR Unsupported { feature: "reasoning summary and provider thought differ" }
+REASONING_VENDOR_GEMINI: ERR Unsupported { feature: "reasoning summary and provider thought differ" }
+REASONING_ALIAS_VENDOR_ANTHROPIC: ERR PolicyViolation { feature: "source-owned extension" }
+VIDEO_URL_GEMINI: ERR Unsupported { feature: "opaque content block" }
+AUDIO_URL_GEMINI: ERR Unsupported { feature: "opaque content block" }

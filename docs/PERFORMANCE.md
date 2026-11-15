@@ -1,5 +1,26 @@
 # Performance and memory measurements
 
+## Version 0.4 resource contracts — 2026-11-15
+
+`cargo bench --bench resources -- --full` measures JSON parsing, semantic
+validation and byte-preserving output together. Each row is the median of nine
+batch-average durations, with fixture construction and allocation outside the
+timed loop. The run used Rust 1.100.0, Linux x86_64 and the repository's thin-LTO
+bench profile. Concurrent work in this shared workspace affects scheduling and
+these results do not set a release performance threshold.
+
+| Resource fixture | Input bytes | Median per operation | Input throughput |
+|---|---:|---:|---:|
+| 1536-element float embedding | 17,618 | 204.347 µs | 82.22 MiB/s |
+| Completed batch metadata | 214 | 8.620 µs | 23.68 MiB/s |
+| File metadata | 97 | 2.072 µs | 44.66 MiB/s |
+| Completed image event | 140 | 2.779 µs | 48.04 MiB/s |
+
+Raw results: [resources-0.4.0.csv](benchmarks/resources-0.4.0.csv). Zero-allocation
+behavior is checked separately by the positive-controlled allocation oracle.
+
+## Historical protocol measurements — 2026-11-10
+
 These are reproducible measurements of the library, not model/network latency
 or a comparison with another product. The measured code is commit
 [`e227184715ba53e827d5435974de88c1f7533c3f`](https://github.com/LIghtJUNction/zconv/commit/e227184715ba53e827d5435974de88c1f7533c3f).

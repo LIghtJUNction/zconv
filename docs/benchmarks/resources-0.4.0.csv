@@ -1,0 +1,5 @@
+case,bytes,median_ns,mib_per_second
+embedding_1536,17618,204346.8,82.22
+batch,214,8620.1,23.68
+file,97,2071.6,44.66
+image_event,140,2779.0,48.04

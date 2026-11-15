@@ -1,5 +1,37 @@
 # Validation evidence
 
+## Version 0.4.0 — 2026-11-15
+
+The compatibility and resource implementation was verified at GitHub commit
+[`1c7b7cf778a61a462b74860a3e9d7997460c9817`](https://github.com/LIghtJUNction/zconv/commit/1c7b7cf778a61a462b74860a3e9d7997460c9817).
+The following are observed local results; the release workflow repeats its gates
+against the final publication commit. Historical measurements below are retained
+as historical evidence, not as the current MSRV or current test count.
+
+| Gate | Observed result |
+|---|---|
+| Rust 1.100.0, all targets | 187 integration tests pass; examples and all four benchmark targets compile/run |
+| Rust 1.99.1 MSRV, all targets | The same 187 tests pass |
+| Optimized release | 187 integration tests and 1 documentation test pass |
+| Documentation example | 1 compiled example passes separately |
+| Resource contracts | 23 tests cover all 15 schemas and 13 endpoint variants, nullable fields, binary multipart, JSONL, SSE and exact capacities |
+| Nonstream compatibility | 19 tests cover relaxed agent inputs, reasoning, media/tool results, object arguments and stream options |
+| Stream compatibility | 11 focused tests plus the existing stream/owned suites cover usage, provenance, raw/summary separation, fragmentation, backpressure and rejection rollback |
+| Allocation oracle | 2 tests pass, including resource builders, JSONL, float response parsing and binary multipart; measured allocation count/bytes are zero |
+| Cross compilation | MSRV checks pass for wasm32-unknown-unknown, aarch64-unknown-linux-gnu and thumbv7em-none-eabi |
+| Formatting and Clippy | All-target checks pass with warnings denied |
+| Package audit | No dependencies of any kind, no build script, safe no_std core; the package compiles from the extracted archive |
+| Release scripts | 14 Python tests pass |
+| Independent JSON oracle | 4 comparison tests pass; comparison dependencies remain outside the published graph |
+
+Cross compilation does not establish runtime behavior on those devices. No live
+model inference, provider API availability or remote batch job was tested. The
+wire-level support and deliberate rejections are defined in [SUPPORT.md](SUPPORT.md)
+and [RESOURCE_APIS.md](RESOURCE_APIS.md). The new resource benchmark measures
+local parse/validation/encoding and has no shared-runner timing release threshold.
+
+## Historical initial implementation — 2026-11-10
+
 The executable implementation was verified on **2026-11-10**. The measured code
 commit is [`e227184715ba53e827d5435974de88c1f7533c3f`](https://github.com/LIghtJUNction/zconv/commit/e227184715ba53e827d5435974de88c1f7533c3f).
 The [GitHub CI run](https://github.com/LIghtJUNction/zconv/actions/runs/42817235107)
@@ -96,7 +128,7 @@ boundary and were not performed.
 
 ```sh
 cargo test --all-targets --locked
-cargo +1.74.0 test --all-targets --locked
+cargo +1.99.1 test --all-targets --locked
 cargo test --release --locked
 cargo test --doc --locked
 cargo fmt --all -- --check

@@ -208,6 +208,15 @@ fn chat(
             if delta.get("role").is_some() && !eq(delta, "role", "assistant") {
                 return Err(invalid("delta.role"));
             }
+            if matches!(profile, Profile::OpenAiCompatible(_))
+                && delta.get("reasoning_content").is_some()
+                && delta.get("reasoning").is_some()
+            {
+                return Err(Error::InvalidInput {
+                    field: "reasoning_content",
+                    reason: "multiple reasoning field aliases",
+                });
+            }
             for name in ["reasoning_content", "reasoning"] {
                 if let Some(text) = optional(delta, name)? {
                     if !matches!(profile, Profile::OpenAiCompatible(_)) {
@@ -1000,7 +1009,7 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
             }
             empty_only(item, "content")?;
         } else if eq(item, "type", "reasoning") {
-            // Summary parts have independently indexed block lifecycles.
+            // Content and summary parts have separate index spaces.
             empty_only(item, "encrypted_content")?;
         } else {
             return Err(Error::Unsupported {
@@ -1020,6 +1029,8 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
             BlockKind::Text
         } else if eq(part, "type", "refusal") {
             BlockKind::Refusal
+        } else if eq(part, "type", "reasoning_text") {
+            BlockKind::Reasoning
         } else {
             return Err(Error::Unsupported {
                 feature: "Responses content part",
@@ -1033,10 +1044,10 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
             None,
             optional(value, "item_id")?,
         )?;
-        let field = if kind == BlockKind::Text {
-            "text"
-        } else {
+        let field = if kind == BlockKind::Refusal {
             "refusal"
+        } else {
+            "text"
         };
         if let Some(text) = optional(part, field)?
             && text.len() != 0
@@ -1052,6 +1063,8 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
     } else if event_type.eq_str("response.function_call_arguments.delta") {
         Some(BlockKind::Tool)
     } else if event_type.eq_str("response.reasoning_summary_text.delta") {
+        Some(BlockKind::ReasoningSummary)
+    } else if event_type.eq_str("response.reasoning_text.delta") {
         Some(BlockKind::Reasoning)
     } else {
         None
@@ -1075,11 +1088,14 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
     if event_type.eq_str("response.output_text.done")
         || event_type.eq_str("response.refusal.done")
         || event_type.eq_str("response.function_call_arguments.done")
+        || event_type.eq_str("response.reasoning_text.done")
     {
         let kind = if event_type.eq_str("response.function_call_arguments.done") {
             BlockKind::Tool
         } else if event_type.eq_str("response.refusal.done") {
             BlockKind::Refusal
+        } else if event_type.eq_str("response.reasoning_text.done") {
+            BlockKind::Reasoning
         } else {
             BlockKind::Text
         };
@@ -1118,6 +1134,8 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
             BlockKind::Refusal
         } else if eq(part, "type", "output_text") {
             BlockKind::Text
+        } else if eq(part, "type", "reasoning_text") {
+            BlockKind::Reasoning
         } else {
             return Err(Error::Unsupported {
                 feature: "Responses final content part",
@@ -1142,6 +1160,9 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
     }
     if event_type.eq_str("response.reasoning_summary_part.added") {
         let part = object(value, "part")?;
+        if !eq(part, "type", "summary_text") {
+            return Err(invalid("summary part type"));
+        }
         let key = Key {
             choice: 0,
             index: index(value, "output_index")?,
@@ -1149,7 +1170,7 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
         };
         sink.block(
             key,
-            BlockKind::Reasoning,
+            BlockKind::ReasoningSummary,
             None,
             None,
             optional(value, "item_id")?,
@@ -1157,7 +1178,7 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
         if let Some(text) = optional(part, "text")?
             && text.len() != 0
         {
-            sink.delta(key, BlockKind::Reasoning, text)?;
+            sink.delta(key, BlockKind::ReasoningSummary, text)?;
         }
         return Ok(());
     }
@@ -1165,7 +1186,11 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
         || event_type.eq_str("response.reasoning_summary_text.done")
     {
         let text = if event_type.eq_str("response.reasoning_summary_part.done") {
-            string(object(value, "part")?, "text")?
+            let part = object(value, "part")?;
+            if !eq(part, "type", "summary_text") {
+                return Err(invalid("summary part type"));
+            }
+            string(part, "text")?
         } else {
             string(value, "text")?
         };
@@ -1175,7 +1200,7 @@ fn responses(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
                 index: index(value, "output_index")?,
                 part: index(value, "summary_index")?,
             },
-            BlockKind::Reasoning,
+            BlockKind::ReasoningSummary,
             text,
         );
     }
@@ -1335,15 +1360,37 @@ fn response_snapshot(
             .array()
             .enumerate()
         {
+            if !eq(summary, "type", "summary_text") {
+                return Err(invalid("summary part type"));
+            }
             sink.snapshot(
                 Key {
                     choice: 0,
                     index: output_index,
                     part: u32::try_from(part).map_err(|_| invalid("summary_index"))?,
                 },
-                BlockKind::Reasoning,
+                BlockKind::ReasoningSummary,
                 string(summary, "text")?,
             )?;
+        }
+        if let Some(content) = item.get("content").filter(|v| !v.is_null()) {
+            if content.kind() != Kind::Array {
+                return Err(invalid("reasoning content"));
+            }
+            for (part, text) in content.array().enumerate() {
+                if !eq(text, "type", "reasoning_text") {
+                    return Err(invalid("reasoning content type"));
+                }
+                sink.snapshot(
+                    Key {
+                        choice: 0,
+                        index: output_index,
+                        part: u32::try_from(part).map_err(|_| invalid("content_index"))?,
+                    },
+                    BlockKind::Reasoning,
+                    string(text, "text")?,
+                )?;
+            }
         }
         return Ok(());
     }
@@ -1458,7 +1505,7 @@ fn google(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
                 )?;
                 if let Some(text) = optional(part, "text")? {
                     let kind = if part.get("thought").and_then(Value::as_bool) == Some(true) {
-                        BlockKind::Reasoning
+                        BlockKind::ReasoningSummary
                     } else {
                         BlockKind::Text
                     };
@@ -1554,7 +1601,7 @@ fn interactions(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error>
             empty_only(step, "content")?;
             sink.block(key, BlockKind::Text, None, None, None)
         } else if eq(step, "type", "thought") {
-            sink.block(key, BlockKind::Reasoning, None, None, None)
+            sink.block(key, BlockKind::ReasoningSummary, None, None, None)
         } else if eq(step, "type", "function_call") {
             sink.block(
                 key,
@@ -1590,7 +1637,7 @@ fn interactions(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error>
         } else if eq(delta, "type", "thought_summary") {
             sink.delta(
                 key,
-                BlockKind::Reasoning,
+                BlockKind::ReasoningSummary,
                 string(object(delta, "content")?, "text")?,
             )
         } else if eq(delta, "type", "thought_signature") {

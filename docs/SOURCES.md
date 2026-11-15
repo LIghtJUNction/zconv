@@ -1,6 +1,8 @@
 # Protocol and design sources
 
-Documentation retrieved on 2026-11-10. Adapter versions are explicit in `Format`.
+Conversation documentation was reviewed on 2026-11-10 and the 0.4 compatibility
+and resource contracts were checked on 2026-11-15. Adapter versions are explicit
+in `Format`.
 
 | Adapter | Wire version | Primary specification |
 |---|---|---|
@@ -19,6 +21,14 @@ Documentation retrieved on 2026-11-10. Adapter versions are explicit in `Format`
 | Gemini thought accounting | Visible output versus thought tokens | https://ai.google.dev/gemini-api/docs/thought-signatures |
 | SSE framing | WHATWG Living Standard, 2026-11-09 revision | https://html.spec.whatwg.org/multipage/server-sent-events.html |
 | JSON grammar | RFC 8259 | https://www.rfc-editor.org/rfc/rfc8259 |
+| Batch resource | v1 | https://developers.openai.com/api/reference/resources/batches/methods/create |
+| Batch JSONL | v1 | https://developers.openai.com/api/docs/guides/batch |
+| Files resource/upload | v1 | https://developers.openai.com/api/reference/resources/files/methods/create |
+| Embeddings | v1 | https://developers.openai.com/api/reference/resources/embeddings/methods/create |
+| Image generation | v1 | https://developers.openai.com/api/reference/resources/images/methods/generate |
+| Image edits | v1 | https://developers.openai.com/api/reference/resources/images/methods/edit |
+| Image events and output | v1 | https://developers.openai.com/api/reference/resources/images |
+| Multipart boundary grammar | RFC 2046, section 5.1 | https://www.rfc-editor.org/rfc/rfc2046#section-5.1 |
 
 ## Pinned design study
 
@@ -62,6 +72,14 @@ extensions.
 
 Specifications define the supported wire contract. Additional model-specific
 validation and network headers remain the caller's responsibility.
+
+The new resource module is an independent implementation of wire contracts, not
+an upstream type re-export. Embedding vectors remain floating JSON values or
+base64 strings; numeric token accounting remains integral. Files `bytes` may be
+null, and binary file content has no JSON schema. Batch JSONL validates individual
+envelopes but cannot establish file-wide custom ID uniqueness without caller state.
+Legacy image variation encoding preserves a historical wire format and does not
+assert that a retired endpoint or model is available on a provider.
 
 ## Defaults and token-accounting differences
 

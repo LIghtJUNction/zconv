@@ -31,8 +31,17 @@ pub enum BlockKind {
     #[default]
     Text,
     Tool,
+    /// Provider thought text, distinct from a generated reasoning summary.
     Reasoning,
+    /// A provider-generated summary of reasoning, never raw thought text.
+    ReasoningSummary,
     Refusal,
+}
+
+impl BlockKind {
+    const fn is_reasoning(self) -> bool {
+        matches!(self, Self::Reasoning | Self::ReasoningSummary)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -539,6 +548,8 @@ pub struct ActiveItem {
     key: Key,
     kind: BlockKind,
     wire_index: u32,
+    group_head: usize,
+    part_index: u32,
     id: Span,
     name: Span,
     head: usize,
@@ -567,6 +578,8 @@ impl ActiveItem {
         },
         kind: BlockKind::Text,
         wire_index: 0,
+        group_head: 0,
+        part_index: 0,
         id: Span::EMPTY,
         name: Span::EMPTY,
         head: NONE,

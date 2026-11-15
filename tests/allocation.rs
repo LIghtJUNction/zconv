@@ -139,3 +139,60 @@ fn parser_direct_ir_and_identity_allocate_zero_bytes() {
     assert_eq!(count, 0);
     assert_eq!(bytes, 0);
 }
+
+#[test]
+fn resource_validation_builders_and_multipart_allocate_zero_bytes() {
+    use zconv::api::{
+        self, Embedding, EmbeddingInput, EmbeddingVector, EmbeddingsRequest, EmbeddingsResponse,
+        FileUpload, Schema,
+    };
+    let mut tokens = [Token::EMPTY; 128];
+    let mut body = [0; 1024];
+    let mut line = [0; 2048];
+    let mut upload_bytes = [0; 4096];
+    let vector = [0.1, -0.2, f32::MIN_POSITIVE, f32::MAX];
+    let data = [Embedding {
+        index: 0,
+        vector: EmbeddingVector::Floats(&vector),
+    }];
+    COUNTERS.with(|counters| counters.set((true, 0, 0)));
+    let outcome = (|| -> Result<(), zconv::Error> {
+        for _ in 0..16 {
+            let n = EmbeddingsRequest::new("m", EmbeddingInput::Text("Hello")).encode(&mut body)?;
+            let request = api::parse(
+                Schema::EmbeddingsRequest,
+                &body[..n],
+                &mut tokens,
+                zconv::json::Limits::default(),
+            )?;
+            let n =
+                api::encode_batch_input("example", "/v1/embeddings", request.value(), &mut line)?;
+            FileUpload {
+                filename: "input.jsonl",
+                content_type: "application/jsonl",
+                contents: &line[..n],
+                purpose: "batch",
+                expires_after: Some(3600),
+            }
+            .encode("zconv-allocation", &mut upload_bytes)?;
+            let n = EmbeddingsResponse {
+                model: "m",
+                data: &data,
+                prompt_tokens: 2,
+                total_tokens: 2,
+            }
+            .encode(&mut body)?;
+            api::parse(
+                Schema::EmbeddingsResponse,
+                &body[..n],
+                &mut tokens,
+                zconv::json::Limits::default(),
+            )?
+            .encode(&mut line)?;
+        }
+        Ok(())
+    })();
+    let (_, count, bytes) = COUNTERS.with(|counters| counters.replace((false, 0, 0)));
+    outcome.unwrap();
+    assert_eq!((count, bytes), (0, 0));
+}

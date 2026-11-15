@@ -272,6 +272,22 @@ fn summaries_and_provider_signatures_are_not_relabelled_as_raw_thoughts() {
     )
     .unwrap();
     assert!(output.contains(r#""reasoning_content":"thought"#));
+    for target in [
+        Protocol::GeminiGenerateContent,
+        Protocol::GeminiInteractions,
+    ] {
+        assert!(matches!(
+            request(
+                unsigned,
+                Protocol::OpenAiResponses.into(),
+                target.into(),
+                Strategy::Ir
+            ),
+            Err(Error::Unsupported {
+                feature: "reasoning summary and provider thought differ"
+            })
+        ));
+    }
 }
 
 #[test]

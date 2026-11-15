@@ -105,7 +105,7 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
         self.writer
             .raw(b",\"content\":{\"role\":\"model\",\"parts\":[{\"text\":");
         quoted_span(&mut self.writer, self.aggregate, text);
-        if item.kind == BlockKind::Reasoning {
+        if item.kind == BlockKind::ReasoningSummary {
             self.writer.raw(b",\"thought\":true");
         }
         if let Some(signature) = item.signature {
@@ -185,15 +185,23 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
         self.items[slot].signature_provider = Some(provider);
         Ok(())
     }
-    fn reasoning_supported(&self) -> bool {
-        matches!(
-            self.config.target.protocol,
-            Protocol::AnthropicMessages
-                | Protocol::OpenAiResponses
-                | Protocol::GeminiGenerateContent
-                | Protocol::GeminiInteractions
-        ) || (self.config.target.protocol == Protocol::OpenAiChat
-            && matches!(self.config.target.profile, Profile::OpenAiCompatible(_)))
+    fn reasoning_supported(&self, kind: BlockKind) -> bool {
+        match kind {
+            BlockKind::ReasoningSummary => matches!(
+                self.config.target.protocol,
+                Protocol::OpenAiResponses
+                    | Protocol::GeminiGenerateContent
+                    | Protocol::GeminiInteractions
+            ),
+            BlockKind::Reasoning => {
+                matches!(
+                    self.config.target.protocol,
+                    Protocol::AnthropicMessages | Protocol::OpenAiResponses
+                ) || (self.config.target.protocol == Protocol::OpenAiChat
+                    && matches!(self.config.target.profile, Profile::OpenAiCompatible(_)))
+            }
+            _ => false,
+        }
     }
     pub(super) fn new(
         config: StreamConfig<'a>,
@@ -504,6 +512,11 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
                         quoted_span(&mut self.writer, self.aggregate, item.name);
                         self.writer.raw(b",\"input\":{}}");
                     }
+                    BlockKind::ReasoningSummary => {
+                        return Err(Error::Unsupported {
+                            feature: "reasoning summary in Anthropic",
+                        });
+                    }
                     BlockKind::Refusal => {
                         return Err(Error::Unsupported {
                             feature: "Anthropic refusal content stream",
@@ -513,34 +526,31 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
                 self.end_event();
             }
             Protocol::OpenAiResponses => {
-                self.response_event(b"response.output_item.added")?;
-                self.writer.raw(b",\"output_index\":");
-                number(&mut self.writer, u64::from(item.wire_index));
-                self.writer.raw(b",\"item\":");
-                self.response_item(item, false)?;
-                self.end_event();
-                if item.kind == BlockKind::Reasoning {
-                    self.response_event(b"response.reasoning_summary_part.added")?;
+                if item.group_head == slot {
+                    self.response_event(b"response.output_item.added")?;
                     self.writer.raw(b",\"output_index\":");
                     number(&mut self.writer, u64::from(item.wire_index));
-                    self.writer.raw(b",\"item_id\":");
-                    self.item_id(item);
-                    self.writer.raw(
-                        b",\"summary_index\":0,\"part\":{\"type\":\"summary_text\",\"text\":\"\"}",
-                    );
+                    self.writer.raw(b",\"item\":");
+                    self.response_item(item, false)?;
                     self.end_event();
                 }
-                if item.kind == BlockKind::Text || item.kind == BlockKind::Refusal {
-                    self.response_event(b"response.content_part.added")?;
+                if item.kind != BlockKind::Tool {
+                    self.response_event(if item.kind == BlockKind::ReasoningSummary {
+                        b"response.reasoning_summary_part.added"
+                    } else {
+                        b"response.content_part.added"
+                    })?;
                     self.writer.raw(b",\"output_index\":");
                     number(&mut self.writer, u64::from(item.wire_index));
                     self.writer.raw(b",\"item_id\":");
                     self.item_id(item);
-                    self.writer.raw(b",\"content_index\":0,\"part\":");
-                    self.writer.raw(if item.kind == BlockKind::Text {
-                        b"{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}"
-                    } else {
-                        b"{\"type\":\"refusal\",\"refusal\":\"\"}"
+                    self.response_part_index(item);
+                    self.writer.raw(b",\"part\":");
+                    self.writer.raw(match item.kind {
+                        BlockKind::ReasoningSummary => b"{\"type\":\"summary_text\",\"text\":\"\"}",
+                        BlockKind::Reasoning => b"{\"type\":\"reasoning_text\",\"text\":\"\"}",
+                        BlockKind::Refusal => b"{\"type\":\"refusal\",\"refusal\":\"\"}",
+                        _ => b"{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}",
                     });
                     self.end_event();
                 }
@@ -553,7 +563,12 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
                 self.writer.raw(b",\"step\":");
                 match item.kind {
                     BlockKind::Text => self.writer.raw(b"{\"type\":\"model_output\"}"),
-                    BlockKind::Reasoning => self.writer.raw(b"{\"type\":\"thought\"}"),
+                    BlockKind::ReasoningSummary => self.writer.raw(b"{\"type\":\"thought\"}"),
+                    BlockKind::Reasoning => {
+                        return Err(Error::Unsupported {
+                            feature: "raw thought in Interactions",
+                        });
+                    }
                     BlockKind::Tool => {
                         self.writer.raw(b"{\"type\":\"function_call\",\"id\":");
                         quoted_span(&mut self.writer, self.aggregate, item.id);
@@ -569,6 +584,46 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
                 }
                 self.end_event();
             }
+        }
+        Ok(())
+    }
+    fn response_part_index(&mut self, item: ActiveItem) {
+        self.writer
+            .raw(if item.kind == BlockKind::ReasoningSummary {
+                b",\"summary_index\":"
+            } else {
+                b",\"content_index\":"
+            });
+        number(&mut self.writer, u64::from(item.part_index));
+    }
+    fn response_group_parts(
+        &mut self,
+        item: ActiveItem,
+        kind: Option<BlockKind>,
+    ) -> Result<(), Error> {
+        let count = self.items[..self.state.item_count]
+            .iter()
+            .filter(|member| {
+                member.group_head == item.group_head && kind.is_none_or(|kind| member.kind == kind)
+            })
+            .count();
+        for part in 0..count {
+            let member = self.items[..self.state.item_count]
+                .iter()
+                .find(|member| {
+                    member.group_head == item.group_head
+                        && kind.is_none_or(|kind| member.kind == kind)
+                        && member.part_index as usize == part
+                })
+                .copied()
+                .ok_or(Error::InvalidInput {
+                    field: "Responses content index",
+                    reason: "non-contiguous final parts",
+                })?;
+            if part != 0 {
+                self.writer.byte(b',');
+            }
+            self.response_part(member)?;
         }
         Ok(())
     }
@@ -590,22 +645,53 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
             self.writer
                 .raw(b",\"type\":\"message\",\"role\":\"assistant\",\"content\":[");
             if complete {
-                self.response_part(item)?;
+                self.response_group_parts(item, None)?;
             }
             self.writer.byte(b']');
         } else {
             self.writer.raw(b",\"type\":\"reasoning\",\"summary\":[");
             if complete {
-                self.response_part(item)?;
+                self.response_group_parts(item, Some(BlockKind::ReasoningSummary))?;
+            }
+            self.writer.raw(b"],\"content\":[");
+            if complete {
+                self.response_group_parts(item, Some(BlockKind::Reasoning))?;
             }
             self.writer.byte(b']');
         }
         if complete {
-            self.provider_metadata(item)?;
+            // Signatures belong to the output item. A content group must not
+            // silently discard signatures attached to a later part.
+            let mut signature = None;
+            for member in &self.items[..self.state.item_count] {
+                if member.group_head == item.group_head
+                    && let Some(value) = member.signature
+                {
+                    if let Some((previous, previous_value)) = signature {
+                        let previous: ActiveItem = previous;
+                        if previous.signature_provider != member.signature_provider
+                            || span(self.aggregate, previous_value) != span(self.aggregate, value)
+                        {
+                            return Err(Error::InvalidInput {
+                                field: "signature",
+                                reason: "conflicting output item signatures",
+                            });
+                        }
+                    } else {
+                        signature = Some((*member, value));
+                    }
+                }
+            }
+            if let Some((signed, _)) = signature {
+                self.provider_metadata(signed)?;
+            }
         }
         self.writer.raw(b",\"status\":");
+        let incomplete = self.items[..self.state.item_count]
+            .iter()
+            .any(|member| member.group_head == item.group_head && member.incomplete);
         self.writer.string(if complete {
-            if item.incomplete {
+            if incomplete {
                 b"incomplete"
             } else {
                 b"completed"
@@ -617,12 +703,11 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
         Ok(())
     }
     fn response_part(&mut self, item: ActiveItem) -> Result<(), Error> {
-        self.writer.raw(if item.kind == BlockKind::Reasoning {
-            b"{\"type\":\"summary_text\",\"text\":"
-        } else if item.kind == BlockKind::Refusal {
-            b"{\"type\":\"refusal\",\"refusal\":"
-        } else {
-            b"{\"type\":\"output_text\",\"text\":"
+        self.writer.raw(match item.kind {
+            BlockKind::ReasoningSummary => b"{\"type\":\"summary_text\",\"text\":",
+            BlockKind::Reasoning => b"{\"type\":\"reasoning_text\",\"text\":",
+            BlockKind::Refusal => b"{\"type\":\"refusal\",\"refusal\":",
+            _ => b"{\"type\":\"output_text\",\"text\":",
         });
         self.write_chain(item, true)?;
         if item.kind == BlockKind::Text {
@@ -640,9 +725,9 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
         {
             self.flush_gemini_text(slot)?;
         }
-        if self.items[slot].kind == BlockKind::Reasoning
+        if self.items[slot].kind.is_reasoning()
             && self.config.policy.drop_reasoning
-            && !self.reasoning_supported()
+            && !self.reasoning_supported(self.items[slot].kind)
         {
             self.items[slot].closed = true;
             return Ok(());
@@ -673,66 +758,56 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
                 self.end_event();
             }
             Protocol::OpenAiResponses => {
-                if item.kind == BlockKind::Tool {
-                    self.response_event(b"response.function_call_arguments.done")?;
-                    self.writer.raw(b",\"item_id\":");
-                    self.item_id(item);
-                    self.writer.raw(b",\"output_index\":");
-                    number(&mut self.writer, u64::from(item.wire_index));
-                    self.writer.raw(b",\"arguments\":");
-                    self.write_chain(item, true)?;
-                    self.end_event();
-                } else if item.kind == BlockKind::Text || item.kind == BlockKind::Refusal {
-                    self.response_event(if item.kind == BlockKind::Text {
-                        b"response.output_text.done"
+                self.response_event(match item.kind {
+                    BlockKind::Tool => b"response.function_call_arguments.done",
+                    BlockKind::ReasoningSummary => b"response.reasoning_summary_text.done",
+                    BlockKind::Reasoning => b"response.reasoning_text.done",
+                    BlockKind::Refusal => b"response.refusal.done",
+                    BlockKind::Text => b"response.output_text.done",
+                })?;
+                self.writer.raw(b",\"item_id\":");
+                self.item_id(item);
+                self.writer.raw(b",\"output_index\":");
+                number(&mut self.writer, u64::from(item.wire_index));
+                if item.kind != BlockKind::Tool {
+                    self.response_part_index(item);
+                }
+                self.writer.raw(match item.kind {
+                    BlockKind::Tool => b",\"arguments\":",
+                    BlockKind::Refusal => b",\"refusal\":",
+                    _ => b",\"text\":",
+                });
+                self.write_chain(item, true)?;
+                self.end_event();
+                if item.kind != BlockKind::Tool {
+                    self.response_event(if item.kind == BlockKind::ReasoningSummary {
+                        b"response.reasoning_summary_part.done"
                     } else {
-                        b"response.refusal.done"
+                        b"response.content_part.done"
                     })?;
                     self.writer.raw(b",\"item_id\":");
                     self.item_id(item);
                     self.writer.raw(b",\"output_index\":");
                     number(&mut self.writer, u64::from(item.wire_index));
-                    self.writer.raw(b",\"content_index\":0,");
-                    self.writer.raw(if item.kind == BlockKind::Text {
-                        b"\"text\":"
-                    } else {
-                        b"\"refusal\":"
-                    });
-                    self.write_chain(item, true)?;
-                    self.end_event();
-                    self.response_event(b"response.content_part.done")?;
-                    self.writer.raw(b",\"item_id\":");
-                    self.item_id(item);
-                    self.writer.raw(b",\"output_index\":");
-                    number(&mut self.writer, u64::from(item.wire_index));
-                    self.writer.raw(b",\"content_index\":0,\"part\":");
+                    self.response_part_index(item);
+                    self.writer.raw(b",\"part\":");
                     self.response_part(item)?;
                     self.end_event();
                 }
-                if item.kind == BlockKind::Reasoning {
-                    self.response_event(b"response.reasoning_summary_text.done")?;
+                if self.items[..self.state.item_count]
+                    .iter()
+                    .enumerate()
+                    .all(|(index, member)| {
+                        member.group_head != item.group_head || member.closed || index == slot
+                    })
+                {
+                    self.response_event(b"response.output_item.done")?;
                     self.writer.raw(b",\"output_index\":");
                     number(&mut self.writer, u64::from(item.wire_index));
-                    self.writer.raw(b",\"item_id\":");
-                    self.item_id(item);
-                    self.writer.raw(b",\"summary_index\":0,\"text\":");
-                    self.write_chain(item, true)?;
-                    self.end_event();
-                    self.response_event(b"response.reasoning_summary_part.done")?;
-                    self.writer.raw(b",\"output_index\":");
-                    number(&mut self.writer, u64::from(item.wire_index));
-                    self.writer.raw(b",\"item_id\":");
-                    self.item_id(item);
-                    self.writer.raw(b",\"summary_index\":0,\"part\":");
-                    self.response_part(item)?;
+                    self.writer.raw(b",\"item\":");
+                    self.response_item(self.items[item.group_head], true)?;
                     self.end_event();
                 }
-                self.response_event(b"response.output_item.done")?;
-                self.writer.raw(b",\"output_index\":");
-                number(&mut self.writer, u64::from(item.wire_index));
-                self.writer.raw(b",\"item\":");
-                self.response_item(item, true)?;
-                self.end_event();
             }
             Protocol::GeminiGenerateContent if item.kind == BlockKind::Tool => {
                 self.writer.raw(b"data: {\"candidates\":[{\"index\":");
@@ -1117,6 +1192,7 @@ impl Sink for Emitter<'_, '_, '_, '_> {
             id,
             name,
             provider_block,
+            group_head: slot,
             wire_index: slot as u32,
             ..ActiveItem::EMPTY
         };
@@ -1338,8 +1414,11 @@ impl Sink for Emitter<'_, '_, '_, '_> {
         if matches!(
             self.config.source.protocol,
             Protocol::AnthropicMessages | Protocol::OpenAiResponses | Protocol::GeminiInteractions
-        ) && self.lookup(key, None).is_some()
-        {
+        ) && self.lookup(key, None).is_some_and(|slot| {
+            !(self.config.source.protocol == Protocol::OpenAiResponses
+                && kind.is_reasoning()
+                && self.items[slot].kind.is_reasoning())
+        }) {
             return Err(Error::InvalidInput {
                 field: "block start",
                 reason: "index reused with a different block type",
@@ -1357,8 +1436,8 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                 feature: "multiple stream choices",
             });
         }
-        if kind == BlockKind::Reasoning
-            && !self.reasoning_supported()
+        if kind.is_reasoning()
+            && !self.reasoning_supported(kind)
             && !self.config.policy.drop_reasoning
         {
             return Err(Error::Unsupported {
@@ -1429,21 +1508,90 @@ impl Sink for Emitter<'_, '_, '_, '_> {
         } else {
             (Span::EMPTY, Span::EMPTY)
         };
-        let output_id = item_id.map(|id| self.store(id)).transpose()?;
+        let group_head = if self.config.source.protocol == Protocol::OpenAiResponses
+            && self.config.target.protocol == Protocol::OpenAiResponses
+        {
+            self.items[..slot]
+                .iter()
+                .position(|item| item.key.index == key.index && item.key.choice == key.choice)
+                .unwrap_or(slot)
+        } else {
+            slot
+        };
+        let (wire_index, part_index, output_id) = if group_head != slot {
+            let head = self.items[group_head];
+            if self.items[..slot]
+                .iter()
+                .any(|item| item.group_head == group_head && item.closed)
+            {
+                return Err(Error::InvalidInput {
+                    field: "output item",
+                    reason: "content added after item closed",
+                });
+            }
+            if head.kind.is_reasoning() != kind.is_reasoning()
+                || head.kind == BlockKind::Tool
+                || kind == BlockKind::Tool
+            {
+                return Err(Error::InvalidInput {
+                    field: "output item",
+                    reason: "inconsistent content kinds",
+                });
+            }
+            if let (Some(expected), Some(provided)) = (head.output_id, item_id) {
+                let equal = match provided {
+                    Text::Utf8(bytes) => bytes == span(self.aggregate, expected),
+                    Text::Json(text) => text
+                        .bytes()
+                        .eq(span(self.aggregate, expected).iter().copied()),
+                };
+                if !equal {
+                    return Err(Error::InvalidInput {
+                        field: "item_id",
+                        reason: "output item identity changed",
+                    });
+                }
+            }
+            (head.wire_index, key.part, head.output_id)
+        } else {
+            let groups = if self.config.target.protocol == Protocol::OpenAiResponses {
+                self.items[..slot]
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, item)| item.group_head == *index)
+                    .count()
+            } else {
+                slot
+            };
+            let part_index = if self.config.source.protocol == Protocol::OpenAiResponses
+                && self.config.target.protocol == Protocol::OpenAiResponses
+            {
+                key.part
+            } else {
+                0
+            };
+            (
+                groups as u32,
+                part_index,
+                item_id.map(|id| self.store(id)).transpose()?,
+            )
+        };
         self.items[slot] = ActiveItem {
             used: true,
             output_id,
             key,
             kind,
-            wire_index: slot as u32,
+            wire_index,
+            group_head,
+            part_index,
             id,
             name,
             ..ActiveItem::EMPTY
         };
         self.state.item_count += 1;
-        if kind == BlockKind::Reasoning
+        if kind.is_reasoning()
             && self.config.policy.drop_reasoning
-            && !self.reasoning_supported()
+            && !self.reasoning_supported(kind)
         {
             return Ok(());
         }
@@ -1482,14 +1630,6 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                 reason: "complete provider block has no deltas",
             });
         }
-        if kind == BlockKind::Reasoning
-            && self.config.policy.drop_reasoning
-            && !self.reasoning_supported()
-        {
-            self.state.report.dropped_reasoning =
-                self.state.report.dropped_reasoning.saturating_add(1);
-            return Ok(());
-        }
         self.items[slot].content_length = self.items[slot]
             .content_length
             .checked_add(text.len())
@@ -1500,6 +1640,14 @@ impl Sink for Emitter<'_, '_, '_, '_> {
             || kind == BlockKind::Tool
         {
             self.append(slot, text)?;
+        }
+        if kind.is_reasoning()
+            && self.config.policy.drop_reasoning
+            && !self.reasoning_supported(kind)
+        {
+            self.state.report.dropped_reasoning =
+                self.state.report.dropped_reasoning.saturating_add(1);
+            return Ok(());
         }
         if self.config.target.protocol == Protocol::GeminiGenerateContent && kind != BlockKind::Tool
         {
@@ -1556,17 +1704,16 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                 self.response_event(match kind {
                     BlockKind::Tool => b"response.function_call_arguments.delta",
                     BlockKind::Refusal => b"response.refusal.delta",
-                    BlockKind::Reasoning => b"response.reasoning_summary_text.delta",
+                    BlockKind::ReasoningSummary => b"response.reasoning_summary_text.delta",
+                    BlockKind::Reasoning => b"response.reasoning_text.delta",
                     _ => b"response.output_text.delta",
                 })?;
                 self.writer.raw(b",\"item_id\":");
                 self.item_id(item);
                 self.writer.raw(b",\"output_index\":");
                 number(&mut self.writer, u64::from(item.wire_index));
-                if kind == BlockKind::Reasoning {
-                    self.writer.raw(b",\"summary_index\":0");
-                } else if kind != BlockKind::Tool {
-                    self.writer.raw(b",\"content_index\":0");
+                if kind != BlockKind::Tool {
+                    self.response_part_index(item);
                 }
                 self.writer.raw(b",\"delta\":");
                 text.write(&mut self.writer);
@@ -1578,7 +1725,7 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                 self.writer
                     .raw(b",\"content\":{\"role\":\"model\",\"parts\":[{\"text\":");
                 text.write(&mut self.writer);
-                if kind == BlockKind::Reasoning {
+                if kind == BlockKind::ReasoningSummary {
                     self.writer.raw(b",\"thought\":true");
                 }
                 self.writer.raw(b"}]}}]}\n\n");
@@ -1591,13 +1738,13 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                 self.writer.raw(b",\"delta\":");
                 self.writer.raw(match kind {
                     BlockKind::Tool => b"{\"type\":\"arguments_delta\",\"arguments\":",
-                    BlockKind::Reasoning => {
+                    BlockKind::ReasoningSummary => {
                         b"{\"type\":\"thought_summary\",\"content\":{\"type\":\"text\",\"text\":"
                     }
                     _ => b"{\"type\":\"text\",\"text\":",
                 });
                 text.write(&mut self.writer);
-                if kind == BlockKind::Reasoning {
+                if kind == BlockKind::ReasoningSummary {
                     self.writer.byte(b'}');
                 }
                 self.writer.byte(b'}');
@@ -1646,7 +1793,7 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                     self.provider_metadata(item)?;
                     self.writer.raw(b"}]");
                 } else {
-                    self.writer.raw(if item.kind == BlockKind::Reasoning {
+                    self.writer.raw(if item.kind.is_reasoning() {
                         b"\"reasoning_details\":[{\"type\":\"signature_delta\",\"index\":"
                     } else {
                         b"\"content_details\":[{\"type\":\"signature_delta\",\"index\":"
@@ -1986,10 +2133,15 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                 self.writer.raw(b",\"response\":");
                 self.response_object_header(status);
                 self.writer.raw(b",\"output\":[");
+                let mut first = true;
                 for slot in 0..self.state.item_count {
-                    if slot != 0 {
+                    if self.items[slot].group_head != slot {
+                        continue;
+                    }
+                    if !first {
                         self.writer.byte(b',');
                     }
+                    first = false;
                     self.response_item(self.items[slot], true)?;
                 }
                 self.writer.raw(b"],\"usage\":");

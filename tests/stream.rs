@@ -983,7 +983,7 @@ fn vendor_reasoning_requires_an_explicit_profile_and_never_leaks_into_standard_c
         input.as_bytes(),
         config(
             Protocol::OpenAiChat,
-            Protocol::GeminiGenerateContent,
+            Protocol::OpenAiResponses,
             Strategy::Auto,
         ),
         1,
@@ -998,25 +998,25 @@ fn vendor_reasoning_requires_an_explicit_profile_and_never_leaks_into_standard_c
     ));
     let mut profiled = config(
         Protocol::OpenAiChat,
-        Protocol::GeminiGenerateContent,
+        Protocol::OpenAiResponses,
         Strategy::Auto,
     );
     profiled.source.profile = zconv::Profile::OpenAiCompatible("example-provider");
-    let google = run(input.as_bytes(), profiled, 1, 1).unwrap();
-    assert!(String::from_utf8_lossy(&google.0).contains("\"thought\":true"));
+    let responses = run(input.as_bytes(), profiled, 1, 1).unwrap();
+    assert!(String::from_utf8_lossy(&responses.0).contains("response.reasoning_text.delta"));
     let mut target = config(
-        Protocol::GeminiGenerateContent,
+        Protocol::OpenAiResponses,
         Protocol::OpenAiChat,
         Strategy::Auto,
     );
     target.target.profile = zconv::Profile::OpenAiCompatible("example-provider");
-    let compatible = run(&google.0, target, 1, 1).unwrap();
+    let compatible = run(&responses.0, target, 1, 1).unwrap();
     assert!(String::from_utf8_lossy(&compatible.0).contains("\"reasoning_content\":"));
     assert!(matches!(
         run(
-            &google.0,
+            &responses.0,
             config(
-                Protocol::GeminiGenerateContent,
+                Protocol::OpenAiResponses,
                 Protocol::OpenAiChat,
                 Strategy::Auto
             ),

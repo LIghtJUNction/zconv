@@ -350,7 +350,7 @@ fn raw_lifetime_observations_are_preserved_and_standard_encoding_rejects_conflic
 
 #[test]
 fn responses_reasoning_parts_have_independent_ir_lifecycles() {
-    let mut encoder = Encoder::new(Protocol::OpenAiResponses, Protocol::OpenAiChat);
+    let mut encoder = Encoder::new(Protocol::OpenAiResponses, Protocol::OpenAiResponses);
     let mut output = String::new();
     for payload in [
         br#"{"type":"response.created","response":{"id":"r","model":"m"}}"#.as_slice(),
@@ -362,8 +362,8 @@ fn responses_reasoning_parts_have_independent_ir_lifecycles() {
         br#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","summary":[{"type":"summary_text","text":"thought"}]}}"#,
         br#"{"type":"response.completed","response":{"id":"r","status":"completed","output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"thought"}]}]}}"#,
     ] { output += &encoder.frame(Protocol::OpenAiResponses, payload).unwrap(); }
-    assert!(output.contains("\"reasoning_content\":\"thought\""));
-    assert!(output.contains("[DONE]"));
+    assert!(output.contains("response.reasoning_summary_text.delta"));
+    assert!(output.contains("response.completed"));
 }
 
 #[test]
@@ -437,13 +437,13 @@ fn explicit_signature_origin_and_responses_reasoning_keep_original_lifecycle() {
                 Event::EMPTY,
                 Event {
                     kind: EventKind::BlockStart,
-                    block: BlockKind::Reasoning,
+                    block: BlockKind::ReasoningSummary,
                     item_id: span(13, 3),
                     ..Event::EMPTY
                 },
                 Event {
                     kind: EventKind::Delta,
-                    block: BlockKind::Reasoning,
+                    block: BlockKind::ReasoningSummary,
                     a: span(0, 4),
                     ..Event::EMPTY
                 },
@@ -516,12 +516,12 @@ fn gemini_signature_and_continuation_are_in_their_owning_wire_objects() {
                 Event::EMPTY,
                 Event {
                     kind: EventKind::BlockStart,
-                    block: BlockKind::Reasoning,
+                    block: BlockKind::ReasoningSummary,
                     ..Event::EMPTY
                 },
                 Event {
                     kind: EventKind::Delta,
-                    block: BlockKind::Reasoning,
+                    block: BlockKind::ReasoningSummary,
                     a: span(0, 4),
                     ..Event::EMPTY
                 },

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0
+
+- Add allocation-free `api` contracts for Batch, Files, Embeddings and Images, including typed embedding builders, binary multipart uploads, JSONL envelopes, pagination, endpoint paths and image SSE framing. Known fields are validated; unknown fields remain borrowed and are preserved. These are locally owned contracts with no upstream SDK dependency.
+- Accept Codex/Agents-style Responses input with omitted/null message content, null reasoning summaries and annotations, omitted/null image detail, `text.verbosity`, object-valued function arguments and typed tool-result arrays. Empty content stays empty; no answer or argument is invented.
+- Preserve ordered Chat-compatible `reasoning`/`reasoning_content` strings or arrays and distinguish native Responses raw reasoning content from summaries. Preserve audio/video URL blocks and representable nested tool results across Chat, Responses, Anthropic and Gemini. Unrepresentable native media and provider signatures retain explicit errors.
+- Add typed request `StreamOptions` and transport metadata for targets without a matching request field. Add opt-in continuous usage emission for Chat/Completions without changing the final-only default or inventing absent counts.
+- Preserve Anthropic streaming redacted thinking, citations, server-owned tools/results and detailed usage in explicit provider-owned events. A server-owned tool event does not request local execution; unsupported cross-provider translation fails.
+- Distinguish raw reasoning from summaries in streaming IR and Responses events. A summary is never silently relabelled as raw thought.
+- Add resource, compatibility, fragmentation/backpressure and allocation regressions, a resource example and a resource benchmark. The core remains `no_std`, safe Rust, allocation-free and dependency-free with Rust 1.99.1 MSRV.
+
+Compatibility: public IR fields/variants and stream event variants have been added.
+Consumers with exhaustive matches or struct literals must update. Conversation
+`Protocol` variants remain unchanged; resource contracts live under `api`.
+
 ## 0.3.0
 
 - Add caller-owned `EventEncoderState` and per-call `EventEncoderBuffers`; buffer growth no longer requires a self-referential application object. Capacity retries roll back state without replaying committed output.

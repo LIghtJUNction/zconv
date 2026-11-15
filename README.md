@@ -9,7 +9,7 @@ Input is borrowed. Every output buffer, JSON index, IR arena and stream workspac
 belongs to the caller. There is no allocator, runtime, I/O, global cache or
 background work in the library.
 
-**MSRV: Rust 1.74.0.** The same crate builds for Linux, macOS, Windows, aarch64,
+**MSRV: Rust 1.99.1.** The same crate builds for Linux, macOS, Windows, aarch64,
 WASM and bare-metal targets. Benchmarks, examples and tests may use `std`.
 
 ## Own stream state without borrowing buffers
@@ -24,10 +24,10 @@ when the application is ready to publish a successful terminal response.
 
 ## Start here
 
-Use the repository source until the first registry release is available:
+Install the current minor release:
 
 ```sh
-cargo add zconv@0.3
+cargo add zconv@0.4
 ```
 
 This complete request conversion is also available as
@@ -117,14 +117,39 @@ select IR; for example, most nonstream media paths currently use IR.
 
 The [support and fidelity matrix](docs/SUPPORT.md) distinguishes faithful
 conversion, caller-supplied context, explicit downgrade and unrepresentable
-features for each protocol and operation. Streamed media and managed server/agent
-tool steps are outside the first release's supported stream subset. Unknown
-versions and unsupported features return errors.
+features for each protocol and operation. Anthropic citation, redacted-thinking,
+server-tool and detailed-usage events have an explicit same-origin representation;
+they do not become local function calls. Other unsupported event families return
+errors.
 
 Gemini Interactions is not an alias for GenerateContent. Stored response,
 interaction and provider file handles retain their source namespace. An OpenAI
 compatible provider must select an explicit `Profile`; its extensions are not
 automatically injected into another provider.
+
+## Resource APIs
+
+`api` provides independently implemented wire contracts for Batch, Files,
+Embeddings and Images. These are resource messages, not new conversation
+protocols. They use the same caller-owned JSON tokens and output buffers:
+
+| Resource | Implemented wire operations |
+|---|---|
+| Batch | Create/retrieve/list/cancel metadata, input/output JSONL envelopes, error records and pagination |
+| Files | Multipart upload with binary contents and expiry, retrieve/list/delete metadata, content-download endpoint |
+| Embeddings | Text/token batches, dimensions, float/base64 encoding, typed request/response builders and borrowed vectors |
+| Images | Generation and JSON/multipart edits, response metadata/usage, partial/completed image SSE events; legacy variation wire format |
+
+`api::parse` validates known fields and retains unknown fields. `Document::encode`
+preserves validated JSON bytes. `encode_object` constructs and validates resource
+objects, while `EmbeddingsRequest`, `EmbeddingsResponse` and `FileUpload` provide
+typed builders. `Endpoint` writes method/path metadata; the caller performs HTTP,
+authentication, retries, pagination and provider operations. File content is
+arbitrary bytes and deliberately does not pass through a JSON parser.
+
+See [resource contracts and examples](docs/RESOURCE_APIS.md) and the runnable
+[`examples/resources.rs`](examples/resources.rs). No upstream SDK is linked or
+re-exported, so adding these contracts does not change the dependency graph.
 
 ## Strict fidelity and explicit context
 
@@ -146,6 +171,12 @@ Responses output item IDs. No clock or random ID generator is hidden inside
 the converter. GenerateContent model/stream selection is returned as transport
 metadata because those settings do not belong in its JSON request body.
 
+Chat-compatible reasoning accepts `reasoning_content` or `reasoning`, including
+ordered string arrays, only under an explicit compatible profile. Raw reasoning
+maps to Responses `reasoning.content`; summaries stay in `reasoning.summary`.
+Targets that cannot preserve that distinction reject the conversion unless the
+caller explicitly drops reasoning. Signatures retain their source identity.
+
 ## Incremental streams and memory
 
 [`examples/stream.rs`](examples/stream.rs) feeds seven-byte input fragments into a
@@ -162,6 +193,14 @@ SSE framing handles CR, LF, CRLF, BOM, comments, multiple data lines and arbitra
 network splits. Output backpressure and workspace growth preserve consumed
 bytes and never replay committed events. Stream routing is fixed before the
 first output.
+
+`StreamConfig::usage_emission = UsageEmission::Continuous` emits currently
+observed usage alongside Chat/Completions chunks and emits usage-only updates.
+The default remains `Final`. Cumulative values replace prior values; they are
+never summed per chunk. Missing counts remain unknown. Request `stream_options`
+are typed in IR and returned as `EncodeReport::transport_stream_options` for
+targets without a matching request field; the application selects the stream
+encoder's output mode from that preference.
 
 Text paths without target snapshots do not retain the entire answer. Tool
 arguments need bounded storage for validation at completion. Responses targets
@@ -180,15 +219,17 @@ limits. Duplicate keys, including escape-equivalent names, are rejected.
 
 ```sh
 cargo test --all-targets --locked
-cargo +1.74.0 test --all-targets --locked
+cargo +1.99.1 test --all-targets --locked
 cargo clippy --all-targets -- -D warnings
 cargo run --example convert
 cargo run --example edit_ir
 cargo run --example stream
 cargo run --example memory
+cargo run --example resources
 cargo bench --bench convert -- --full
 cargo bench --bench json -- --full
 cargo bench --bench stream -- --full
+cargo bench --bench resources -- --full
 python3 scripts/check_package.py
 ```
 
@@ -206,7 +247,7 @@ checks and a package audit.
 
 ## Sources and scope
 
-Official protocol documentation was checked on **2026-11-10**. Adapter versions,
+Official protocol documentation was checked on **2026-11-15**. Adapter versions,
 source URLs and interpretation rules are recorded in [SOURCES.md](docs/SOURCES.md).
 The historical design study uses
 [cortexfs-protocol at commit 84f349c97bc2f6a611109686a02e21de3800042a](https://github.com/LIghtJUNction/cortexfs/tree/84f349c97bc2f6a611109686a02e21de3800042a/crates/cortexfs-protocol).

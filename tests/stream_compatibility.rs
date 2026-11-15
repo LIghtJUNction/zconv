@@ -94,6 +94,269 @@ fn usage_values(wire: &[u8]) -> Vec<Option<u64>> {
     values
 }
 
+fn response_reasoning(raw: bool, summaries: usize) -> Vec<u8> {
+    let mut frames = vec![
+        r#"{"type":"response.created","response":{"id":"r1","model":"m","created_at":7}}"#.to_string(),
+        r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"reason0","summary":[],"content":[]}}"#.to_string(),
+    ];
+    if raw {
+        frames.extend([
+            r#"{"type":"response.content_part.added","output_index":0,"content_index":0,"item_id":"reason0","part":{"type":"reasoning_text","text":""}}"#.to_string(),
+            r#"{"type":"response.reasoning_text.delta","output_index":0,"content_index":0,"item_id":"reason0","delta":"raw thought"}"#.to_string(),
+            r#"{"type":"response.reasoning_text.done","output_index":0,"content_index":0,"item_id":"reason0","text":"raw thought"}"#.to_string(),
+            r#"{"type":"response.content_part.done","output_index":0,"content_index":0,"item_id":"reason0","part":{"type":"reasoning_text","text":"raw thought"}}"#.to_string(),
+        ]);
+    }
+    for index in 0..summaries {
+        frames.push(format!(r#"{{"type":"response.reasoning_summary_part.added","output_index":0,"summary_index":{index},"item_id":"reason0","part":{{"type":"summary_text","text":""}}}}"#));
+        frames.push(format!(r#"{{"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":{index},"item_id":"reason0","delta":"summary {index}"}}"#));
+        frames.push(format!(r#"{{"type":"response.reasoning_summary_part.done","output_index":0,"summary_index":{index},"item_id":"reason0","part":{{"type":"summary_text","text":"summary {index}"}}}}"#));
+    }
+    let summary = (0..summaries)
+        .map(|index| format!(r#"{{"type":"summary_text","text":"summary {index}"}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let content = if raw {
+        r#"{"type":"reasoning_text","text":"raw thought"}"#
+    } else {
+        ""
+    };
+    let item = format!(
+        r#"{{"type":"reasoning","id":"reason0","summary":[{summary}],"content":[{content}],"status":"completed"}}"#
+    );
+    frames.push(format!(
+        r#"{{"type":"response.output_item.done","output_index":0,"item":{item}}}"#
+    ));
+    frames.push(format!(r#"{{"type":"response.completed","response":{{"id":"r1","status":"completed","output":[{item}],"usage":{{"input_tokens":5,"output_tokens":3,"total_tokens":8}}}}}}"#));
+    frames
+        .into_iter()
+        .map(|frame| format!("data: {frame}\n\n"))
+        .collect::<String>()
+        .into_bytes()
+}
+
+#[test]
+fn responses_raw_thought_and_summary_keep_distinct_parts_and_one_output_item() {
+    let input = response_reasoning(true, 2);
+    let mut baseline = None;
+    for strategy in [Strategy::Direct, Strategy::Ir] {
+        for split in [1, 17, input.len()] {
+            let result = run(
+                &input,
+                config(
+                    Protocol::OpenAiResponses,
+                    Protocol::OpenAiResponses,
+                    strategy,
+                ),
+                split,
+                1,
+            )
+            .unwrap();
+            let output = String::from_utf8(result.0).unwrap();
+            assert_eq!(
+                output
+                    .matches("event: response.output_item.added\n")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                output.matches("event: response.output_item.done\n").count(),
+                1
+            );
+            assert!(output.contains("event: response.reasoning_text.delta\n"));
+            assert!(output.contains("event: response.reasoning_summary_text.delta\n"));
+            assert!(output.contains("\"summary_index\":1"));
+            let final_json = output
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .next_back()
+                .unwrap();
+            let mut tokens = [Token::EMPTY; 1024];
+            let document =
+                json::parse(final_json.as_bytes(), &mut tokens, Default::default()).unwrap();
+            let items = document
+                .root()
+                .get("response")
+                .unwrap()
+                .get("output")
+                .unwrap();
+            assert_eq!(items.array().count(), 1);
+            let item = items.array().next().unwrap();
+            assert!(
+                item.get("id")
+                    .unwrap()
+                    .as_string()
+                    .unwrap()
+                    .eq_str("reason0")
+            );
+            let summary = item.get("summary").unwrap();
+            assert_eq!(summary.array().count(), 2);
+            for (index, part) in summary.array().enumerate() {
+                assert!(
+                    part.get("type")
+                        .unwrap()
+                        .as_string()
+                        .unwrap()
+                        .eq_str("summary_text")
+                );
+                assert!(
+                    part.get("text")
+                        .unwrap()
+                        .as_string()
+                        .unwrap()
+                        .eq_str(&format!("summary {index}"))
+                );
+            }
+            let content = item.get("content").unwrap();
+            assert_eq!(content.array().count(), 1);
+            let thought = content.array().next().unwrap();
+            assert!(
+                thought
+                    .get("type")
+                    .unwrap()
+                    .as_string()
+                    .unwrap()
+                    .eq_str("reasoning_text")
+            );
+            assert!(
+                thought
+                    .get("text")
+                    .unwrap()
+                    .as_string()
+                    .unwrap()
+                    .eq_str("raw thought")
+            );
+            let replayed = run(
+                output.as_bytes(),
+                config(
+                    Protocol::OpenAiResponses,
+                    Protocol::OpenAiResponses,
+                    strategy,
+                ),
+                1,
+                3,
+            )
+            .unwrap();
+            assert_eq!(replayed.0, output.as_bytes());
+            if let Some(ref baseline) = baseline {
+                assert_eq!(&output, baseline);
+            } else {
+                baseline = Some(output);
+            }
+        }
+    }
+}
+
+#[test]
+fn reasoning_semantics_are_explicit_and_loss_requires_policy() {
+    let raw_payload = br#"{"type":"response.reasoning_text.delta","output_index":0,"content_index":0,"delta":"raw"}"#;
+    let summary_payload = br#"{"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"summary"}"#;
+    for (payload, expected) in [
+        (raw_payload.as_slice(), BlockKind::Reasoning),
+        (summary_payload.as_slice(), BlockKind::ReasoningSummary),
+    ] {
+        let mut tokens = [Token::EMPTY; 128];
+        let mut events = [Event::EMPTY; 8];
+        let count = decode_event(
+            Protocol::OpenAiResponses,
+            payload,
+            &mut tokens,
+            &mut events,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(events[0].block, expected);
+    }
+    for strategy in [Strategy::Direct, Strategy::Ir] {
+        let mut raw_chat = config(Protocol::OpenAiResponses, Protocol::OpenAiChat, strategy);
+        raw_chat.target.profile = zconv::Profile::OpenAiCompatible("reasoning-provider");
+        let raw = response_reasoning(true, 0);
+        let chat = run(&raw, raw_chat, 1, 1).unwrap();
+        assert!(String::from_utf8_lossy(&chat.0).contains("\"reasoning_content\":\"raw thought\""));
+        let summary = response_reasoning(false, 1);
+        assert!(matches!(
+            run(&summary, raw_chat, 1, 1).unwrap_err().0,
+            Error::Unsupported {
+                feature: "reasoning stream target"
+            }
+        ));
+        let google = config(
+            Protocol::OpenAiResponses,
+            Protocol::GeminiGenerateContent,
+            Strategy::Ir,
+        );
+        assert!(matches!(
+            run(&raw, google, 1, 1).unwrap_err().0,
+            Error::Unsupported {
+                feature: "reasoning stream target"
+            }
+        ));
+        let google_summary = run(&summary, google, 1, 1).unwrap();
+        assert!(String::from_utf8_lossy(&google_summary.0).contains("\"thought\":true"));
+        raw_chat.policy.drop_reasoning = true;
+        let dropped = run(&summary, raw_chat, 1, 1).unwrap();
+        assert_eq!(dropped.2.dropped_reasoning, 1);
+        assert!(!String::from_utf8_lossy(&dropped.0).contains("summary 0"));
+    }
+    let bad = String::from_utf8(response_reasoning(true, 0))
+        .unwrap()
+        .replace("\"text\":\"raw thought\"", "\"text\":\"bad snapshot\"");
+    assert!(matches!(
+        run(
+            bad.as_bytes(),
+            config(
+                Protocol::OpenAiResponses,
+                Protocol::OpenAiResponses,
+                Strategy::Ir
+            ),
+            1,
+            1
+        )
+        .unwrap_err()
+        .0,
+        Error::InvalidInput {
+            field: "final snapshot",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn chat_reasoning_aliases_are_profiled_and_cannot_double_append() {
+    let wire = concat!(
+        "data: {\"id\":\"r1\",\"model\":\"m\",\"created\":7,\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"thought\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    for strategy in [Strategy::Direct, Strategy::Ir] {
+        let mut config = config(Protocol::OpenAiChat, Protocol::OpenAiChat, strategy);
+        config.source.profile = zconv::Profile::OpenAiCompatible("reasoning-provider");
+        config.target = config.source;
+        config.context.initial_usage = Usage::default();
+        let converted = run(wire.as_bytes(), config, 1, 1).unwrap();
+        assert!(
+            String::from_utf8_lossy(&converted.0).contains("\"reasoning_content\":\"thought\"")
+        );
+        let duplicate = wire.replace(
+            "\"reasoning\":\"thought\"",
+            "\"reasoning\":\"thought\",\"reasoning_content\":\"thought\"",
+        );
+        let failure = run(duplicate.as_bytes(), config, 1, 1).unwrap_err();
+        assert!(matches!(
+            failure.0,
+            Error::InvalidInput {
+                field: "reasoning_content",
+                reason: "multiple reasoning field aliases"
+            }
+        ));
+        assert!(
+            failure.1.is_empty(),
+            "conflicting source event must not publish partial output"
+        );
+    }
+}
+
 #[test]
 fn continuous_usage_is_emitted_during_direct_and_ir_streams() {
     let mut baseline = None;

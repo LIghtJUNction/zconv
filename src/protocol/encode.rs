@@ -432,7 +432,8 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                                 && ((kind == ReasoningKind::Thought
                                     && matches!(
                                         self.target.protocol,
-                                        Protocol::GeminiInteractions
+                                        Protocol::GeminiGenerateContent
+                                            | Protocol::GeminiInteractions
                                     ))
                                     || (kind == ReasoningKind::Summary
                                         && matches!(

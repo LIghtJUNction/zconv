@@ -33,6 +33,7 @@
 //! decode, inspect and edit IR explicitly, or [`stream::StreamConverter`] for
 //! resumable SSE conversion with output backpressure.
 
+pub mod api;
 mod convert;
 pub mod direct;
 pub mod ir;

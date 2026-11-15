@@ -57,18 +57,45 @@ The transport framing for all adapters is SSE. Gemini GenerateContent uses the A
 |---|---|---|
 | OpenAI Completions | Text choices, integer indices, finish reasons, usage, `[DONE]`, error envelopes | Tool calls, media and non-null logprobs cannot be represented by this text protocol. |
 | OpenAI Chat Completions | Text/refusal deltas, new `tool_calls`, legacy `function_call` with caller ID, multiple choices, usage and `[DONE]` | A tool header must supply a complete function name before its argument deltas. Unknown vendor fields require an implemented profile. |
-| OpenAI Responses | Created lifecycle, text/refusal content parts, function-call items and arguments, final snapshots, usage and completion/incomplete/failure status | Reasoning summary snapshot variants, server-side tools and streamed media are rejected. Complete final snapshots are emitted when this is the target. |
-| Anthropic Messages | Message/content-block lifecycle, text, tool input JSON fragments, thinking and same-origin signatures, cumulative usage, stops, ping and errors | Unsupported server-tool blocks, citation payloads and detailed usage breakdowns are rejected. Multiple choices cannot be encoded. |
+| OpenAI Responses | Created lifecycle, text/refusal content parts, raw reasoning and summary parts, function-call items and arguments, final snapshots, usage and completion/incomplete/failure status | Server-side tools and streamed media outside the declared subset are rejected. Complete final snapshots are emitted when this is the target. |
+| Anthropic Messages | Message/content-block lifecycle, text, tool input JSON fragments, thinking/signatures, redacted thinking, citations, server tools/results, detailed usage, stops, ping and errors | Provider-only content requires the same source/target Format; multiple choices cannot be encoded. |
 | Gemini GenerateContent | Candidates and indices, text/thought parts, complete function-call objects, finish reasons, usage and stream EOF | Streamed media, server-tool parts, function-bound signatures and partial-argument extension schemas are rejected. |
 | Gemini Interactions v1 | Independent `interaction.created`, `step.start/delta/stop`, `interaction.completed` model-output, thought and function-call steps; usage/errors/final statuses | Agent/server-tool steps and streamed media are rejected. The older content-event schema is not accepted as v1. |
 
 These rows describe stream features, not a promise that every target can express every source feature. Multiple choices are representable in Chat, Completions and GenerateContent. Anthropic, Responses and Interactions reject nonzero choice indices. Refusal deltas are representable in Chat and Responses. Textual reasoning can be represented in Anthropic, GenerateContent, Interactions and explicitly profiled compatible Chat. Opaque signatures cannot cross provider/profile identities.
+
+`BlockKind::Reasoning` is raw thought; `ReasoningSummary` is a summary. Responses
+raw reasoning uses `reasoning_text` and content indexes, while summary text uses
+its separate summary indexes. Items retain both parts in final snapshots. A target
+that only represents raw thought cannot silently receive a summary, and a target
+that only represents summaries cannot silently receive raw thought. The caller
+may explicitly permit reasoning loss under the normal policy.
+
+`EventKind::ProviderBlock`, `ProviderDelta` and `ProviderUsage` preserve declared
+Anthropic-only payloads as validated raw JSON with source provenance. They are
+not ordinary function events. In particular, `server_tool_use` is work performed
+by the provider and must never become a local tool execution request. These
+payloads can be replayed only to the identical source Format; unsupported
+cross-provider use is an error.
 
 `Profile::OpenAiCompatible("provider-name")` is supported for Chat streaming. It enables the recognized `reasoning_content` / `reasoning` extensions. Standard Chat rejects those fields. The writer emits `reasoning_content` only for an explicitly compatible Chat target; it never injects that field into the standard profile. Arbitrary vendor field names remain unsupported.
 
 ## Usage and explicit losses
 
 Usage events replace the counters they contain. They are not summed across events. In particular, an Anthropic output-token update from 2 to 7 produces 7, not 9. Arithmetic is integer-only and checked. Cache reads and writes are included when normalizing Anthropic prompt totals; encoding Anthropic reverses that normalization. Gemini visible output and thought counts are added for canonical/OpenAI output, then separated again for Gemini targets. Source bases are retained so a partial cache/thought update can recompute the total without double-counting.
+
+`StreamConfig::usage_emission` and the owned encoder's equivalent select
+`UsageEmission::Final` (default) or `Continuous`. Continuous mode attaches the
+latest observed usage to Chat/Completions chunks and flushes usage-only updates;
+fragmentation, capacity retries and output backpressure do not duplicate counters.
+No counts are inferred from text length. `allow_partial_usage` remains the caller's
+explicit policy when only a partial count set is known.
+
+Request IR separately carries `StreamOptions { include_usage,
+continuous_usage_stats }`. Chat/Completions write the request field; other targets
+return `EncodeReport::transport_stream_options`. This metadata lets an HTTP
+adapter choose how to configure its response encoder without inserting a foreign
+field into a provider request. Parsing a request never mutates a stream encoder.
 
 The default policy rejects losses. `drop_reasoning` permits dropping unsupported textual reasoning, with the number of dropped deltas in `Report.dropped_reasoning`. `drop_extensions` permits only the field classes listed below. The report includes both a count and a `dropped_fields` bit mask using `DroppedField`.
 

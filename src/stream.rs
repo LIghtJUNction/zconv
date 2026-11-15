@@ -309,6 +309,20 @@ pub enum DroppedField {
     CacheCreationTokens = 32,
 }
 
+/// Controls when observed usage is published by the stream encoder.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UsageEmission {
+    /// Preserve the usual terminal usage snapshot.
+    #[default]
+    Final,
+    /// Publish cumulative usage while streaming. Chat and Completions attach
+    /// it to chunks; Anthropic and GenerateContent emit usage update events.
+    /// Responses and Interactions have no supported intermediate usage event.
+    /// Missing counters are never filled with zero. Incomplete usage waits for
+    /// the remaining counters unless `allow_partial_usage` is enabled.
+    Continuous,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct StreamConfig<'a> {
     pub source: Format,
@@ -323,6 +337,7 @@ pub struct StreamConfig<'a> {
     pub validate_snapshots: bool,
     /// Encode only observed counters instead of requiring complete terminal usage.
     pub allow_partial_usage: bool,
+    pub usage_emission: UsageEmission,
 }
 impl<'a> StreamConfig<'a> {
     pub fn new(source: Protocol, target: Protocol) -> Self {
@@ -335,6 +350,7 @@ impl<'a> StreamConfig<'a> {
             policy: StreamPolicy::default(),
             validate_snapshots: false,
             allow_partial_usage: false,
+            usage_emission: UsageEmission::Final,
         }
     }
 }
@@ -623,6 +639,7 @@ struct State {
     stop_sequence: Option<Span>,
     continuation: Option<(u32, Span)>,
     usage_seen: bool,
+    usage_pending: bool,
 }
 impl State {
     fn new(context: StreamContext<'_>) -> Result<Self, Error> {
@@ -643,6 +660,7 @@ impl State {
             stop_sequence: None,
             continuation: None,
             usage_seen: false,
+            usage_pending: false,
         })
     }
 }
@@ -683,6 +701,7 @@ impl<'a, 'c> StreamConverter<'a, 'c> {
         for format in [config.source, config.target] {
             validate_stream_format(format)?;
         }
+        validate_usage_emission(config)?;
         if buffers.checkpoints.len() < buffers.items.len() {
             return Err(Error::WorkspaceTooSmall {
                 needed: buffers.items.len(),
@@ -1249,6 +1268,7 @@ fn process(
     } else {
         decode::event(config.source, root, &mut emitter)?;
     }
+    emitter.flush_usage()?;
     emitter.state.report.source_events = emitter.state.report.source_events.saturating_add(1);
     let length = emitter.writer.finish()?;
     validate_arguments(config.json_limits, state, items, aggregate, tokens)?;
@@ -1461,6 +1481,20 @@ pub fn validate_stream_format(format: Format) -> Result<(), Error> {
     if format.version != Format::new(format.protocol).version || !profile {
         return Err(Error::Unsupported {
             feature: "stream protocol version/profile",
+        });
+    }
+    Ok(())
+}
+
+fn validate_usage_emission(config: StreamConfig<'_>) -> Result<(), Error> {
+    if config.usage_emission == UsageEmission::Continuous
+        && matches!(
+            config.target.protocol,
+            Protocol::OpenAiResponses | Protocol::GeminiInteractions
+        )
+    {
+        return Err(Error::Unsupported {
+            feature: "continuous usage in target protocol",
         });
     }
     Ok(())

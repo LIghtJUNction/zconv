@@ -27,6 +27,7 @@ impl EventEncoderState {
     pub fn new(config: StreamConfig<'_>) -> Result<Self, Error> {
         validate_stream_format(config.source)?;
         validate_stream_format(config.target)?;
+        validate_usage_emission(config)?;
         let state = State::new(config.context)?;
         Ok(Self {
             config: StreamConfig {
@@ -38,6 +39,7 @@ impl EventEncoderState {
                 policy: config.policy,
                 validate_snapshots: config.validate_snapshots,
                 allow_partial_usage: config.allow_partial_usage,
+                usage_emission: config.usage_emission,
             },
             state,
         })
@@ -176,6 +178,7 @@ pub(super) fn stage(
         for event in events {
             replay(*event, payload, &mut emitter, tokens, config.json_limits)?;
         }
+        emitter.flush_usage()?;
         emitter.state.report.ir_events =
             emitter.state.report.ir_events.saturating_add(events.len());
         let length = emitter.writer.finish()?;

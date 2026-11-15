@@ -328,6 +328,68 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
     fn end_event(&mut self) {
         self.writer.raw(b"}\n\n");
     }
+    fn usage_ready(&self) -> bool {
+        let usage = self.state.usage.usage();
+        if !self.state.usage_seen {
+            return false;
+        }
+        if usage == Usage::default() {
+            return true;
+        }
+        if self.config.allow_partial_usage {
+            return true;
+        }
+        match self.config.target.protocol {
+            Protocol::OpenAiChat | Protocol::OpenAiCompletions => {
+                usage.input.is_some() && usage.output.is_some() && usage.total.is_some()
+            }
+            Protocol::AnthropicMessages => usage.input.is_some() && usage.output.is_some(),
+            _ => true,
+        }
+    }
+    fn end_chat_event(&mut self) -> Result<(), Error> {
+        if self.config.usage_emission == UsageEmission::Continuous && self.usage_ready() {
+            self.writer.raw(b",\"usage\":");
+            self.write_usage(self.config.target.protocol)?;
+            self.state.usage_pending = false;
+        }
+        self.end_event();
+        Ok(())
+    }
+    pub(super) fn flush_usage(&mut self) -> Result<(), Error> {
+        if self.config.usage_emission != UsageEmission::Continuous
+            || !self.state.begun
+            || self.state.ended
+            || !self.state.usage_pending
+            || !self.usage_ready()
+        {
+            return Ok(());
+        }
+        match self.config.target.protocol {
+            Protocol::OpenAiChat | Protocol::OpenAiCompletions => {
+                self.chat_header(self.config.target.protocol == Protocol::OpenAiCompletions);
+                self.writer.raw(b",\"choices\":[],\"usage\":");
+            }
+            Protocol::AnthropicMessages => {
+                self.named(b"message_delta", b"type");
+                self.writer
+                    .raw(b",\"delta\":{\"stop_reason\":null},\"usage\":");
+            }
+            Protocol::GeminiGenerateContent => {
+                self.writer
+                    .raw(b"data: {\"candidates\":[],\"usageMetadata\":");
+            }
+            _ => {
+                return Err(Error::Unsupported {
+                    feature: "continuous usage in target protocol",
+                });
+            }
+        }
+        self.write_usage(self.config.target.protocol)?;
+        self.end_event();
+        self.state.usage_pending = false;
+        Ok(())
+    }
     fn chat_header(&mut self, completion: bool) {
         self.writer.raw(b"data: {\"id\":");
         quoted_span(&mut self.writer, self.aggregate, self.state.id);
@@ -382,7 +444,8 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
                 {
                     self.choice_header(key.choice, false);
                     self.writer
-                        .raw(b",\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n");
+                        .raw(b",\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]");
+                    self.end_chat_event()?;
                 }
                 if item.kind == BlockKind::Tool {
                     self.choice_header(key.choice, false);
@@ -395,7 +458,8 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
                         .raw(b",\"type\":\"function\",\"function\":{\"name\":");
                     quoted_span(&mut self.writer, self.aggregate, item.name);
                     self.writer
-                        .raw(b",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n");
+                        .raw(b",\"arguments\":\"\"}}]},\"finish_reason\":null}]");
+                    self.end_chat_event()?;
                 }
             }
             Protocol::OpenAiCompletions => {
@@ -928,7 +992,8 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
                         });
                     }
                 });
-                self.writer.raw(b"}]}\n\n");
+                self.writer.raw(b"}]");
+                self.end_chat_event()?;
             }
             Protocol::GeminiGenerateContent => {
                 if reason == FinishReason::Continuation && self.state.continuation.is_none() {
@@ -1306,14 +1371,16 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                     });
                     text.write(&mut self.writer);
                 }
-                self.writer.raw(b"},\"finish_reason\":null}]}\n\n");
+                self.writer.raw(b"},\"finish_reason\":null}]");
+                self.end_chat_event()?;
             }
             Protocol::OpenAiCompletions => {
                 self.choice_header(key.choice, true);
                 self.writer.raw(b",\"text\":");
                 text.write(&mut self.writer);
                 self.writer
-                    .raw(b",\"logprobs\":null,\"finish_reason\":null}]}\n\n");
+                    .raw(b",\"logprobs\":null,\"finish_reason\":null}]");
+                self.end_chat_event()?;
             }
             Protocol::AnthropicMessages => {
                 self.named(b"content_block_delta", b"type");
@@ -1435,7 +1502,8 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                     text.write(&mut self.writer);
                     self.writer.raw(b"}]");
                 }
-                self.writer.raw(b"},\"finish_reason\":null}]}\n\n");
+                self.writer.raw(b"},\"finish_reason\":null}]");
+                self.end_chat_event()?;
             }
             Protocol::OpenAiResponses if openai => {} // Retained in completed item and terminal snapshot.
             Protocol::AnthropicMessages if item.kind == BlockKind::Reasoning => {
@@ -1513,7 +1581,8 @@ impl Sink for Emitter<'_, '_, '_, '_> {
         self.choice_header(choice, false);
         self.writer.raw(b",\"delta\":{\"images\":");
         self.writer.raw(value.raw());
-        self.writer.raw(b"},\"finish_reason\":null}]}\n\n");
+        self.writer.raw(b"},\"finish_reason\":null}]");
+        self.end_chat_event()?;
         Ok(())
     }
     fn grounding(&mut self, choice: u32, value: json::RawValue<'_>) -> Result<(), Error> {
@@ -1582,8 +1651,10 @@ impl Sink for Emitter<'_, '_, '_, '_> {
         Ok(())
     }
     fn usage(&mut self, usage: Usage) -> Result<(), Error> {
+        self.flush_usage()?;
         self.state.usage_seen = true;
         self.state.usage.update(usage)?;
+        self.state.usage_pending = true;
         Ok(())
     }
     fn choice(&mut self, choice: u32, reason: FinishReason) -> Result<(), Error> {
@@ -1691,7 +1762,10 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                         feature: "cancelled/failed terminal status without error payload",
                     });
                 }
-                if self.state.usage_seen {
+                if self.state.usage_seen
+                    && (self.config.usage_emission == UsageEmission::Final
+                        || self.state.usage_pending)
+                {
                     self.chat_header(self.config.target.protocol == Protocol::OpenAiCompletions);
                     self.writer.raw(b",\"choices\":[],\"usage\":");
                     self.write_usage(self.config.target.protocol)?;

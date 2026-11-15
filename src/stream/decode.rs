@@ -25,6 +25,12 @@ fn optional<'a>(value: Value<'a, '_>, name: &'static str) -> Result<Option<Text<
             .ok_or_else(|| invalid(name)),
     }
 }
+fn arguments<'a>(value: Value<'a, '_>) -> Result<Option<Text<'a>>, Error> {
+    match value.get("arguments") {
+        Some(value) if value.kind() == Kind::Object => Ok(Some(Text::Utf8(value.raw()))),
+        _ => optional(value, "arguments"),
+    }
+}
 fn object<'a, 't>(value: Value<'a, 't>, name: &'static str) -> Result<Value<'a, 't>, Error> {
     let value = value.get(name).ok_or_else(|| invalid(name))?;
     if value.kind() != Kind::Object {
@@ -282,7 +288,7 @@ fn chat(
                     if id.is_some() || name.is_some() {
                         sink.block(key, BlockKind::Tool, id, name, None)?;
                     }
-                    if let Some(arguments) = optional(function, "arguments")? {
+                    if let Some(arguments) = arguments(function)? {
                         sink.delta(key, BlockKind::Tool, arguments)?;
                     }
                 }
@@ -306,7 +312,7 @@ fn chat(
                 if let Some(name) = optional(function, "name")? {
                     sink.block(key, BlockKind::Tool, None, Some(name), None)?;
                 }
-                if let Some(arguments) = optional(function, "arguments")? {
+                if let Some(arguments) = arguments(function)? {
                     sink.delta(key, BlockKind::Tool, arguments)?;
                 }
             }

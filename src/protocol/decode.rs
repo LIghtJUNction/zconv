@@ -184,6 +184,16 @@ impl<'s, 'a> Arena<'s, 'a> {
         item_id: Presence<Text<'a>>,
     ) -> Result<(), Error> {
         let owner = self.push(Record::Empty)?;
+        self.finish_block(owner, content, raw, known, item_id)
+    }
+    fn finish_block(
+        &mut self,
+        owner: usize,
+        content: Content<'a>,
+        raw: Option<V<'a, '_>>,
+        known: &[&str],
+        item_id: Presence<Text<'a>>,
+    ) -> Result<(), Error> {
         let extensions = if let Some(raw) = raw {
             self.extras(raw, known, "content", owner)?
         } else {
@@ -215,6 +225,55 @@ impl<'s, 'a> Arena<'s, 'a> {
             }),
         );
         Ok(())
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn tool_result(
+        &mut self,
+        result: V<'a, '_>,
+        id: Presence<Text<'a>>,
+        name: Presence<Text<'a>>,
+        is_error: Presence<bool>,
+        raw: Option<V<'a, '_>>,
+        known: &[&str],
+        item_id: Presence<Text<'a>>,
+    ) -> Result<(), Error> {
+        let owner = self.push(Record::Empty)?;
+        let result = if result.kind() == Kind::Array {
+            let start = self.used;
+            for part in result.array() {
+                if let Some(kind) = part.get("type").and_then(Value::as_string)
+                    && [
+                        "tool_result",
+                        "tool_use",
+                        "function_call",
+                        "function_call_output",
+                    ]
+                    .iter()
+                    .any(|name| kind.eq_str(name))
+                {
+                    return Err(invalid("tool result content", "nested tool operation"));
+                }
+                self.content_block(part, Role::User)?;
+            }
+            Data::Content(Span {
+                start,
+                end: self.used,
+            })
+        } else {
+            data(result)
+        };
+        self.finish_block(
+            owner,
+            Content::ToolResult {
+                id,
+                name,
+                result,
+                is_error,
+            },
+            raw,
+            known,
+            item_id,
+        )
     }
     fn message_start(&mut self) -> Result<usize, Error> {
         self.push(Record::Empty)
@@ -251,7 +310,9 @@ impl<'s, 'a> Arena<'s, 'a> {
                 reasoning: if matches!(self.source.profile, crate::Profile::Standard) {
                     Presence::Missing
                 } else {
-                    marker(raw.and_then(|v| v.get("reasoning_content")))
+                    marker(
+                        raw.and_then(|v| v.get("reasoning_content").or_else(|| v.get("reasoning"))),
+                    )
                 },
                 name,
                 shape,
@@ -291,6 +352,11 @@ impl<'s, 'a> Arena<'s, 'a> {
         }
         let kind = req_text(v, "type")?;
         if kind.eq_str("text") || kind.eq_str("input_text") || kind.eq_str("output_text") {
+            if self.source.protocol == Protocol::OpenAiResponses
+                && let Some(annotations) = v.get("annotations").filter(|v| !v.is_null())
+            {
+                array(annotations, "annotations")?;
+            }
             if self.source.protocol == Protocol::AnthropicMessages
                 && self.source.version == "2026-10-21"
                 && role == Role::User
@@ -353,34 +419,50 @@ impl<'s, 'a> Arena<'s, 'a> {
                 return Err(invalid("tool_result", "must belong to user"));
             }
             let result = required(v, "content")?;
-            self.block(
-                Content::ToolResult {
-                    id: Presence::Value(req_text(v, "tool_use_id")?),
-                    name: Presence::Missing,
-                    result: data(result),
-                    is_error: pbool(v, "is_error")?,
-                },
+            self.tool_result(
+                result,
+                Presence::Value(req_text(v, "tool_use_id")?),
+                Presence::Missing,
+                pbool(v, "is_error")?,
                 Some(v),
                 &["type", "tool_use_id", "content", "is_error"],
                 Presence::Missing,
             )
-        } else if kind.eq_str("image_url") {
-            let image = required(v, "image_url")?;
-            object(image, "image_url")?;
+        } else if kind.eq_str("image_url") || kind.eq_str("audio_url") || kind.eq_str("video_url") {
+            let field = if kind.eq_str("image_url") {
+                "image_url"
+            } else if kind.eq_str("audio_url") {
+                "audio_url"
+            } else {
+                "video_url"
+            };
+            let image = required(v, field)?;
+            let (url, detail) = if image.kind() == Kind::String {
+                (text(image, field)?, Presence::Missing)
+            } else {
+                object(image, field)?;
+                reject_extra(image, &["url", "detail"], "media URL extension")?;
+                (req_text(image, "url")?, ptext(image, "detail")?)
+            };
             let media = Media {
                 mime_type: Presence::Missing,
-                kind: MediaKind::Image,
-                source: url_source(req_text(image, "url")?),
-                detail: ptext(image, "detail")?,
+                kind: if kind.eq_str("image_url") {
+                    MediaKind::Image
+                } else if kind.eq_str("audio_url") {
+                    MediaKind::Audio
+                } else {
+                    MediaKind::Video
+                },
+                source: url_source(url),
+                detail,
                 filename: Presence::Missing,
             };
             self.block(
                 Content::Media(media),
                 Some(v),
-                &["type", "image_url"],
+                &["type", field],
                 Presence::Missing,
             )?;
-            reject_extra(image, &["url", "detail"], "image_url extension")?;
             Ok(())
         } else if kind.eq_str("input_image") {
             let source = if let Some(url) = v.get("image_url") {
@@ -396,7 +478,10 @@ impl<'s, 'a> Arena<'s, 'a> {
                     mime_type: Presence::Missing,
                     kind: MediaKind::Image,
                     source,
-                    detail: ptext(v, "detail")?,
+                    detail: match ptext(v, "detail")? {
+                        Presence::Missing | Presence::Null => Presence::Value(Text::Utf8("auto")),
+                        value => value,
+                    },
                     filename: Presence::Missing,
                 }),
                 Some(v),
@@ -626,11 +711,49 @@ impl<'s, 'a> Arena<'s, 'a> {
             object(result, "functionResponse")?;
             reject_extra(
                 result,
-                &["id", "name", "response"],
+                &["id", "name", "response", "parts"],
                 "functionResponse extension",
             )?;
             let response = required(result, "response")?;
             object(response, "response")?;
+            if let Some(parts) = result.get("parts") {
+                array(parts, "functionResponse.parts")?;
+                let owner = self.push(Record::Empty)?;
+                let start = self.used;
+                let object_text = core::str::from_utf8(response.raw())
+                    .map_err(|_| invalid("functionResponse.response", "invalid UTF-8"))?;
+                self.block(
+                    Content::Text(Text::Utf8(object_text)),
+                    None,
+                    &[],
+                    Presence::Missing,
+                )?;
+                for part in parts.array() {
+                    object(part, "functionResponse part")?;
+                    if part.get("inlineData").is_none() && part.get("fileData").is_none() {
+                        return Err(invalid(
+                            "functionResponse.parts",
+                            "expected inlineData or fileData",
+                        ));
+                    }
+                    self.gemini_part(part)?;
+                }
+                return self.finish_block(
+                    owner,
+                    Content::ToolResult {
+                        id: ptext(result, "id")?,
+                        name: Presence::Value(req_text(result, "name")?),
+                        result: Data::Content(Span {
+                            start,
+                            end: self.used,
+                        }),
+                        is_error: Presence::Missing,
+                    },
+                    Some(v),
+                    &["functionResponse"],
+                    Presence::Missing,
+                );
+            }
             self.block(
                 Content::ToolResult {
                     id: ptext(result, "id")?,
@@ -717,33 +840,41 @@ impl<'s, 'a> Arena<'s, 'a> {
             if legacy && name.is_missing() {
                 return Err(invalid("name", "required for function message"));
             }
-            self.block(
-                Content::ToolResult {
-                    id,
-                    name,
-                    result: data(result),
-                    is_error: Presence::Missing,
-                },
+            self.tool_result(
+                result,
+                id,
+                name,
+                Presence::Missing,
                 None,
                 &[],
                 Presence::Missing,
             )?;
         } else {
+            if !matches!(self.source.profile, crate::Profile::Standard)
+                && v.get("reasoning_content").is_some()
+                && v.get("reasoning").is_some()
+            {
+                return Err(invalid(
+                    "reasoning_content",
+                    "multiple reasoning field aliases",
+                ));
+            }
             if let Some(reasoning) = v
                 .get("reasoning_content")
+                .or_else(|| v.get("reasoning"))
                 .filter(|_| !matches!(self.source.profile, crate::Profile::Standard))
                 && !reasoning.is_null()
             {
-                self.block(
-                    Content::Reasoning {
-                        kind: ReasoningKind::Thought,
-                        text: Presence::Value(text(reasoning, "reasoning_content")?),
-                        signature: Presence::Missing,
-                    },
-                    None,
-                    &[],
-                    Presence::Missing,
-                )?;
+                if r != Role::Assistant {
+                    return Err(invalid("reasoning_content", "must belong to assistant"));
+                }
+                if reasoning.kind() == Kind::Array {
+                    for part in reasoning.array() {
+                        self.reasoning_text(text(part, "reasoning_content")?)?;
+                    }
+                } else {
+                    self.reasoning_text(text(reasoning, "reasoning_content")?)?;
+                }
             }
             if let Some(content) = v.get("content") {
                 self.content(content, r)?;
@@ -815,8 +946,22 @@ impl<'s, 'a> Arena<'s, 'a> {
                     "function_call",
                     "refusal",
                     "reasoning_content",
+                    "reasoning",
                 ]
             },
+            Presence::Missing,
+        )
+    }
+
+    fn reasoning_text(&mut self, text: Text<'a>) -> Result<(), Error> {
+        self.block(
+            Content::Reasoning {
+                kind: ReasoningKind::Thought,
+                text: Presence::Value(text),
+                signature: Presence::Missing,
+            },
+            None,
+            &[],
             Presence::Missing,
         )
     }
@@ -828,11 +973,17 @@ impl<'s, 'a> Arena<'s, 'a> {
         legacy: bool,
     ) -> Result<(), Error> {
         object(v, "function")?;
+        let args = required(v, "arguments")?;
+        let arguments = match args.kind() {
+            Kind::String => Data::JsonText(text(args, "arguments")?),
+            Kind::Object => Data::Json(args.raw_value()),
+            _ => return Err(invalid("arguments", "expected JSON string or object")),
+        };
         self.block(
             Content::ToolCall {
                 id,
                 name: req_text(v, "name")?,
-                arguments: Data::JsonText(req_text(v, "arguments")?),
+                arguments,
                 legacy,
             },
             Some(v),
@@ -926,14 +1077,23 @@ impl<'s, 'a> Arena<'s, 'a> {
             {
                 return Err(invalid("role", "Responses has no model role"));
             }
-            let content = required(v, "content")?;
+            let content = v.get("content");
+            if content.is_none() && (interactions || r != Role::Assistant) {
+                return Err(invalid("content", "required field missing"));
+            }
             let start = self.message_start()?;
-            self.content(content, r)?;
+            if let Some(content) = content {
+                self.content(content, r)?;
+            }
             self.message_end(
                 start,
                 r,
                 Presence::Missing,
-                shape(Some(content)),
+                if !interactions && r == Role::Assistant && content.is_none_or(|v| v.is_null()) {
+                    ContentShape::Array
+                } else {
+                    shape(content)
+                },
                 Some(v),
                 &["type", "role", "content", "id", "status"],
                 ptext(v, "id")?,
@@ -974,13 +1134,11 @@ impl<'s, 'a> Arena<'s, 'a> {
         } else if ty.eq_str("function_call_output") || ty.eq_str("function_result") {
             let result = required(v, if interactions { "result" } else { "output" })?;
             let start = self.message_start()?;
-            self.block(
-                Content::ToolResult {
-                    id: Presence::Value(req_text(v, "call_id")?),
-                    name: ptext(v, "name")?,
-                    result: data(result),
-                    is_error: pbool(v, "is_error")?,
-                },
+            self.tool_result(
+                result,
+                Presence::Value(req_text(v, "call_id")?),
+                ptext(v, "name")?,
+                pbool(v, "is_error")?,
                 Some(v),
                 &[
                     "type", "id", "call_id", "name", "result", "output", "is_error", "status",
@@ -998,80 +1156,72 @@ impl<'s, 'a> Arena<'s, 'a> {
             )
         } else if ty.eq_str("reasoning") || ty.eq_str("thought") {
             let start = self.message_start()?;
-            let mut had_text = false;
-            let mut included_signature = false;
-            if let Some(summary) = v.get("summary") {
-                if summary.kind() == Kind::String {
-                    self.block(
-                        Content::Reasoning {
-                            kind: ReasoningKind::Summary,
-                            text: Presence::Value(text(summary, "summary")?),
-                            signature: ptext(
-                                v,
-                                if interactions {
-                                    "signature"
-                                } else {
-                                    "encrypted_content"
-                                },
-                            )?,
-                        },
-                        Some(v),
-                        &[
-                            "type",
-                            "id",
-                            "summary",
-                            "signature",
-                            "encrypted_content",
-                            "status",
-                        ],
-                        ptext(v, "id")?,
-                    )?;
-                    had_text = true;
-                    included_signature = true;
-                } else {
-                    array(summary, "summary")?;
-                    for part in summary.array() {
-                        let t = req_text(part, "text")?;
+            for (field, kind, part_type) in [
+                ("summary", ReasoningKind::Summary, "summary_text"),
+                ("content", ReasoningKind::Thought, "reasoning_text"),
+            ] {
+                if let Some(parts) = v.get(field).filter(|v| !v.is_null()) {
+                    if interactions && field == "summary" && parts.kind() == Kind::String {
                         self.block(
                             Content::Reasoning {
-                                kind: ReasoningKind::Summary,
-                                text: Presence::Value(t),
+                                kind,
+                                text: Presence::Value(text(parts, "summary")?),
                                 signature: Presence::Missing,
                             },
-                            Some(part),
-                            &["type", "text"],
+                            None,
+                            &[],
                             Presence::Missing,
                         )?;
-                        had_text = true;
+                    } else {
+                        array(parts, field)?;
+                        for part in parts.array() {
+                            object(part, "reasoning content")?;
+                            if let Some(ty) = part.get("type")
+                                && !text(ty, "type")?.eq_str(part_type)
+                            {
+                                return Err(invalid("type", "unexpected reasoning content type"));
+                            }
+                            self.block(
+                                Content::Reasoning {
+                                    kind,
+                                    text: Presence::Value(req_text(part, "text")?),
+                                    signature: Presence::Missing,
+                                },
+                                Some(part),
+                                &["type", "text"],
+                                Presence::Missing,
+                            )?;
+                        }
                     }
                 }
             }
-            if !had_text || !included_signature {
-                self.block(
-                    Content::Reasoning {
-                        kind: ReasoningKind::Summary,
-                        text: Presence::Missing,
-                        signature: ptext(
-                            v,
-                            if interactions {
-                                "signature"
-                            } else {
-                                "encrypted_content"
-                            },
-                        )?,
-                    },
-                    Some(v),
-                    &[
-                        "type",
-                        "id",
-                        "summary",
-                        "signature",
-                        "encrypted_content",
-                        "status",
-                    ],
-                    ptext(v, "id")?,
-                )?;
-            }
+            // Keep item identity, replay material and unknown item fields once,
+            // independently of the number of summary or thought text parts.
+            self.block(
+                Content::Reasoning {
+                    kind: ReasoningKind::Summary,
+                    text: Presence::Missing,
+                    signature: ptext(
+                        v,
+                        if interactions {
+                            "signature"
+                        } else {
+                            "encrypted_content"
+                        },
+                    )?,
+                },
+                Some(v),
+                &[
+                    "type",
+                    "id",
+                    "summary",
+                    "content",
+                    "signature",
+                    "encrypted_content",
+                    "status",
+                ],
+                ptext(v, "id")?,
+            )?;
             self.message_end(
                 start,
                 Role::Assistant,
@@ -1543,6 +1693,22 @@ fn parameters<'a, 't>(
         },
         _ => Presence::Missing,
     };
+    params.text_verbosity = match source.protocol {
+        Protocol::OpenAiChat => ptext(root, "verbosity")?,
+        Protocol::OpenAiResponses => match root.get("text") {
+            Some(v) => {
+                object(v, "text")?;
+                ptext(v, "verbosity")?
+            }
+            None => Presence::Missing,
+        },
+        _ => Presence::Missing,
+    };
+    if let Presence::Value(value) = params.text_verbosity
+        && !["low", "medium", "high"].iter().any(|v| value.eq_str(v))
+    {
+        return Err(invalid("verbosity", "expected low, medium or high"));
+    }
     for (field, p) in [
         ("stream", params.stream),
         ("parallel_tool_calls", params.parallel_tool_calls),
@@ -1622,6 +1788,7 @@ pub(super) fn request_keys(source: Protocol) -> &'static [&'static str] {
             "parallel_tool_calls",
             "response_format",
             "reasoning_effort",
+            "verbosity",
         ],
         Protocol::OpenAiResponses => &[
             "model",
@@ -1924,7 +2091,11 @@ fn request_header<'a, 't>(
     let output = if source.protocol == Protocol::OpenAiResponses {
         if let Some(t) = root.get("text") {
             object(t, "text")?;
-            reject_extra(t, &["format"], "Responses text configuration extension")?;
+            reject_extra(
+                t,
+                &["format", "verbosity"],
+                "Responses text configuration extension",
+            )?;
         }
         root.get("text").and_then(|v| v.get("format"))
     } else if source.protocol == Protocol::GeminiGenerateContent {

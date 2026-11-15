@@ -12,6 +12,26 @@ fn write_text(w: &mut Writer<'_>, text: Text<'_>) {
     }
 }
 
+/// Visit sibling blocks, skipping the nested content owned by a tool result.
+fn blocks_in<'r, 'a>(
+    records: &'r [Record<'a>],
+    start: usize,
+    end: usize,
+) -> impl Iterator<Item = (usize, Block<'a>)> + 'r {
+    let mut at = start;
+    core::iter::from_fn(move || {
+        while at < end {
+            let index = at;
+            at += 1;
+            if let Some(Record::Block(block)) = records.get(index) {
+                at = block.end.max(at);
+                return Some((index, *block));
+            }
+        }
+        None
+    })
+}
+
 // Traverse schema positions only. Defaults, examples, enum objects and
 // property names are business JSON, even when they contain a field named type.
 fn json_schema(w: &mut Writer<'_>, value: json::Value<'_, '_>) -> Result<(), Error> {
@@ -331,6 +351,31 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                         return Err(invalid("IR block end", "invalid arena range"));
                     }
                     self.check_span(b.extensions, index, b.end)?;
+                    if let Content::ToolResult {
+                        result: Data::Content(span),
+                        ..
+                    } = b.content
+                    {
+                        if span.start != index + 1 || span.end < span.start || span.end > b.end {
+                            return Err(invalid("IR tool result content", "invalid arena range"));
+                        }
+                        for (_, child) in blocks_in(self.records, span.start, span.end) {
+                            if child.end > span.end
+                                || !matches!(
+                                    child.content,
+                                    Content::Text(_)
+                                        | Content::Media(_)
+                                        | Content::Refusal(_)
+                                        | Content::Opaque { .. }
+                                )
+                            {
+                                return Err(invalid(
+                                    "IR tool result content",
+                                    "expected text or media content",
+                                ));
+                            }
+                        }
+                    }
                     if !b.item_id.is_missing() && self.target.protocol != Protocol::OpenAiResponses
                     {
                         self.metadata_loss(true, "response item ID")?;
@@ -376,17 +421,18 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                         b.signature.value().map(|s| s.source).unwrap_or(self.source);
                     match b.content {
                         Content::Reasoning {
-                            signature, kind, ..
+                            signature,
+                            kind,
+                            text,
                         } => {
                             if self.policy.drop_reasoning {
                                 self.report.dropped_reasoning += 1;
                             } else if content_source != self.target
+                                && text.value().is_some()
                                 && ((kind == ReasoningKind::Thought
                                     && matches!(
                                         self.target.protocol,
-                                        Protocol::OpenAiResponses
-                                            | Protocol::GeminiInteractions
-                                            | Protocol::GeminiGenerateContent
+                                        Protocol::GeminiInteractions
                                     ))
                                     || (kind == ReasoningKind::Summary
                                         && matches!(
@@ -653,6 +699,14 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                     self.w.raw(v.raw());
                 }
             }
+            Data::Content(span) => {
+                if stringify || object_required {
+                    return Err(Error::Unsupported {
+                        feature: "typed tool content requires content-array target",
+                    });
+                }
+                self.blocks(span.start, span.end, Role::User, false)?;
+            }
             Data::Text(t) => {
                 if object_required {
                     return self.data(Data::JsonText(t), false, true);
@@ -735,10 +789,39 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                         );
                     }
                     self.media_url(media.source)?;
-                    ptext(&mut self.w, &mut comma, "detail", media.detail);
+                    ptext(
+                        &mut self.w,
+                        &mut comma,
+                        "detail",
+                        if p == Protocol::OpenAiResponses
+                            && (media.detail.is_missing() || media.detail.is_null())
+                        {
+                            Presence::Value(Text::Utf8("auto"))
+                        } else {
+                            media.detail
+                        },
+                    );
                     if p == Protocol::OpenAiChat {
                         self.w.byte(b'}');
                     }
+                } else if p == Protocol::OpenAiChat
+                    && (media.kind == MediaKind::Video
+                        || (media.kind == MediaKind::Audio
+                            && !matches!(media.source, MediaSource::Base64 { .. })))
+                {
+                    let field = if media.kind == MediaKind::Video {
+                        "video_url"
+                    } else {
+                        "audio_url"
+                    };
+                    key(&mut self.w, &mut comma, "type");
+                    self.w.string(field.as_bytes());
+                    key(&mut self.w, &mut comma, field);
+                    self.w.raw(b"{\"url\":");
+                    self.media_url(media.source)?;
+                    let mut nested = true;
+                    ptext(&mut self.w, &mut nested, "detail", media.detail);
+                    self.w.byte(b'}');
                 } else if media.kind == MediaKind::Audio && p == Protocol::OpenAiChat {
                     let (data, mime_type) = match media.source {
                         MediaSource::Base64 { data, mime_type } => (data, mime_type),
@@ -787,7 +870,7 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                             key(&mut self.w, &mut comma, "file_url");
                             write_text(&mut self.w, url);
                         }
-                        MediaSource::Base64 { .. } => {
+                        MediaSource::Base64 { .. } | MediaSource::DataUrl(_) => {
                             key(&mut self.w, &mut comma, "file_data");
                             self.media_url(media.source)?;
                         }
@@ -1149,7 +1232,29 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                     key(&mut self.w, &mut n, "name");
                     write_text(&mut self.w, name);
                     key(&mut self.w, &mut n, "response");
-                    self.data(result, false, true)?;
+                    if let Data::Content(span) = result {
+                        let mut parts_start = span.start;
+                        if let Some((_, first)) =
+                            blocks_in(self.records, span.start, span.end).next()
+                            && let Content::Text(text) = first.content
+                        {
+                            self.data(Data::JsonText(text), false, true)?;
+                            parts_start = first.end;
+                        } else {
+                            self.w.raw(b"{}");
+                        }
+                        if blocks_in(self.records, parts_start, span.end)
+                            .any(|(_, b)| !matches!(b.content, Content::Media(_)))
+                        {
+                            return Err(Error::Unsupported {
+                                feature: "Gemini tool content requires an optional JSON object followed by media",
+                            });
+                        }
+                        key(&mut self.w, &mut n, "parts");
+                        self.blocks(parts_start, span.end, Role::User, false)?;
+                    } else {
+                        self.data(result, false, true)?;
+                    }
                     self.w.byte(b'}');
                 } else {
                     return Err(Error::Unsupported {
@@ -1261,17 +1366,8 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
         }
     }
     fn chat_message(&mut self, index: usize, m: Message<'a>, response: bool) -> Result<(), Error> {
-        let result_count = self.records[index + 1..m.end]
-            .iter()
-            .filter(|r| {
-                matches!(
-                    r,
-                    Record::Block(Block {
-                        content: Content::ToolResult { .. },
-                        ..
-                    })
-                )
-            })
+        let result_count = blocks_in(self.records, index + 1, m.end)
+            .filter(|(_, b)| matches!(b.content, Content::ToolResult { .. }))
             .count();
         if result_count > 1 {
             return Err(Error::Unsupported {
@@ -1292,20 +1388,18 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
         );
         ptext(&mut self.w, &mut c, "name", m.name);
         let mut seen_call = false;
-        for record in &self.records[index + 1..m.end] {
-            if let Record::Block(b) = record {
-                if matches!(b.content, Content::ToolCall { .. }) {
-                    seen_call = true;
-                } else if seen_call
-                    && matches!(
-                        b.content,
-                        Content::Text(_) | Content::Media(_) | Content::Refusal(_)
-                    )
-                {
-                    return Err(Error::Unsupported {
-                        feature: "interleaved content/tool order in Chat",
-                    });
-                }
+        for (_, b) in blocks_in(self.records, index + 1, m.end) {
+            if matches!(b.content, Content::ToolCall { .. }) {
+                seen_call = true;
+            } else if seen_call
+                && matches!(
+                    b.content,
+                    Content::Text(_) | Content::Media(_) | Content::Refusal(_)
+                )
+            {
+                return Err(Error::Unsupported {
+                    feature: "interleaved content/tool order in Chat",
+                });
             }
         }
         let mut plain = 0;
@@ -1315,29 +1409,21 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
         let mut refusal = None;
         let mut reasoning = None;
         let mut result = None;
-        for r in self
-            .records
-            .get(index + 1..m.end)
-            .ok_or_else(|| invalid("IR message", "invalid range"))?
-        {
-            if let Record::Block(b) = r {
-                match b.content {
-                    Content::Text(t) => {
-                        plain += 1;
-                        text_value = Some(t);
-                    }
-                    Content::ToolCall { .. } => calls += 1,
-                    Content::ToolResult { .. } => result = Some(*b),
-                    Content::Refusal(t) => {
-                        refusal = Some(t);
-                    }
-                    Content::Reasoning { text, .. } => {
-                        if !self.policy.drop_reasoning && text.value().is_some() {
-                            reasoning = text.value();
-                        }
-                    }
-                    _ => other += 1,
+        for (_, b) in blocks_in(self.records, index + 1, m.end) {
+            match b.content {
+                Content::Text(t) => {
+                    plain += 1;
+                    text_value = Some(t);
                 }
+                Content::ToolCall { .. } => calls += 1,
+                Content::ToolResult { .. } => result = Some(b),
+                Content::Refusal(t) => refusal = Some(t),
+                Content::Reasoning { text, .. } => {
+                    if !self.policy.drop_reasoning && text.value().is_some() {
+                        reasoning = text.value();
+                    }
+                }
+                _ => other += 1,
             }
         }
         if let Some(b) = result {
@@ -1353,7 +1439,7 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                 is_error,
             } = b.content
             {
-                if !is_error.is_missing() {
+                if matches!(is_error, Presence::Value(true)) {
                     return Err(Error::Unsupported {
                         feature: "Chat tool error flag",
                     });
@@ -1377,13 +1463,9 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
             if (response || m.shape == ContentShape::String) && plain > 1 && other == 0 {
                 key(&mut self.w, &mut c, "content");
                 self.w.byte(b'"');
-                for record in &self.records[index + 1..m.end] {
-                    if let Record::Block(Block {
-                        content: Content::Text(t),
-                        ..
-                    }) = record
-                    {
-                        text_inner(&mut self.w, *t);
+                for (_, b) in blocks_in(self.records, index + 1, m.end) {
+                    if let Content::Text(t) = b.content {
+                        text_inner(&mut self.w, t);
                     }
                 }
                 self.w.byte(b'"');
@@ -1396,13 +1478,11 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                 key(&mut self.w, &mut c, "content");
                 self.w.byte(b'[');
                 let mut bc = false;
-                for at in index + 1..m.end {
-                    if let Record::Block(b) = self.records[at]
-                        && matches!(
-                            b.content,
-                            Content::Text(_) | Content::Media(_) | Content::Opaque { .. }
-                        )
-                    {
+                for (_, b) in blocks_in(self.records, index + 1, m.end) {
+                    if matches!(
+                        b.content,
+                        Content::Text(_) | Content::Media(_) | Content::Opaque { .. }
+                    ) {
                         if bc {
                             self.w.byte(b',');
                         }
@@ -1435,13 +1515,9 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
             if refusal.is_some() {
                 key(&mut self.w, &mut c, "refusal");
                 self.w.byte(b'"');
-                for record in &self.records[index + 1..m.end] {
-                    if let Record::Block(Block {
-                        content: Content::Refusal(t),
-                        ..
-                    }) = record
-                    {
-                        text_inner(&mut self.w, *t);
+                for (_, b) in blocks_in(self.records, index + 1, m.end) {
+                    if let Content::Refusal(t) = b.content {
+                        text_inner(&mut self.w, t);
                     }
                 }
                 self.w.byte(b'"');
@@ -1454,17 +1530,13 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                 }
                 key(&mut self.w, &mut c, "reasoning_content");
                 self.w.byte(b'"');
-                for record in &self.records[index + 1..m.end] {
-                    if let Record::Block(Block {
-                        content:
-                            Content::Reasoning {
-                                text: Presence::Value(t),
-                                ..
-                            },
+                for (_, b) in blocks_in(self.records, index + 1, m.end) {
+                    if let Content::Reasoning {
+                        text: Presence::Value(t),
                         ..
-                    }) = record
+                    } = b.content
                     {
-                        text_inner(&mut self.w, *t);
+                        text_inner(&mut self.w, t);
                     }
                 }
                 self.w.byte(b'"');
@@ -1478,14 +1550,10 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                         feature: "multiple calls with legacy function_call",
                     });
                 }
-                for at in index + 1..m.end {
-                    if let Record::Block(Block {
-                        content:
-                            Content::ToolCall {
-                                name, arguments, ..
-                            },
-                        ..
-                    }) = self.records[at]
+                for (_, b) in blocks_in(self.records, index + 1, m.end) {
+                    if let Content::ToolCall {
+                        name, arguments, ..
+                    } = b.content
                     {
                         key(&mut self.w, &mut c, "function_call");
                         self.w.raw(b"{\"name\":");
@@ -1499,14 +1567,13 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                 key(&mut self.w, &mut c, "tool_calls");
                 self.w.byte(b'[');
                 let mut tc = false;
-                for at in index + 1..m.end {
-                    if let Record::Block(b) = self.records[at]
-                        && let Content::ToolCall {
-                            id,
-                            name,
-                            arguments,
-                            ..
-                        } = b.content
+                for (_, b) in blocks_in(self.records, index + 1, m.end) {
+                    if let Content::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                        ..
+                    } = b.content
                     {
                         if tc {
                             self.w.byte(b',');
@@ -1563,36 +1630,10 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                     at = m.end;
                     continue;
                 }
-                let only_summaries = self.records[at + 1..m.end]
-                    .iter()
-                    .filter_map(|r| {
-                        if let Record::Block(b) = r {
-                            Some(b)
-                        } else {
-                            None
-                        }
-                    })
-                    .all(|b| {
-                        matches!(
-                            b.content,
-                            Content::Reasoning {
-                                kind: ReasoningKind::Summary,
-                                ..
-                            }
-                        )
-                    });
-                let has_summaries = self.records[at + 1..m.end].iter().any(|r| {
-                    matches!(
-                        r,
-                        Record::Block(Block {
-                            content: Content::Reasoning {
-                                kind: ReasoningKind::Summary,
-                                ..
-                            },
-                            ..
-                        })
-                    )
-                });
+                let only_summaries = blocks_in(self.records, at + 1, m.end)
+                    .all(|(_, b)| matches!(b.content, Content::Reasoning { .. }));
+                let has_summaries = blocks_in(self.records, at + 1, m.end)
+                    .any(|(_, b)| matches!(b.content, Content::Reasoning { .. }));
                 if self.target.protocol == Protocol::OpenAiResponses
                     && only_summaries
                     && has_summaries
@@ -1608,8 +1649,8 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                     continue;
                 }
                 let mut run_start = at + 1;
-                for bi in at + 1..m.end {
-                    if let Record::Block(b) = self.records[bi] {
+                for (bi, b) in blocks_in(self.records, at + 1, m.end) {
+                    {
                         let special = matches!(
                             b.content,
                             Content::ToolCall { .. }
@@ -1634,11 +1675,7 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                         }
                     }
                 }
-                if run_start < m.end
-                    || !self.records[at + 1..m.end]
-                        .iter()
-                        .any(|r| matches!(r, Record::Block(_)))
-                {
+                if run_start < m.end || blocks_in(self.records, at + 1, m.end).next().is_none() {
                     self.item_message(m, run_start, m.end, response, &mut comma)?;
                 }
                 at = m.end;
@@ -1654,27 +1691,29 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
         let mut signature = Presence::Missing;
         let mut item_status = Presence::Missing;
         let mut item_extras = Span::EMPTY;
-        for record in &self.records[start..end] {
-            if let Record::Block(b) = record {
-                if !b.item_id.is_missing() {
-                    id = b.item_id;
-                    item_status = b.item_status;
+        for (_, b) in blocks_in(self.records, start, end) {
+            if !b.item_id.is_missing() {
+                id = b.item_id;
+            }
+            if !b.item_status.is_missing() {
+                item_status = b.item_status;
+            }
+            if let Content::Reasoning {
+                signature: value,
+                text,
+                ..
+            } = b.content
+            {
+                if !value.is_missing() {
+                    if !signature.is_missing() {
+                        return Err(Error::Unsupported {
+                            feature: "multiple reasoning signatures in one item",
+                        });
+                    }
+                    signature = value;
                 }
-                if let Content::Reasoning {
-                    signature: s, text, ..
-                } = b.content
-                {
-                    if !s.is_missing() {
-                        if !signature.is_missing() {
-                            return Err(Error::Unsupported {
-                                feature: "multiple reasoning signatures in one item",
-                            });
-                        }
-                        signature = s;
-                    }
-                    if text.is_missing() {
-                        item_extras = b.extensions;
-                    }
+                if text.is_missing() {
+                    item_extras = b.extensions;
                 }
             }
         }
@@ -1695,30 +1734,57 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
             );
         }
         key(&mut self.w, &mut c, "summary");
-        self.w.byte(b'[');
-        let mut sc = false;
-        for record in &self.records[start..end] {
-            if let Record::Block(b) = record
-                && let Content::Reasoning {
-                    text: Presence::Value(t),
+        self.reasoning_parts(start, end, ReasoningKind::Summary)?;
+        if blocks_in(self.records, start, end).any(|(_, b)| {
+            matches!(
+                b.content,
+                Content::Reasoning {
+                    kind: ReasoningKind::Thought,
+                    text: Presence::Value(_),
                     ..
-                } = b.content
+                }
+            )
+        }) {
+            key(&mut self.w, &mut c, "content");
+            self.reasoning_parts(start, end, ReasoningKind::Thought)?;
+        }
+        ptext(&mut self.w, &mut c, "encrypted_content", signature);
+        self.extras(item_extras, &mut c)?;
+        self.w.byte(b'}');
+        Ok(())
+    }
+    fn reasoning_parts(
+        &mut self,
+        start: usize,
+        end: usize,
+        desired: ReasoningKind,
+    ) -> Result<(), Error> {
+        self.w.byte(b'[');
+        let mut comma = false;
+        for (_, b) in blocks_in(self.records, start, end) {
+            if let Content::Reasoning {
+                kind,
+                text: Presence::Value(text),
+                ..
+            } = b.content
+                && kind == desired
             {
-                if sc {
+                if comma {
                     self.w.byte(b',');
                 }
-                sc = true;
-                self.w.raw(b"{\"type\":\"summary_text\",\"text\":");
-                write_text(&mut self.w, t);
+                comma = true;
+                self.w.raw(if kind == ReasoningKind::Summary {
+                    b"{\"type\":\"summary_text\",\"text\":"
+                } else {
+                    b"{\"type\":\"reasoning_text\",\"text\":"
+                });
+                write_text(&mut self.w, text);
                 let mut c = true;
                 self.extras(b.extensions, &mut c)?;
                 self.w.byte(b'}');
             }
         }
         self.w.byte(b']');
-        ptext(&mut self.w, &mut c, "encrypted_content", signature);
-        self.extras(item_extras, &mut c)?;
-        self.w.byte(b'}');
         Ok(())
     }
     fn item_message(
@@ -1852,14 +1918,16 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                 if interactions {
                     ptext(&mut self.w, &mut c, "name", name);
                     pbool(&mut self.w, &mut c, "is_error", is_error);
-                } else if !is_error.is_missing() {
+                } else if matches!(is_error, Presence::Value(true)) {
                     return Err(Error::Unsupported {
                         feature: "Responses tool result error flag",
                     });
                 }
             }
             Content::Reasoning {
-                text, signature, ..
+                kind,
+                text,
+                signature,
             } => {
                 key(&mut self.w, &mut c, "type");
                 self.w.string(if interactions {
@@ -1872,9 +1940,17 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                     ptext(&mut self.w, &mut c, "signature", signature);
                 } else {
                     key(&mut self.w, &mut c, "summary");
+                    if kind == ReasoningKind::Thought {
+                        self.w.raw(b"[]");
+                        key(&mut self.w, &mut c, "content");
+                    }
                     self.w.byte(b'[');
                     if let Presence::Value(t) = text {
-                        self.w.raw(b"{\"type\":\"summary_text\",\"text\":");
+                        self.w.raw(if kind == ReasoningKind::Thought {
+                            b"{\"type\":\"reasoning_text\",\"text\":"
+                        } else {
+                            b"{\"type\":\"summary_text\",\"text\":"
+                        });
                         write_text(&mut self.w, t);
                         self.w.byte(b'}');
                     }
@@ -2437,6 +2513,17 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                 }
             }
         }
+        if !p.text_verbosity.is_missing() {
+            match target {
+                Protocol::OpenAiChat => ptext(&mut self.w, comma, "verbosity", p.text_verbosity),
+                Protocol::OpenAiResponses => {}
+                _ => {
+                    return Err(Error::Unsupported {
+                        feature: "text verbosity in target",
+                    });
+                }
+            }
+        }
         let parallel = match p.parallel_tool_calls {
             Presence::Value(v) => Presence::Value(
                 v.as_bool()
@@ -2934,24 +3021,19 @@ pub fn encode_request<'a>(
                                 m.end = next.end;
                             }
                         }
-                        let results = request.records[at + 1..m.end]
-                            .iter()
-                            .filter(|r| {
-                                matches!(
-                                    r,
-                                    Record::Block(Block {
-                                        content: Content::ToolResult { .. },
-                                        ..
-                                    })
-                                )
-                            })
+                        let results = blocks_in(request.records, at + 1, m.end)
+                            .filter(|(_, b)| matches!(b.content, Content::ToolResult { .. }))
                             .count();
                         if target.protocol == Protocol::OpenAiChat && results > 1 {
-                            if request.records[at+1..m.end].iter().any(|r|matches!(r,Record::Block(Block{content, ..})if !matches!(content,Content::ToolResult{..}))){return Err(Error::Unsupported{feature:"mixed content and multiple tool results in Chat"});}
-                            for bi in at + 1..m.end {
-                                if let Record::Block(b) = request.records[bi]
-                                    && matches!(b.content, Content::ToolResult { .. })
-                                {
+                            if blocks_in(request.records, at + 1, m.end)
+                                .any(|(_, b)| !matches!(b.content, Content::ToolResult { .. }))
+                            {
+                                return Err(Error::Unsupported {
+                                    feature: "mixed content and multiple tool results in Chat",
+                                });
+                            }
+                            for (bi, b) in blocks_in(request.records, at + 1, m.end) {
+                                if matches!(b.content, Content::ToolResult { .. }) {
                                     if mc {
                                         e.w.byte(b',');
                                     }
@@ -3051,7 +3133,22 @@ pub fn encode_request<'a>(
     }
     if target.protocol != Protocol::GeminiGenerateContent {
         match request.output_constraint {
-            Presence::Missing => {}
+            Presence::Missing => {
+                if target.protocol == Protocol::OpenAiResponses
+                    && !request.parameters.text_verbosity.is_missing()
+                {
+                    key(&mut e.w, &mut comma, "text");
+                    e.w.byte(b'{');
+                    let mut tc = false;
+                    ptext(
+                        &mut e.w,
+                        &mut tc,
+                        "verbosity",
+                        request.parameters.text_verbosity,
+                    );
+                    e.w.byte(b'}');
+                }
+            }
             Presence::Null => {
                 if request.source != target {
                     return Err(Error::Unsupported {
@@ -3060,7 +3157,15 @@ pub fn encode_request<'a>(
                 }
                 if target.protocol == Protocol::OpenAiResponses {
                     key(&mut e.w, &mut comma, "text");
-                    e.w.raw(b"{\"format\":null}");
+                    e.w.raw(b"{\"format\":null");
+                    let mut tc = true;
+                    ptext(
+                        &mut e.w,
+                        &mut tc,
+                        "verbosity",
+                        request.parameters.text_verbosity,
+                    );
+                    e.w.byte(b'}');
                 } else {
                     key(&mut e.w, &mut comma, "response_format");
                     e.w.raw(b"null");
@@ -3106,6 +3211,13 @@ pub fn encode_request<'a>(
                     }
                     e.w.byte(b'}');
                     if responses {
+                        let mut tc = true;
+                        ptext(
+                            &mut e.w,
+                            &mut tc,
+                            "verbosity",
+                            request.parameters.text_verbosity,
+                        );
                         e.w.byte(b'}');
                     }
                 } else if v.source == target {

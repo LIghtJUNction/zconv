@@ -517,7 +517,10 @@ fn call_id<'a>(
 fn check_call(function: V<'_, '_>) -> Result<(), Error> {
     keys(function, &["name", "arguments"])?;
     string(required(function, "name")?, "name")?;
-    string(required(function, "arguments")?, "arguments")?;
+    let args = required(function, "arguments")?;
+    if !matches!(args.kind(), Kind::String | Kind::Object) {
+        return Err(invalid("arguments", "expected JSON string or object"));
+    }
     Ok(())
 }
 
@@ -672,7 +675,13 @@ fn check_response_history(
         {
             return Err(invalid("role", "unknown Responses message role"));
         }
-        check_text(required(item, "content")?, Protocol::OpenAiResponses)?;
+        if let Some(content) = item.get("content") {
+            if !content.is_null() || !role.eq_str("assistant") {
+                check_text(content, Protocol::OpenAiResponses)?;
+            }
+        } else if !role.eq_str("assistant") {
+            return Err(invalid("content", "missing field"));
+        }
     }
     request_item_metadata(item, policy, count, fields)
 }
@@ -688,7 +697,14 @@ fn write_call_item(writer: &mut Writer<'_>, function: V<'_, '_>, id: Text<'_>) {
     writer.raw(b"{\"type\":\"function_call\",\"call_id\":");
     text(writer, id);
     copy(writer, function, "name", b"name");
-    copy(writer, function, "arguments", b"arguments");
+    if let Some(args) = function.get("arguments") {
+        property(writer, b"arguments");
+        if args.kind() == Kind::Object {
+            writer.string(args.raw());
+        } else {
+            writer.raw(args.raw());
+        }
+    }
     writer.byte(b'}');
 }
 
@@ -775,13 +791,20 @@ fn write_response_history(
         copy(writer, item, "output", b"content");
         writer.byte(b'}');
     } else {
-        write_message(
-            writer,
-            string(required(item, "role")?, "role")?,
-            required(item, "content")?,
-            Protocol::OpenAiResponses,
-            Protocol::OpenAiChat,
-        );
+        let role = string(required(item, "role")?, "role")?;
+        if let Some(content) = item.get("content").filter(|v| !v.is_null()) {
+            write_message(
+                writer,
+                role,
+                content,
+                Protocol::OpenAiResponses,
+                Protocol::OpenAiChat,
+            );
+        } else {
+            writer.raw(b"{\"role\":");
+            writer.json_string(role);
+            writer.raw(b",\"content\":[]}");
+        }
     }
     Ok(())
 }
@@ -807,6 +830,7 @@ fn check_text(value: V<'_, '_>, source: Protocol) -> Result<(), Error> {
                     return Err(unavailable("non-text Responses block"));
                 }
                 if let Some(annotations) = block.get("annotations")
+                    && !annotations.is_null()
                     && (annotations.kind() != Kind::Array || annotations.array().next().is_some())
                 {
                     return Err(unavailable("response annotations"));

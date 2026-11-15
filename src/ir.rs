@@ -84,6 +84,9 @@ impl Number<'_> {
 #[derive(Clone, Copy, Debug)]
 pub enum Data<'a> {
     Json(RawValue<'a>),
+    /// Typed tool-result content stored after its parent block in the same arena.
+    /// The span contains text/media blocks and preserves their order.
+    Content(Span),
     /// The decoded string must itself be a valid JSON value before object output.
     JsonText(Text<'a>),
     Text(Text<'a>),
@@ -290,14 +293,15 @@ impl Extension<'_> {
     pub fn is_empty_annotation(&self) -> bool {
         self.location == "content"
             && self.key.eq_str("annotations")
-            && self.value.kind() == crate::json::Kind::Array
-            && self
-                .value
-                .raw()
-                .iter()
-                .filter(|b| !b.is_ascii_whitespace())
-                .copied()
-                .eq(b"[]".iter().copied())
+            && (self.value.kind() == crate::json::Kind::Null
+                || (self.value.kind() == crate::json::Kind::Array
+                    && self
+                        .value
+                        .raw()
+                        .iter()
+                        .filter(|b| !b.is_ascii_whitespace())
+                        .copied()
+                        .eq(b"[]".iter().copied())))
     }
 }
 
@@ -336,6 +340,8 @@ pub struct Parameters<'a> {
     pub parallel_tool_calls: Presence<RawValue<'a>>,
     pub serial_tool_calls: Presence<bool>,
     pub reasoning_effort: Presence<Text<'a>>,
+    /// OpenAI text verbosity hint, independent of the structured output format.
+    pub text_verbosity: Presence<Text<'a>>,
     pub extensions: Span,
 }
 

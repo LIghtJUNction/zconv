@@ -319,3 +319,131 @@ fn continuous_owned_encoder_rolls_back_output_capacity_failures() {
         assert_eq!(usage_values(&output[..written]), [Some(count)]);
     }
 }
+
+const ANTHROPIC_PROVIDER: &str = concat!(
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"r1\",\"model\":\"m\",\"role\":\"assistant\",\"type\":\"message\",\"content\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":0,\"service_tier\":\"standard\",\"inference_geo\":\"us\"}}}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque-signed-by-provider\"}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":7,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srv_1\",\"name\":\"web_search\",\"input\":{}}}\n\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":7,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"test\\\"}\"}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":7}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":12,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srv_1\",\"content\":[{\"type\":\"web_search_result\",\"url\":\"https://example.test\",\"title\":\"result\",\"encrypted_content\":\"opaque\"}]}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":12}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":42,\"content_block\":{\"type\":\"text\",\"text\":\"answer\",\"citations\":[{\"type\":\"char_location\",\"cited_text\":\"source\",\"document_index\":0,\"start_char_index\":0,\"end_char_index\":6}]}}\n\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":42,\"delta\":{\"type\":\"text_delta\",\"text\":\" continued\"}}\n\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":42,\"delta\":{\"type\":\"citations_delta\",\"citation\":{\"type\":\"char_location\",\"cited_text\":\"other\",\"document_index\":0,\"start_char_index\":7,\"end_char_index\":12}}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":42}\n\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":7,\"server_tool_use\":{\"web_search_requests\":1},\"iterations\":[{\"type\":\"message\",\"input_tokens\":5,\"output_tokens\":7}]}}\n\n",
+    "data: {\"type\":\"message_stop\"}\n\n"
+);
+
+#[test]
+fn anthropic_provider_blocks_citations_and_usage_round_trip() {
+    let mut expected = None;
+    for strategy in [Strategy::Direct, Strategy::Ir] {
+        let result = run(
+            ANTHROPIC_PROVIDER.as_bytes(),
+            config(
+                Protocol::AnthropicMessages,
+                Protocol::AnthropicMessages,
+                strategy,
+            ),
+            1,
+            1,
+        )
+        .unwrap();
+        let wire = String::from_utf8(result.0).unwrap();
+        for field in [
+            "opaque-signed-by-provider",
+            "server_tool_use",
+            "web_search_tool_result",
+            "\"citations\":[",
+            "citations_delta",
+            "\"web_search_requests\":1",
+            "\"service_tier\":\"standard\"",
+            "\"inference_geo\":\"us\"",
+            "\"iterations\":[",
+        ] {
+            assert!(wire.contains(field), "missing {field}");
+        }
+        for line in wire.lines().filter_map(|line| line.strip_prefix("data: ")) {
+            let mut tokens = [Token::EMPTY; 512];
+            json::parse(line.as_bytes(), &mut tokens, json::Limits::default()).unwrap();
+        }
+        assert_eq!(result.3.output, Some(7));
+        assert_eq!(result.3.total, Some(12));
+        if let Some(ref expected) = expected {
+            assert_eq!(&wire, expected);
+        } else {
+            expected = Some(wire);
+        }
+    }
+}
+
+#[test]
+fn provider_owned_stream_data_does_not_cross_namespaces() {
+    let error = run(
+        ANTHROPIC_PROVIDER.as_bytes(),
+        config(
+            Protocol::AnthropicMessages,
+            Protocol::OpenAiChat,
+            Strategy::Ir,
+        ),
+        1,
+        1,
+    )
+    .unwrap_err()
+    .0;
+    assert!(matches!(
+        error,
+        Error::Unsupported {
+            feature: "provider-owned Anthropic stream data in target"
+        }
+    ));
+}
+
+#[test]
+fn provider_blocks_and_usage_enforce_shape_and_lifecycle() {
+    let late_delta = ANTHROPIC_PROVIDER.replace(
+        "\"type\":\"content_block_stop\",\"index\":2",
+        "\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"invalid\"}",
+    );
+    assert!(matches!(
+        run(
+            late_delta.as_bytes(),
+            config(
+                Protocol::AnthropicMessages,
+                Protocol::AnthropicMessages,
+                Strategy::Ir
+            ),
+            1,
+            1
+        ),
+        Err((Error::InvalidInput { .. }, _))
+    ));
+    for invalid in [
+        ANTHROPIC_PROVIDER.replace("\"web_search_requests\":1", "\"web_search_requests\":-1"),
+        ANTHROPIC_PROVIDER.replace(
+            "\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srv_1\"",
+            "\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srv_1\",\"is_error\":\"true\"",
+        ),
+        ANTHROPIC_PROVIDER.replace(
+            "\"type\":\"citations_delta\",\"citation\":{\"type\":\"char_location\"",
+            "\"type\":\"citations_delta\",\"citation\":{\"type\":null",
+        ),
+    ] {
+        assert!(matches!(
+            run(
+                invalid.as_bytes(),
+                config(
+                    Protocol::AnthropicMessages,
+                    Protocol::AnthropicMessages,
+                    Strategy::Direct
+                ),
+                7,
+                13
+            ),
+            Err((Error::InvalidInput { .. }, _))
+        ));
+    }
+}

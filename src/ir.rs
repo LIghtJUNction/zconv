@@ -326,6 +326,14 @@ impl Default for Record<'_> {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+pub struct StreamOptions {
+    /// Include final usage in the streamed response.
+    pub include_usage: Presence<bool>,
+    /// Emit cumulative usage on each content chunk where the target supports it.
+    pub continuous_usage_stats: Presence<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Parameters<'a> {
     pub temperature: Presence<RawValue<'a>>,
     pub top_p: Presence<RawValue<'a>>,
@@ -337,6 +345,7 @@ pub struct Parameters<'a> {
     pub presence_penalty: Presence<RawValue<'a>>,
     pub n: Presence<RawValue<'a>>,
     pub stream: Presence<RawValue<'a>>,
+    pub stream_options: Presence<StreamOptions>,
     pub parallel_tool_calls: Presence<RawValue<'a>>,
     pub serial_tool_calls: Presence<bool>,
     pub reasoning_effort: Presence<Text<'a>>,
@@ -458,6 +467,9 @@ pub struct EncodeReport<'a> {
     pub metadata_loss_fields: u32,
     pub transport_model: Presence<Text<'a>>,
     pub transport_stream: Presence<bool>,
+    /// Streaming usage preferences. Targets without `stream_options` keep these
+    /// outside the wire request so the caller can configure its event encoder.
+    pub transport_stream_options: Presence<StreamOptions>,
 }
 
 /// Envelope/item metadata loss fields; counts include repeated per-item fields.

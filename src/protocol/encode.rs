@@ -443,7 +443,9 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                                 return Err(Error::Unsupported {
                                     feature: "reasoning summary and provider thought differ",
                                 });
-                            } else if content_source != self.target && !signature.is_missing() {
+                            } else if content_source != self.target
+                                && matches!(signature, Presence::Value(_))
+                            {
                                 return Err(Error::PolicyViolation {
                                     feature: "reasoning signature belongs to source",
                                 });
@@ -1512,6 +1514,15 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
                 key(&mut self.w, &mut c, "reasoning_content");
                 self.w.raw(b"null");
             }
+            if reasoning.is_none() && matches!(m.reasoning, Presence::Value(())) {
+                if matches!(self.target.profile, Profile::Standard) {
+                    return Err(Error::Unsupported {
+                        feature: "reasoning_content requires explicit vendor profile",
+                    });
+                }
+                key(&mut self.w, &mut c, "reasoning_content");
+                self.w.string(b"");
+            }
             if refusal.is_some() {
                 key(&mut self.w, &mut c, "refusal");
                 self.w.byte(b'"');
@@ -2493,6 +2504,29 @@ impl<'a> Encoder<'a, '_, '_, '_, '_, '_> {
             };
         } else {
             praw(&mut self.w, comma, "stream", p.stream);
+        }
+        self.report.transport_stream_options = p.stream_options;
+        if matches!(target, Protocol::OpenAiChat | Protocol::OpenAiCompletions) {
+            match p.stream_options {
+                Presence::Missing => {}
+                Presence::Null => {
+                    key(&mut self.w, comma, "stream_options");
+                    self.w.raw(b"null");
+                }
+                Presence::Value(options) => {
+                    key(&mut self.w, comma, "stream_options");
+                    self.w.byte(b'{');
+                    let mut c = false;
+                    pbool(&mut self.w, &mut c, "include_usage", options.include_usage);
+                    pbool(
+                        &mut self.w,
+                        &mut c,
+                        "continuous_usage_stats",
+                        options.continuous_usage_stats,
+                    );
+                    self.w.byte(b'}');
+                }
+            }
         }
         if !p.reasoning_effort.is_missing() {
             match target {

@@ -385,6 +385,49 @@ pub enum EventKind {
     Grounding,
     Continuation,
     StopSequence,
+    /// Source-owned Anthropic block. `a` is complete block JSON; `b`/`c` are
+    /// server-tool ID/name where present. It opens a lifecycle slot but never
+    /// requests application tool execution. Tool input remains in `a`.
+    ProviderBlock,
+    /// Source-owned Anthropic delta. `a` is the complete delta JSON.
+    ProviderDelta,
+    /// Anthropic usage detail. `key.index` is an [`AnthropicUsageField`] and
+    /// `a` contains its JSON value, including an explicitly present null.
+    ProviderUsage,
+}
+
+/// Namespaced usage fields preserved without interpreting billing or execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum AnthropicUsageField {
+    ServerToolUse = 0,
+    ServiceTier = 1,
+    InferenceGeo = 2,
+    Iterations = 3,
+}
+impl AnthropicUsageField {
+    const ALL: [Self; 4] = [
+        Self::ServerToolUse,
+        Self::ServiceTier,
+        Self::InferenceGeo,
+        Self::Iterations,
+    ];
+    const fn name(self) -> &'static str {
+        match self {
+            Self::ServerToolUse => "server_tool_use",
+            Self::ServiceTier => "service_tier",
+            Self::InferenceGeo => "inference_geo",
+            Self::Iterations => "iterations",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderBlock {
+    None,
+    Text,
+    Tool,
+    Opaque,
 }
 
 /// Compact event IR. All spans refer to the associated payload, never a cache.
@@ -511,6 +554,7 @@ pub struct ActiveItem {
     pending_text: Option<Span>,
     signature: Option<Span>,
     signature_provider: Option<Format>,
+    provider_block: ProviderBlock,
 }
 impl ActiveItem {
     pub const EMPTY: Self = Self {
@@ -538,6 +582,7 @@ impl ActiveItem {
         pending_text: None,
         signature: None,
         signature_provider: None,
+        provider_block: ProviderBlock::None,
     };
 }
 impl Default for ActiveItem {
@@ -640,6 +685,7 @@ struct State {
     continuation: Option<(u32, Span)>,
     usage_seen: bool,
     usage_pending: bool,
+    provider_usage: [Option<Span>; 4],
 }
 impl State {
     fn new(context: StreamContext<'_>) -> Result<Self, Error> {
@@ -661,6 +707,7 @@ impl State {
             continuation: None,
             usage_seen: false,
             usage_pending: false,
+            provider_usage: [None; 4],
         })
     }
 }
@@ -1193,6 +1240,13 @@ trait Sink {
     ) -> Result<(), Error>;
     fn close(&mut self, key: Key) -> Result<(), Error>;
     fn usage(&mut self, usage: Usage) -> Result<(), Error>;
+    fn provider_block(&mut self, key: Key, value: Value<'_, '_>) -> Result<(), Error>;
+    fn provider_delta(&mut self, key: Key, value: Value<'_, '_>) -> Result<(), Error>;
+    fn provider_usage(
+        &mut self,
+        field: AnthropicUsageField,
+        value: Value<'_, '_>,
+    ) -> Result<(), Error>;
     fn images(&mut self, choice: u32, value: json::RawValue<'_>) -> Result<(), Error>;
     fn grounding(&mut self, choice: u32, value: json::RawValue<'_>) -> Result<(), Error>;
     fn continuation(&mut self, choice: u32, token: Text<'_>) -> Result<(), Error>;
@@ -1556,6 +1610,52 @@ impl Collector<'_, '_> {
     }
 }
 impl Sink for Collector<'_, '_> {
+    fn provider_block(&mut self, key: Key, value: Value<'_, '_>) -> Result<(), Error> {
+        let block = match decode::validate_provider_block(value)? {
+            ProviderBlock::Tool => BlockKind::Tool,
+            ProviderBlock::Opaque
+                if value
+                    .get("type")
+                    .and_then(Value::as_string)
+                    .is_some_and(|v| v.eq_str("redacted_thinking")) =>
+            {
+                BlockKind::Reasoning
+            }
+            _ => BlockKind::Text,
+        };
+        self.add(Event {
+            kind: EventKind::ProviderBlock,
+            key,
+            block,
+            a: self.text(Some(Text::Utf8(value.raw())))?,
+            b: self.text(value.get("id").and_then(Value::as_string).map(Text::Json))?,
+            c: self.text(value.get("name").and_then(Value::as_string).map(Text::Json))?,
+            ..Event::EMPTY
+        })
+    }
+    fn provider_delta(&mut self, key: Key, value: Value<'_, '_>) -> Result<(), Error> {
+        self.add(Event {
+            kind: EventKind::ProviderDelta,
+            key,
+            a: self.text(Some(Text::Utf8(value.raw())))?,
+            ..Event::EMPTY
+        })
+    }
+    fn provider_usage(
+        &mut self,
+        field: AnthropicUsageField,
+        value: Value<'_, '_>,
+    ) -> Result<(), Error> {
+        self.add(Event {
+            kind: EventKind::ProviderUsage,
+            key: Key {
+                index: field as u32,
+                ..Key::default()
+            },
+            a: self.text(Some(Text::Utf8(value.raw())))?,
+            ..Event::EMPTY
+        })
+    }
     fn begin(
         &mut self,
         id: Option<Text<'_>>,
@@ -1762,6 +1862,37 @@ fn replay(
     let a = event_text(event.a, payload)?;
     let b = event_text(event.b, payload)?;
     match event.kind {
+        EventKind::ProviderBlock | EventKind::ProviderDelta | EventKind::ProviderUsage => {
+            let Text::Utf8(raw) = required_text(a)? else {
+                return Err(Error::InvalidInput {
+                    field: "provider event",
+                    reason: "expected unquoted JSON",
+                });
+            };
+            let document = json::parse(raw, tokens, limits)?;
+            let value = document.root();
+            match event.kind {
+                EventKind::ProviderBlock => {
+                    decode::validate_provider_block(value)?;
+                    sink.provider_block(event.key, value)
+                }
+                EventKind::ProviderDelta => {
+                    decode::validate_provider_delta(value)?;
+                    sink.provider_delta(event.key, value)
+                }
+                _ => {
+                    let field = AnthropicUsageField::ALL
+                        .get(event.key.index as usize)
+                        .copied()
+                        .ok_or(Error::InvalidInput {
+                            field: "provider usage",
+                            reason: "unknown field",
+                        })?;
+                    decode::validate_provider_usage(field, value)?;
+                    sink.provider_usage(field, value)
+                }
+            }
+        }
         EventKind::Images | EventKind::Grounding => {
             let raw = required_text(a)?;
             let Text::Utf8(raw) = raw else {

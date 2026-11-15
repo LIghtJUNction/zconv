@@ -102,6 +102,11 @@ pub fn convert<'a>(
                     .get("stream")
                     .and_then(|v| v.as_bool())
                     .map_or(Presence::Missing, Presence::Value),
+                transport_stream_options: if operation == Operation::Request {
+                    protocol::stream_options(source.protocol, root)?
+                } else {
+                    Presence::Missing
+                },
                 ..EncodeReport::default()
             },
             resources,

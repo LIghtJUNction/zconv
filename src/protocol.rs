@@ -3,6 +3,7 @@
 mod decode;
 mod encode;
 
+pub(crate) use decode::stream_options;
 pub use decode::{decode_request, decode_response, validate};
 pub use encode::{encode_request, encode_response};
 

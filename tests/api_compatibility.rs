@@ -263,6 +263,15 @@ fn summaries_and_provider_signatures_are_not_relabelled_as_raw_thoughts() {
         ),
         Err(Error::PolicyViolation { .. })
     ));
+    let unsigned = br#"{"model":"m","input":[{"type":"reasoning","summary":null,"content":[{"type":"reasoning_text","text":"thought"}],"encrypted_content":null}]}"#;
+    let output = request(
+        unsigned,
+        Protocol::OpenAiResponses.into(),
+        compatible(Protocol::OpenAiChat),
+        Strategy::Ir,
+    )
+    .unwrap();
+    assert!(output.contains(r#""reasoning_content":"thought"#));
 }
 
 #[test]
@@ -512,4 +521,107 @@ fn nonstream_response_reasoning_alias_keeps_visible_text_and_usage() {
     assert!(output.contains(r#""reasoning_content":"ab"#));
     assert!(output.contains(r#""content":"answer"#));
     assert!(output.contains(r#""total_tokens":5"#));
+}
+
+#[test]
+fn stream_options_are_typed_preserved_and_returned_for_transport() {
+    use zconv::ir::Presence;
+    for (source, target, strategy) in [
+        (Protocol::OpenAiChat, Protocol::OpenAiChat, Strategy::Auto),
+        (Protocol::OpenAiChat, Protocol::OpenAiChat, Strategy::Ir),
+        (
+            Protocol::OpenAiChat,
+            Protocol::OpenAiResponses,
+            Strategy::Auto,
+        ),
+        (
+            Protocol::OpenAiChat,
+            Protocol::OpenAiCompletions,
+            Strategy::Ir,
+        ),
+    ] {
+        let input = br#"{"model":"m","messages":[{"role":"user","content":"x"}],"stream":false,"stream_options":{"include_usage":null,"continuous_usage_stats":true}}"#;
+        let mut tokens = [Token::EMPTY; 256];
+        let mut records = [Record::EMPTY; 64];
+        let mut nested = [Token::EMPTY; 64];
+        let mut scratch = [0; 1024];
+        let mut output = [0; 2048];
+        let result = zconv::convert(
+            source.into(),
+            target.into(),
+            Operation::Request,
+            input,
+            &mut output,
+            Options {
+                strategy,
+                ..Default::default()
+            },
+            Workspace {
+                tokens: &mut tokens,
+                records: &mut records,
+                scratch: &mut scratch,
+                nested_tokens: &mut nested,
+            },
+        )
+        .unwrap();
+        let Presence::Value(options) = result.report.transport_stream_options else {
+            panic!("missing usage preferences")
+        };
+        assert!(options.include_usage.is_null());
+        assert!(matches!(
+            options.continuous_usage_stats,
+            Presence::Value(true)
+        ));
+        let output = std::str::from_utf8(&output[..result.written()]).unwrap();
+        assert_eq!(
+            output.contains("stream_options"),
+            target != Protocol::OpenAiResponses,
+            "{output}"
+        );
+        assert!(output.contains(r#""stream":false"#));
+    }
+    let completion = br#"{"model":"m","prompt":"x","stream_options":{"include_usage":true,"continuous_usage_stats":false}}"#;
+    let chat = request(
+        completion,
+        Protocol::OpenAiCompletions.into(),
+        Protocol::OpenAiChat.into(),
+        Strategy::Ir,
+    )
+    .unwrap();
+    assert!(chat.contains(r#""include_usage":true,"continuous_usage_stats":false"#));
+}
+
+#[test]
+fn stream_option_booleans_and_presence_are_validated_without_cross_field_policy() {
+    for options in [
+        "null",
+        "{}",
+        r#"{"include_usage":null}"#,
+        r#"{"include_usage":true,"continuous_usage_stats":null}"#,
+    ] {
+        let input = format!(r#"{{"model":"m","messages":[],"stream_options":{options}}}"#);
+        let output = request(
+            input.as_bytes(),
+            Protocol::OpenAiChat.into(),
+            Protocol::OpenAiChat.into(),
+            Strategy::Ir,
+        )
+        .unwrap();
+        assert!(output.contains("stream_options"));
+    }
+    let invalid = br#"{"model":"m","messages":[],"stream_options":{"continuous_usage_stats":1}}"#;
+    for strategy in [Strategy::Auto, Strategy::Ir] {
+        assert!(matches!(
+            request(
+                invalid,
+                Protocol::OpenAiChat.into(),
+                Protocol::OpenAiChat.into(),
+                strategy
+            ),
+            Err(Error::InvalidInput {
+                field: "continuous_usage_stats",
+                ..
+            })
+        ));
+    }
 }

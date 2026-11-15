@@ -548,14 +548,9 @@ fn usage_anthropic(value: Value<'_, '_>) -> Result<Usage, Error> {
             "iterations",
         ],
     )?;
-    for field in ["server_tool_use", "iterations"] {
-        if value
-            .get(field)
-            .is_some_and(|value| !is_null_or_empty(value) && value.as_u64() != Some(0))
-        {
-            return Err(Error::Unsupported {
-                feature: "Anthropic detailed usage",
-            });
+    for field in AnthropicUsageField::ALL {
+        if let Some(detail) = value.get(field.name()) {
+            validate_provider_usage(field, detail)?;
         }
     }
     let ttl = value.get("cache_creation").filter(|v| !v.is_null());
@@ -584,6 +579,141 @@ fn usage_anthropic(value: Value<'_, '_>) -> Result<Usage, Error> {
     };
     validate_usage(usage)?;
     Ok(usage)
+}
+
+pub(super) fn validate_provider_usage(
+    field: AnthropicUsageField,
+    value: Value<'_, '_>,
+) -> Result<(), Error> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let valid = match field {
+        AnthropicUsageField::ServerToolUse => {
+            value.kind() == Kind::Object
+                && value.object().all(|(_, value)| value.as_u64().is_some())
+        }
+        AnthropicUsageField::ServiceTier | AnthropicUsageField::InferenceGeo => {
+            value.kind() == Kind::String
+        }
+        AnthropicUsageField::Iterations => {
+            value.kind() == Kind::Array && value.array().all(|entry| entry.kind() == Kind::Object)
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid(field.name()))
+    }
+}
+
+fn anthropic_usage(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
+    let usage = usage_anthropic(value)?;
+    // Details retain the provider namespace and exact JSON representation.
+    for field in AnthropicUsageField::ALL {
+        if let Some(detail) = value.get(field.name()) {
+            sink.provider_usage(field, detail)?;
+        }
+    }
+    sink.usage(usage)
+}
+
+fn validate_citation(value: Value<'_, '_>) -> Result<(), Error> {
+    if value.kind() != Kind::Object || string(value, "type")?.len() == 0 {
+        return Err(invalid("citation"));
+    }
+    for name in [
+        "document_index",
+        "start_char_index",
+        "end_char_index",
+        "start_page_number",
+        "end_page_number",
+        "start_block_index",
+        "end_block_index",
+        "search_result_index",
+    ] {
+        number(value, name)?;
+    }
+    for name in [
+        "cited_text",
+        "document_title",
+        "title",
+        "url",
+        "encrypted_index",
+    ] {
+        optional(value, name)?;
+    }
+    Ok(())
+}
+
+pub(super) fn validate_provider_block(value: Value<'_, '_>) -> Result<ProviderBlock, Error> {
+    if eq(value, "type", "text") {
+        fields(value, &["type", "text", "citations"])?;
+        string(value, "text")?;
+        if let Some(citations) = value.get("citations").filter(|v| !v.is_null()) {
+            if citations.kind() != Kind::Array {
+                return Err(invalid("citations"));
+            }
+            for citation in citations.array() {
+                validate_citation(citation)?;
+            }
+        }
+        Ok(ProviderBlock::Text)
+    } else if eq(value, "type", "redacted_thinking") {
+        fields(value, &["type", "data"])?;
+        string(value, "data")?;
+        Ok(ProviderBlock::Opaque)
+    } else if eq(value, "type", "server_tool_use") {
+        fields(value, &["type", "id", "name", "input", "caller"])?;
+        if string(value, "id")?.len() == 0 || string(value, "name")?.len() == 0 {
+            return Err(invalid("server tool identity"));
+        }
+        object(value, "input")?;
+        if let Some(caller) = value.get("caller").filter(|v| !v.is_null())
+            && caller.kind() != Kind::Object
+        {
+            return Err(invalid("caller"));
+        }
+        Ok(ProviderBlock::Tool)
+    } else if [
+        "web_search_tool_result",
+        "web_fetch_tool_result",
+        "code_execution_tool_result",
+        "bash_code_execution_tool_result",
+        "text_editor_code_execution_tool_result",
+        "tool_search_tool_result",
+        "mcp_tool_result",
+    ]
+    .iter()
+    .any(|name| eq(value, "type", name))
+    {
+        fields(value, &["type", "tool_use_id", "content", "is_error"])?;
+        if string(value, "tool_use_id")?.len() == 0 {
+            return Err(invalid("tool_use_id"));
+        }
+        let content = value.get("content").ok_or_else(|| invalid("content"))?;
+        if !matches!(content.kind(), Kind::Array | Kind::Object | Kind::String) {
+            return Err(invalid("tool result content"));
+        }
+        if let Some(is_error) = value.get("is_error").filter(|v| !v.is_null())
+            && is_error.as_bool().is_none()
+        {
+            return Err(invalid("is_error"));
+        }
+        Ok(ProviderBlock::Opaque)
+    } else {
+        Err(Error::Unsupported {
+            feature: "Anthropic provider block",
+        })
+    }
+}
+
+pub(super) fn validate_provider_delta(value: Value<'_, '_>) -> Result<(), Error> {
+    fields(value, &["type", "citation"])?;
+    if !eq(value, "type", "citations_delta") {
+        return Err(invalid("provider delta type"));
+    }
+    validate_citation(object(value, "citation")?)
 }
 fn usage_google(value: Value<'_, '_>, interactions: bool) -> Result<Usage, Error> {
     if value.is_null() {
@@ -704,7 +834,7 @@ fn anthropic(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
         }
         empty_only(message, "content")?;
         if let Some(usage) = message.get("usage") {
-            sink.usage(usage_anthropic(usage)?)?;
+            anthropic_usage(usage, sink)?;
         }
         return sink.begin(optional(message, "id")?, optional(message, "model")?, None);
     }
@@ -734,7 +864,10 @@ fn anthropic(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
             }
         } else if eq(block, "type", "text") {
             fields(block, &["type", "text", "citations"])?;
-            empty_only(block, "citations")?;
+            if block.get("citations").is_some() {
+                validate_provider_block(block)?;
+                return sink.provider_block(key, block);
+            }
             sink.block(key, BlockKind::Text, None, None, None)?;
             if let Some(text) = optional(block, "text")?
                 && text.len() != 0
@@ -755,9 +888,8 @@ fn anthropic(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
                 sink.signature(key, text, None)?;
             }
         } else {
-            return Err(Error::Unsupported {
-                feature: "Anthropic stream content block",
-            });
+            validate_provider_block(block)?;
+            return sink.provider_block(key, block);
         }
         return Ok(());
     }
@@ -780,6 +912,9 @@ fn anthropic(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
         } else if eq(delta, "type", "signature_delta") {
             fields(delta, &["type", "signature"])?;
             sink.signature(key, string(delta, "signature")?, None)
+        } else if eq(delta, "type", "citations_delta") {
+            validate_provider_delta(delta)?;
+            sink.provider_delta(key, delta)
         } else {
             Err(Error::Unsupported {
                 feature: "Anthropic stream delta",
@@ -794,7 +929,7 @@ fn anthropic(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
     } else if event_type.eq_str("message_delta") {
         fields(value, &["type", "delta", "usage"])?;
         if let Some(usage) = value.get("usage") {
-            sink.usage(usage_anthropic(usage)?)?;
+            anthropic_usage(usage, sink)?;
         }
         let delta = object(value, "delta")?;
         fields(delta, &["stop_reason", "stop_sequence"])?;

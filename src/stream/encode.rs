@@ -51,6 +51,24 @@ fn quoted_span(writer: &mut Writer<'_>, aggregate: &[u8], value: Span) {
 }
 
 impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
+    fn require_anthropic_origin(&self) -> Result<(), Error> {
+        if self.config.source != self.config.target
+            || self.config.source.protocol != Protocol::AnthropicMessages
+        {
+            return Err(Error::Unsupported {
+                feature: "provider-owned Anthropic stream data in target",
+            });
+        }
+        Ok(())
+    }
+    fn provider_usage_fields(&mut self, first: &mut bool) {
+        for field in AnthropicUsageField::ALL {
+            if let Some(value) = self.state.provider_usage[field as usize] {
+                self.usage_key(first, field.name());
+                self.writer.raw(span(self.aggregate, value));
+            }
+        }
+    }
     fn provider_name(provider: Format) -> &'static [u8] {
         match provider.protocol {
             Protocol::AnthropicMessages => b"anthropic",
@@ -768,7 +786,7 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
     }
     fn write_usage(&mut self, protocol: Protocol) -> Result<(), Error> {
         let mut usage = self.state.usage.usage();
-        if usage == Usage::default() {
+        if usage == Usage::default() && self.state.provider_usage.iter().all(Option::is_none) {
             self.writer.raw(b"null");
             return Ok(());
         }
@@ -954,6 +972,9 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
         if protocol == Protocol::GeminiGenerateContent {
             self.usage_counter(&mut first, "toolUsePromptTokenCount", usage.tool_use_prompt);
         }
+        if protocol == Protocol::AnthropicMessages {
+            self.provider_usage_fields(&mut first);
+        }
         self.writer.byte(b'}');
         Ok(())
     }
@@ -1035,6 +1056,131 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
 }
 
 impl Sink for Emitter<'_, '_, '_, '_> {
+    fn provider_block(&mut self, key: Key, value: Value<'_, '_>) -> Result<(), Error> {
+        self.require_anthropic_origin()?;
+        let provider_block = decode::validate_provider_block(value)?;
+        if !self.state.begun
+            || self.state.ended
+            || self.state.seen_finish
+            || key.choice != 0
+            || key.part != 0
+            || self.lookup(key, None).is_some()
+        {
+            return Err(Error::InvalidInput {
+                field: "provider block",
+                reason: "invalid block lifecycle",
+            });
+        }
+        let slot = self.state.item_count;
+        if slot >= self.items.len() || slot > u32::MAX as usize {
+            return Err(Error::TooManyActiveItems {
+                needed: slot.saturating_add(1),
+            });
+        }
+        let kind = if provider_block == ProviderBlock::Tool {
+            BlockKind::Tool
+        } else {
+            BlockKind::Text
+        };
+        let (id, name) = if kind == BlockKind::Tool {
+            let id = value
+                .get("id")
+                .and_then(Value::as_string)
+                .ok_or(Error::InvalidInput {
+                    field: "id",
+                    reason: "missing server tool identity",
+                })?;
+            if self.items[..slot].iter().any(|item| {
+                item.kind == BlockKind::Tool
+                    && id.bytes().eq(span(self.aggregate, item.id).iter().copied())
+            }) {
+                return Err(Error::InvalidInput {
+                    field: "tool id",
+                    reason: "duplicate call id",
+                });
+            }
+            let name = value
+                .get("name")
+                .and_then(Value::as_string)
+                .ok_or(Error::InvalidInput {
+                    field: "name",
+                    reason: "missing server tool name",
+                })?;
+            (self.store(Text::Json(id))?, self.store(Text::Json(name))?)
+        } else {
+            (Span::EMPTY, Span::EMPTY)
+        };
+        self.items[slot] = ActiveItem {
+            used: true,
+            key,
+            kind,
+            id,
+            name,
+            provider_block,
+            wire_index: slot as u32,
+            ..ActiveItem::EMPTY
+        };
+        self.state.item_count += 1;
+        if kind == BlockKind::Tool
+            && let Some(input) = value.get("input").filter(|v| v.object().next().is_some())
+        {
+            self.append(slot, Text::Utf8(input.raw()))?;
+            self.items[slot].content_length = input.raw().len();
+        }
+        self.named(b"content_block_start", b"type");
+        self.writer.raw(b",\"index\":");
+        number(&mut self.writer, slot as u64);
+        self.writer.raw(b",\"content_block\":");
+        self.writer.raw(value.raw());
+        self.end_event();
+        Ok(())
+    }
+    fn provider_delta(&mut self, key: Key, value: Value<'_, '_>) -> Result<(), Error> {
+        self.require_anthropic_origin()?;
+        decode::validate_provider_delta(value)?;
+        let slot = self
+            .lookup(key, Some(BlockKind::Text))
+            .ok_or(Error::InvalidInput {
+                field: "citation delta",
+                reason: "text block missing",
+            })?;
+        let item = self.items[slot];
+        if item.closed
+            || item.finished
+            || item.provider_block == ProviderBlock::Opaque
+            || self.state.ended
+        {
+            return Err(Error::InvalidInput {
+                field: "citation delta",
+                reason: "outside text block lifecycle",
+            });
+        }
+        self.named(b"content_block_delta", b"type");
+        self.writer.raw(b",\"index\":");
+        number(&mut self.writer, u64::from(item.wire_index));
+        self.writer.raw(b",\"delta\":");
+        self.writer.raw(value.raw());
+        self.end_event();
+        Ok(())
+    }
+    fn provider_usage(
+        &mut self,
+        field: AnthropicUsageField,
+        value: Value<'_, '_>,
+    ) -> Result<(), Error> {
+        self.require_anthropic_origin()?;
+        decode::validate_provider_usage(field, value)?;
+        if self.state.ended {
+            return Err(Error::AlreadyFinished);
+        }
+        if self.state.provider_usage[field as usize]
+            .is_some_and(|old| span(self.aggregate, old) == value.raw())
+        {
+            return Ok(());
+        }
+        self.state.provider_usage[field as usize] = Some(self.store(Text::Utf8(value.raw()))?);
+        Ok(())
+    }
     fn begin(
         &mut self,
         id: Option<Text<'_>>,
@@ -1116,13 +1262,17 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                 } else {
                     Some(self.state.usage.usage().output.unwrap_or(0))
                 };
-                if input.is_none() && output.is_none() {
+                if input.is_none()
+                    && output.is_none()
+                    && self.state.provider_usage.iter().all(Option::is_none)
+                {
                     self.writer.raw(b"null");
                 } else {
                     self.writer.byte(b'{');
                     let mut first = true;
                     self.usage_counter(&mut first, "input_tokens", input);
                     self.usage_counter(&mut first, "output_tokens", output);
+                    self.provider_usage_fields(&mut first);
                     self.writer.byte(b'}');
                 }
                 self.writer.byte(b'}');
@@ -1324,6 +1474,12 @@ impl Sink for Emitter<'_, '_, '_, '_> {
             return Err(Error::InvalidInput {
                 field: "delta index",
                 reason: "block already closed",
+            });
+        }
+        if self.items[slot].provider_block == ProviderBlock::Opaque {
+            return Err(Error::InvalidInput {
+                field: "provider block delta",
+                reason: "complete provider block has no deltas",
             });
         }
         if kind == BlockKind::Reasoning

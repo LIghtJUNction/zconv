@@ -81,6 +81,31 @@ fn pbool(v: V<'_, '_>, key: &'static str) -> Result<Presence<bool>, Error> {
     })
 }
 
+pub(crate) fn stream_options(
+    source: Protocol,
+    root: V<'_, '_>,
+) -> Result<Presence<StreamOptions>, Error> {
+    if !matches!(source, Protocol::OpenAiChat | Protocol::OpenAiCompletions) {
+        return Ok(Presence::Missing);
+    }
+    Ok(match presence(root, "stream_options") {
+        Presence::Missing => Presence::Missing,
+        Presence::Null => Presence::Null,
+        Presence::Value(value) => {
+            object(value, "stream_options")?;
+            reject_extra(
+                value,
+                &["include_usage", "continuous_usage_stats"],
+                "stream option",
+            )?;
+            Presence::Value(StreamOptions {
+                include_usage: pbool(value, "include_usage")?,
+                continuous_usage_stats: pbool(value, "continuous_usage_stats")?,
+            })
+        }
+    })
+}
+
 fn pnumber<'a, 't>(v: V<'a, 't>, key: &'static str) -> Result<Presence<Number<'a>>, Error> {
     Ok(match presence(v, key) {
         Presence::Missing => Presence::Missing,
@@ -1693,6 +1718,7 @@ fn parameters<'a, 't>(
         },
         _ => Presence::Missing,
     };
+    params.stream_options = stream_options(source.protocol, root)?;
     params.text_verbosity = match source.protocol {
         Protocol::OpenAiChat => ptext(root, "verbosity")?,
         Protocol::OpenAiResponses => match root.get("text") {
@@ -1763,6 +1789,7 @@ pub(super) fn request_keys(source: Protocol) -> &'static [&'static str] {
             "top_p",
             "n",
             "stream",
+            "stream_options",
             "stop",
             "seed",
             "frequency_penalty",
@@ -1781,6 +1808,7 @@ pub(super) fn request_keys(source: Protocol) -> &'static [&'static str] {
             "max_completion_tokens",
             "n",
             "stream",
+            "stream_options",
             "stop",
             "seed",
             "frequency_penalty",

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.1
+
+- Include the downstream release evidence already present on the default branch in the published source crate. Runtime Rust sources and the public API are unchanged from 0.4.0.
+
 ## 0.4.0
 
 - Add allocation-free `api` contracts for Batch, Files, Embeddings and Images, including typed embedding builders, binary multipart uploads, JSONL envelopes, pagination, endpoint paths and image SSE framing. Known fields are validated; unknown fields remain borrowed and are preserved. These are locally owned contracts with no upstream SDK dependency.

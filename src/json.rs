@@ -884,6 +884,20 @@ impl Iterator for DecodedBytes<'_> {
     }
 }
 
+/// Escape spelling for the backspace and form-feed control characters.
+///
+/// Quotes, backslashes, newline, carriage return, tab and all other bytes retain
+/// the same spelling under both policies. This lets text protocols preserve
+/// their existing output without maintaining a separate JSON escaping loop.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ControlEscapes {
+    /// Use the JSON short escapes for backspace and form feed.
+    #[default]
+    Short,
+    /// Use lowercase four-digit Unicode escapes for backspace and form feed.
+    Unicode,
+}
+
 /// A bounded writer that continues counting after output capacity is exhausted.
 ///
 /// `finish` returns the exact required length. A failed output is provisional and
@@ -929,6 +943,13 @@ impl<'o> Writer<'o> {
     }
 
     pub fn string(&mut self, bytes: &[u8]) {
+        self.string_with_control_escapes(bytes, ControlEscapes::Short);
+    }
+
+    /// Write a UTF-8 string with an explicit backspace/form-feed spelling.
+    ///
+    /// Validation, counting and insufficient-output behavior match `string`.
+    pub fn string_with_control_escapes(&mut self, bytes: &[u8], escapes: ControlEscapes) {
         if let Err(error) = core::str::from_utf8(bytes) {
             self.error = Some(Error::InvalidJson {
                 offset: error.valid_up_to(),
@@ -947,8 +968,8 @@ impl<'o> Writer<'o> {
                     b'\n' => self.raw(b"\\n"),
                     b'\r' => self.raw(b"\\r"),
                     b'\t' => self.raw(b"\\t"),
-                    8 => self.raw(b"\\b"),
-                    12 => self.raw(b"\\f"),
+                    8 if escapes == ControlEscapes::Short => self.raw(b"\\b"),
+                    12 if escapes == ControlEscapes::Short => self.raw(b"\\f"),
                     _ => {
                         const HEX: &[u8; 16] = b"0123456789abcdef";
                         self.raw(&[

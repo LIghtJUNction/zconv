@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Add an explicit JSON control-escape policy for producers that must preserve `\u0008` and `\u000c` output. The existing writer keeps its default `\b` and `\f` spelling.
+- Share UTF-8 validation, escaping and exact output-capacity accounting across both policies. Cover prior producer bytes, all control characters, literal escape text and bounded-output failures.
+
 ## 0.4.1
 
 - Include the downstream release evidence already present on the default branch in the published source crate. Runtime Rust sources and the public API are unchanged from 0.4.0.

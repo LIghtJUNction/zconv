@@ -215,6 +215,27 @@ reserved capacities, state size, IR records and observed high-water usage.
 a lower bound. JSON input size, nesting, tokens and object members have explicit
 limits. Duplicate keys, including escape-equivalent names, are rejected.
 
+## JSON string output
+
+`json::Writer::string` writes into caller-owned storage and keeps its existing
+short escapes for backspace and form feed. Producers with an established textual
+format can select `ControlEscapes::Unicode` to emit `\u0008` and `\u000c` instead:
+
+```rust
+use zconv::json::{ControlEscapes, Writer};
+
+let mut output = [0u8; 16];
+let mut writer = Writer::new(&mut output);
+writer.string_with_control_escapes(b"\x08\x0c", ControlEscapes::Unicode);
+let used = writer.finish().unwrap();
+assert_eq!(&output[..used], br#""\u0008\u000c""#);
+```
+
+Both policies share the same UTF-8 validation and writing loop. Newline, carriage
+return, tab, other controls, quotes, backslashes and non-ASCII text keep the same
+spelling. Insufficient output still reports the exact required size; no allocator,
+new dependency or change to the default policy is introduced.
+
 ## Build, verify and measure
 
 ```sh

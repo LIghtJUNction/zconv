@@ -394,12 +394,8 @@ pub(super) fn validate(schema: Schema, v: V<'_, '_>) -> Result<(), Error> {
         Schema::OpenAiDecisionsRequest => openai_decisions_request(v)?,
         Schema::SystemOneResponse => {
             nonempty(required(v, "model")?, "model")?;
-            if let Some(answers) = v.get("answers") {
-                object(answers, "answers")?;
-            } else {
-                // Extraction uses a different result shape whose fields belong to the provider.
-                object(required(v, "fields")?, "fields")?;
-            }
+            // The named answers can hold decision results or typed extraction values.
+            object(required(v, "answers")?, "answers")?;
         }
         Schema::OpenAiDecisionsResponse => {
             nonempty(required(v, "model")?, "model")?;

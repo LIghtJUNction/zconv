@@ -1,4 +1,4 @@
-//! Borrowed OpenAI resource API messages, endpoint metadata and multipart bodies.
+//! Borrowed resource and decision API messages, endpoint metadata and multipart bodies.
 //!
 //! These APIs complement the model-conversation [`crate::Protocol`] adapters.
 //! They validate and write wire data without networking, allocation or an SDK.
@@ -19,9 +19,11 @@ use crate::{
     json::{self, JsonString, Kind, RawValue, Token, Value, Writer},
 };
 
-/// An OpenAI resource endpoint. Paths exclude a caller's base URL.
+/// A resource or decision endpoint. Paths exclude a caller's base URL.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Endpoint {
+    SystemOne,
+    OpenAiDecisions,
     Embeddings,
     ImageGenerations,
     ImageEdits,
@@ -51,9 +53,20 @@ impl Endpoint {
         }
     }
 
+    /// The operation suffix, without the API version or any base path.
+    pub const fn decision_operation(self) -> Option<&'static str> {
+        match self {
+            Self::SystemOne => Some("systemone"),
+            Self::OpenAiDecisions => Some("decisions"),
+            _ => None,
+        }
+    }
+
     /// Write a path, percent-encoding resource IDs as one path segment.
     pub fn write_path(self, id: Option<&str>, output: &mut [u8]) -> Result<usize, Error> {
         let (base, needs_id, suffix) = match self {
+            Self::SystemOne => ("/v1/systemone", false, ""),
+            Self::OpenAiDecisions => ("/v1/decisions", false, ""),
             Self::Embeddings => ("/v1/embeddings", false, ""),
             Self::ImageGenerations => ("/v1/images/generations", false, ""),
             Self::ImageEdits => ("/v1/images/edits", false, ""),
@@ -87,6 +100,8 @@ impl Endpoint {
     /// Image edits also support multipart through [`encode_multipart`].
     pub const fn request_schema(self) -> Option<Schema> {
         match self {
+            Self::SystemOne => Some(Schema::SystemOneRequest),
+            Self::OpenAiDecisions => Some(Schema::OpenAiDecisionsRequest),
             Self::Embeddings => Some(Schema::EmbeddingsRequest),
             Self::ImageGenerations => Some(Schema::ImageGenerationRequest),
             Self::ImageEdits => Some(Schema::ImageEditRequest),
@@ -98,6 +113,8 @@ impl Endpoint {
     /// File content is arbitrary bytes and therefore has no JSON schema.
     pub const fn response_schema(self) -> Option<Schema> {
         match self {
+            Self::SystemOne => Some(Schema::SystemOneResponse),
+            Self::OpenAiDecisions => Some(Schema::OpenAiDecisionsResponse),
             Self::Embeddings => Some(Schema::EmbeddingsResponse),
             Self::ImageGenerations | Self::ImageEdits | Self::ImageVariations => {
                 Some(Schema::ImagesResponse)
@@ -115,6 +132,10 @@ impl Endpoint {
 /// Validated JSON contracts for the resource APIs and batch JSONL records.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Schema {
+    SystemOneRequest,
+    SystemOneResponse,
+    OpenAiDecisionsRequest,
+    OpenAiDecisionsResponse,
     EmbeddingsRequest,
     EmbeddingsResponse,
     ImageGenerationRequest,
@@ -173,6 +194,36 @@ impl<'a, 't> Document<'a, 't> {
         w.raw(self.value.raw());
         w.finish()
     }
+    /// Write a decision request with a gateway-selected upstream model.
+    /// Other fields retain their original JSON values, including extensions.
+    pub fn encode_decision_model(self, model: &str, output: &mut [u8]) -> Result<usize, Error> {
+        if !matches!(
+            self.schema,
+            Schema::SystemOneRequest | Schema::OpenAiDecisionsRequest
+        ) {
+            return Err(invalid("schema", "expected a decision request"));
+        }
+        if model.is_empty() || model.chars().any(char::is_control) {
+            return Err(invalid(
+                "model",
+                "expected a nonempty model without control characters",
+            ));
+        }
+        let mut writer = Writer::new(output);
+        writer.raw(b"{\"model\":");
+        writer.string(model.as_bytes());
+        for (key, value) in self.value.object() {
+            if !key.eq_str("model") {
+                writer.byte(b',');
+                writer.json_string(key);
+                writer.byte(b':');
+                writer.raw(value.raw());
+            }
+        }
+        writer.byte(b'}');
+        writer.finish()
+    }
+
     /// Frame a validated image stream event as SSE. Pretty-printed JSON remains
     /// valid: each physical line receives a `data:` prefix, and CR/LF normalize
     /// to SSE line endings. The caller owns transport and incremental decoding.

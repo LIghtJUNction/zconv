@@ -641,3 +641,58 @@ fn stream_option_booleans_and_presence_are_validated_without_cross_field_policy(
         ));
     }
 }
+
+#[test]
+fn native_decision_contracts_select_and_rewrite_the_model() {
+    use zconv::{
+        api::{self, Endpoint},
+        json::{Limits, Token},
+    };
+    let pairs: &[(Endpoint, &[u8], &str)] = &[
+        (Endpoint::SystemOne, br#"{"model":"local","state":{"count":9007199254740993},"questions":{"paid":{"type":"noul"}}}"#, "/v1/systemone"),
+        (Endpoint::OpenAiDecisions, br#"{"model":"local","input":"Invoice","questions":[{"type":"predicate","name":"paid","instructions":"Has it been paid?"}]}"#, "/v1/decisions"),
+    ];
+    for &(endpoint, body, path) in pairs {
+        let mut output = [0; 512];
+        let len = endpoint.write_path(None, &mut output).unwrap();
+        assert_eq!(&output[..len], path.as_bytes());
+        let mut tokens = [Token::EMPTY; 64];
+        let request = api::parse(
+            endpoint.request_schema().unwrap(),
+            body,
+            &mut tokens,
+            Limits::default(),
+        )
+        .unwrap();
+        let len = request
+            .encode_decision_model("upstream", &mut output)
+            .unwrap();
+        let mut decoded = [Token::EMPTY; 64];
+        let changed = api::parse(
+            endpoint.request_schema().unwrap(),
+            &output[..len],
+            &mut decoded,
+            Limits::default(),
+        )
+        .unwrap();
+        assert!(changed.model().unwrap().eq_str("upstream"));
+        assert_eq!(
+            request.field("questions").unwrap().raw(),
+            changed.field("questions").unwrap().raw()
+        );
+        let other = if endpoint == Endpoint::SystemOne {
+            Endpoint::OpenAiDecisions
+        } else {
+            Endpoint::SystemOne
+        };
+        assert!(
+            api::parse(
+                other.request_schema().unwrap(),
+                body,
+                &mut decoded,
+                Limits::default()
+            )
+            .is_err()
+        );
+    }
+}

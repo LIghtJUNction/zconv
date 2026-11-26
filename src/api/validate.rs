@@ -327,9 +327,84 @@ fn api_path(v: V<'_, '_>, field: &'static str) -> Result<(), Error> {
     Ok(())
 }
 
+fn question_type(question: V<'_, '_>, variants: &[&str]) -> Result<(), Error> {
+    object(question, "question")?;
+    let ty = required(question, "type")?
+        .as_string()
+        .ok_or(invalid("type", "expected a question type"))?;
+    if variants.iter().any(|variant| ty.eq_str(variant)) {
+        Ok(())
+    } else {
+        Err(invalid("type", "unsupported question type"))
+    }
+}
+
+fn system_one_request(value: V<'_, '_>) -> Result<(), Error> {
+    if let Some(model) = value.get("model") {
+        nonempty(model, "model")?;
+    }
+    if !matches!(
+        required(value, "state")?.kind(),
+        Kind::String | Kind::Object | Kind::Array | Kind::Null
+    ) {
+        return Err(invalid("state", "expected text, object or array"));
+    }
+    match (value.get("questions"), value.get("fields")) {
+        (Some(questions), None) if questions.kind() == Kind::Object => {
+            let count = questions.object().count();
+            if !(1..=32).contains(&count) {
+                return Err(invalid("questions", "expected 1 to 32 named questions"));
+            }
+            for (_, question) in questions.object() {
+                question_type(question, &["noul", "choice", "score"])?;
+            }
+        }
+        (None, Some(fields))
+            if fields.kind() == Kind::Object && fields.object().next().is_some() => {}
+        _ => {
+            return Err(invalid(
+                "questions",
+                "expected exactly one questions or fields object",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn openai_decisions_request(value: V<'_, '_>) -> Result<(), Error> {
+    nonempty(required(value, "model")?, "model")?;
+    if !matches!(required(value, "input")?.kind(), Kind::String | Kind::Array) {
+        return Err(invalid("input", "expected text or input items"));
+    }
+    let questions = required(value, "questions")?;
+    kind(questions, Kind::Array, "questions")?;
+    if !(1..=400).contains(&questions.array().count()) {
+        return Err(invalid("questions", "expected 1 to 400 questions"));
+    }
+    for question in questions.array() {
+        question_type(question, &["predicate", "choice", "score"])?;
+    }
+    Ok(())
+}
+
 pub(super) fn validate(schema: Schema, v: V<'_, '_>) -> Result<(), Error> {
     object(v, "root")?;
     match schema {
+        Schema::SystemOneRequest => system_one_request(v)?,
+        Schema::OpenAiDecisionsRequest => openai_decisions_request(v)?,
+        Schema::SystemOneResponse => {
+            nonempty(required(v, "model")?, "model")?;
+            if let Some(answers) = v.get("answers") {
+                object(answers, "answers")?;
+            } else {
+                // Extraction uses a different result shape whose fields belong to the provider.
+                object(required(v, "fields")?, "fields")?;
+            }
+        }
+        Schema::OpenAiDecisionsResponse => {
+            nonempty(required(v, "model")?, "model")?;
+            kind(required(v, "answers")?, Kind::Array, "answers")?;
+        }
         Schema::EmbeddingsRequest => {
             nonempty(required(v, "model")?, "model")?;
             embeddings_input(required(v, "input")?)?;

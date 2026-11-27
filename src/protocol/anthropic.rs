@@ -7,6 +7,7 @@ pub const VERSION: &str = "2023-06-01";
 const CLI: &str = "claude-code-20250219";
 const INTERLEAVED: &str = "interleaved-thinking-2025-05-14";
 const CONTEXT: &str = "context-management-2025-06-27";
+pub const EFFORT_BETA: &str = "effort-2025-11-24";
 const TOKEN_PROGRESS: &str = "thinking-token-count-2026-05-13";
 
 /// Validate the standard Messages version and known SDK negotiation markers.
@@ -18,9 +19,12 @@ pub fn validate_messages_envelope(
     if version.is_some_and(|v| v != VERSION)
         || query.is_some_and(|q| q != "beta=true")
         || beta.is_some_and(|value| {
-            !value
-                .split(',')
-                .all(|marker| matches!(marker.trim(), CLI | INTERLEAVED | CONTEXT | TOKEN_PROGRESS))
+            !value.split(',').all(|marker| {
+                matches!(
+                    marker.trim(),
+                    CLI | INTERLEAVED | CONTEXT | TOKEN_PROGRESS | EFFORT_BETA
+                )
+            })
         })
     {
         return Err(Error::Unsupported {
@@ -28,6 +32,61 @@ pub fn validate_messages_envelope(
         });
     }
     Ok(())
+}
+
+/// Validate a Messages output configuration carrying a named thinking effort.
+pub fn messages_effort(controls: Value<'_, '_>) -> Result<Option<&'static str>, Error> {
+    let Some(config) = controls.get("output_config") else {
+        return Ok(None);
+    };
+    let value = config.get("effort").and_then(Value::as_string);
+    if config.object().any(|(key, _)| !key.eq_str("effort")) {
+        return Err(invalid(
+            "output_config",
+            "unsupported native output control",
+        ));
+    }
+    ["low", "medium", "high", "xhigh", "max"]
+        .into_iter()
+        .find(|effort| value.is_some_and(|v| v.eq_str(effort)))
+        .map(Some)
+        .ok_or_else(|| invalid("output_config", "invalid thinking effort"))
+}
+
+/// Project a Messages effort to Responses when the native-only context
+/// policy retains all thinking and no fixed thinking budget is requested.
+pub fn responses_effort(controls: Value<'_, '_>) -> Result<Option<&'static str>, Error> {
+    let unsupported = || Error::Unsupported {
+        feature: "native Anthropic thinking or context control in Responses",
+    };
+    if controls.get("thinking").is_some_and(|v| {
+        !v.get("type")
+            .and_then(Value::as_string)
+            .is_some_and(|v| v.eq_str("adaptive"))
+            || v.get("display")
+                .is_some_and(|d| !d.as_string().is_some_and(|d| d.eq_str("omitted")))
+    }) || controls.get("context_management").is_some_and(|ctx| {
+        !ctx.get("edits")
+            .and_then(|edits| edits.array().next())
+            .and_then(|edit| edit.get("keep"))
+            .and_then(Value::as_string)
+            .is_some_and(|keep| keep.eq_str("all"))
+    }) {
+        return Err(unsupported());
+    }
+    messages_effort(controls)
+}
+
+/// Project inclusive input usage into the disjoint Messages input count.
+pub fn uncached_input(
+    input: u64,
+    cache_read: Option<u64>,
+    cache_write: Option<u64>,
+) -> Result<u64, Error> {
+    input
+        .checked_sub(cache_read.unwrap_or(0))
+        .and_then(|left| left.checked_sub(cache_write.unwrap_or(0)))
+        .ok_or_else(|| invalid("usage", "cache counts exceed inclusive input"))
 }
 
 /// Validate the native fields used by Claude Code and identify the supplier
@@ -125,6 +184,23 @@ mod tests {
         ] {
             assert!(validate_messages_envelope(version, markers, query).is_err());
         }
+    }
+
+    #[test]
+    fn claude_code_effort_projects_without_fabricating_native_reasoning() {
+        let mut tokens = [Token::EMPTY; 64];
+        let request = parse(
+            br#"{"thinking":{"type":"adaptive","display":"omitted"},"output_config":{"effort":"high"},"context_management":{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}}"#,
+            &mut tokens,
+            Limits::default(),
+        ).unwrap();
+        assert_eq!(responses_effort(request.root()), Ok(Some("high")));
+        let request = parse(
+            br#"{"thinking":{"type":"enabled","budget_tokens":1024},"output_config":{"effort":"high"}}"#,
+            &mut tokens,
+            Limits::default(),
+        ).unwrap();
+        assert!(responses_effort(request.root()).is_err());
     }
 
     #[test]

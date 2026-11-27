@@ -849,13 +849,7 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
         usage
             .input
             .map(|input| {
-                input
-                    .checked_sub(usage.cached.unwrap_or(0))
-                    .and_then(|input| input.checked_sub(usage.cache_write.unwrap_or(0)))
-                    .ok_or(Error::InvalidInput {
-                        field: "usage",
-                        reason: "cached tokens exceed canonical input",
-                    })
+                crate::protocol::anthropic::uncached_input(input, usage.cached, usage.cache_write)
             })
             .transpose()
     }

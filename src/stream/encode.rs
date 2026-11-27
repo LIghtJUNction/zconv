@@ -1235,13 +1235,11 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
                 self.writer.raw(b"}]");
                 self.end_chat_event()?;
             }
-            Protocol::GeminiGenerateContent => {
-                if !self.config.gemini_chat_history {
-                    self.writer.raw(b"data: {\"candidates\":[{\"index\":");
-                    number(&mut self.writer, u64::from(choice));
-                    self.gemini_finish_fields(choice, reason)?;
-                    self.writer.raw(b"}]}\n\n");
-                }
+            Protocol::GeminiGenerateContent if !self.config.gemini_chat_history => {
+                self.writer.raw(b"data: {\"candidates\":[{\"index\":");
+                number(&mut self.writer, u64::from(choice));
+                self.gemini_finish_fields(choice, reason)?;
+                self.writer.raw(b"}]}\n\n");
             }
             _ => {}
         }

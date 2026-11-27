@@ -1187,3 +1187,61 @@ fn length_and_safety_finishes_remain_incomplete_in_responses() {
         );
     }
 }
+
+#[test]
+fn gemini_signed_text_parts_keep_their_positions_across_a_tool_and_frame_boundary() {
+    let input = concat!(
+        r#"data: {"responseId":"r1","modelVersion":"m","candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"before","thoughtSignature":"sig-A"},{"functionCall":{"id":"call-1","name":"lookup","args":{}}},{"text":"af"}]}}]}"#,
+        "\n\n",
+        r#"data: {"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"ter","thoughtSignature":"sig-B"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":1,"totalTokenCount":6}}"#,
+        "\n\n",
+    )
+    .as_bytes();
+    let convert = |target, strategy| {
+        let mut cfg = config(Protocol::GeminiGenerateContent, target, strategy);
+        cfg.target.profile = zconv::Profile::OpenAiCompatible("test");
+        run(input, cfg, 1, 7).unwrap().0
+    };
+    let chat = convert(Protocol::OpenAiChat, Strategy::Direct);
+    assert_eq!(chat, convert(Protocol::OpenAiChat, Strategy::Ir));
+    assert_eq!(chat_text(&chat), "beforeafter");
+
+    let responses = convert(Protocol::OpenAiResponses, Strategy::Ir);
+    let events = json_events(&responses);
+    let mut tokens = [Token::EMPTY; 256];
+    let doc = json::parse(events.last().unwrap(), &mut tokens, json::Limits::default()).unwrap();
+    let root = doc.root();
+    fn field(value: json::Value<'_, '_>, key: &str, expected: &str) {
+        assert!(
+            value
+                .get(key)
+                .unwrap()
+                .as_string()
+                .unwrap()
+                .eq_str(expected)
+        );
+    }
+    field(root, "type", "response.completed");
+    let output: Vec<_> = root
+        .get("response")
+        .unwrap()
+        .get("output")
+        .unwrap()
+        .array()
+        .collect();
+    assert_eq!(output.len(), 3);
+    for (index, text, signature) in [(0, "before", "sig-A"), (2, "after", "sig-B")] {
+        let item = output[index];
+        field(item, "type", "message");
+        let mut content = item.get("content").unwrap().array();
+        field(content.next().unwrap(), "text", text);
+        assert!(content.next().is_none());
+        let meta = item.get("provider_metadata").unwrap();
+        field(meta, "protocol", "gemini");
+        field(meta, "signature", signature);
+    }
+    field(output[1], "type", "function_call");
+    field(output[1], "call_id", "call-1");
+    field(output[1], "name", "lookup");
+    assert!(output[1].get("provider_metadata").is_none());
+}

@@ -1516,12 +1516,15 @@ fn google(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
                         } else {
                             u32::MAX - 2
                         },
-                        part: 0,
+                        part: u32::try_from(part_index).map_err(|_| invalid("parts"))?,
                     };
-                    sink.delta(key, kind, text)?;
-                    if let Some(signature) = optional(part, "thoughtSignature")? {
-                        sink.signature(key, signature, None)?;
-                    }
+                    sink.gemini_part(
+                        key,
+                        kind,
+                        Some(text),
+                        optional(part, "thoughtSignature")?,
+                        Text::Utf8(part.raw_value().raw()),
+                    )?;
                 } else if let Some(function) = part.get("functionCall") {
                     fields(function, &["id", "name", "args"])?;
                     let key = Key {
@@ -1538,14 +1541,16 @@ fn google(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
                         optional(part, "thoughtSignature")?,
                     )?;
                 } else if let Some(signature) = optional(part, "thoughtSignature")? {
-                    sink.signature(
+                    sink.gemini_part(
                         Key {
                             choice,
                             index: u32::MAX - 2,
-                            part: 0,
+                            part: u32::try_from(part_index).map_err(|_| invalid("parts"))?,
                         },
-                        signature,
+                        BlockKind::ReasoningSummary,
                         None,
+                        Some(signature),
+                        Text::Utf8(part.raw_value().raw()),
                     )?;
                 } else {
                     return Err(Error::Unsupported {

@@ -1248,6 +1248,52 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
 }
 
 impl Sink for Emitter<'_, '_, '_, '_> {
+    fn gemini_part(
+        &mut self,
+        key: Key,
+        kind: BlockKind,
+        text: Option<Text<'_>>,
+        signature: Option<Text<'_>>,
+        _part: Text<'_>,
+    ) -> Result<(), Error> {
+        // A Gemini chunk has no persistent part ID. Only its first part can
+        // continue the previous chunk's last block in the same candidate.
+        let last = self.items[..self.state.item_count]
+            .iter()
+            .rev()
+            .find(|item| item.key.choice == key.choice);
+        let key = match last {
+            Some(item)
+                if !item.closed
+                    && item.kind == kind
+                    && item.key.index == key.index
+                    && (text.is_none() || key.part == 0) =>
+            {
+                item.key
+            }
+            _ if text.is_some() => Key {
+                part: u32::try_from(self.state.item_count).map_err(|_| {
+                    Error::TooManyActiveItems {
+                        needed: self.state.item_count,
+                    }
+                })?,
+                ..key
+            },
+            _ => {
+                return Err(Error::InvalidInput {
+                    field: "signature",
+                    reason: "no current Gemini text part",
+                });
+            }
+        };
+        if let Some(text) = text {
+            self.delta(key, kind, text)?;
+        }
+        if let Some(signature) = signature {
+            self.signature(key, signature, None)?;
+        }
+        Ok(())
+    }
     fn provider_block(&mut self, key: Key, value: Value<'_, '_>) -> Result<(), Error> {
         self.require_anthropic_origin()?;
         let provider_block = decode::validate_provider_block(value)?;

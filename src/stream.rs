@@ -455,6 +455,7 @@ pub struct Event {
     /// Signature origins are `anthropic`, `gemini`, `chat`, or `responses`.
     /// An absent Signature origin uses StreamConfig.source, never the target.
     pub b: EventText,
+    /// ToolComplete: arguments. Native Gemini Delta/Signature: owning frame-local part JSON.
     pub c: EventText,
     /// Explicit output item identity, separate from the tool call ID in `a`.
     /// The encoder preserves this ID; absent IDs use the context prefix.
@@ -1243,6 +1244,14 @@ impl<'a> Text<'a> {
 }
 
 trait Sink {
+    fn gemini_part(
+        &mut self,
+        key: Key,
+        kind: BlockKind,
+        text: Option<Text<'_>>,
+        signature: Option<Text<'_>>,
+        part: Text<'_>,
+    ) -> Result<(), Error>;
     fn begin(
         &mut self,
         id: Option<Text<'_>>,
@@ -1644,6 +1653,29 @@ impl Collector<'_, '_> {
     }
 }
 impl Sink for Collector<'_, '_> {
+    fn gemini_part(
+        &mut self,
+        key: Key,
+        kind: BlockKind,
+        text: Option<Text<'_>>,
+        signature: Option<Text<'_>>,
+        part: Text<'_>,
+    ) -> Result<(), Error> {
+        let part = self.text(Some(part))?;
+        for (event_kind, value) in [(EventKind::Delta, text), (EventKind::Signature, signature)] {
+            if let Some(value) = value {
+                self.add(Event {
+                    kind: event_kind,
+                    key,
+                    block: kind,
+                    a: self.text(Some(value))?,
+                    c: part,
+                    ..Event::EMPTY
+                })?;
+            }
+        }
+        Ok(())
+    }
     fn provider_block(&mut self, key: Key, value: Value<'_, '_>) -> Result<(), Error> {
         let block = match decode::validate_provider_block(value)? {
             ProviderBlock::Tool => BlockKind::Tool,
@@ -1955,6 +1987,21 @@ fn replay(
             b,
             event_text(event.item_id, payload)?,
         ),
+        EventKind::Delta | EventKind::Signature if event.c.present => {
+            let value = Some(required_text(a)?);
+            let (text, signature) = if event.kind == EventKind::Delta {
+                (value, None)
+            } else {
+                (None, value)
+            };
+            sink.gemini_part(
+                event.key,
+                event.block,
+                text,
+                signature,
+                required_text(event_text(event.c, payload)?)?,
+            )
+        }
         EventKind::Delta => sink.delta(event.key, event.block, required_text(a)?),
         EventKind::Signature => {
             let provider = b

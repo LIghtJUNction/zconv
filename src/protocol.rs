@@ -1,5 +1,6 @@
 //! Request and complete-response adapters, with explicit source ownership.
 
+pub mod anthropic;
 mod decode;
 mod encode;
 

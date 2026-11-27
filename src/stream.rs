@@ -347,6 +347,10 @@ pub struct StreamConfig<'a> {
     /// Encode only observed counters instead of requiring complete terminal usage.
     pub allow_partial_usage: bool,
     pub usage_emission: UsageEmission,
+    /// Shape single-candidate Gemini output for chat history. Retain one real
+    /// part for final metadata and publish earlier parts as more content arrives.
+    /// Requires GenerateContent and final usage emission.
+    pub gemini_chat_history: bool,
 }
 impl<'a> StreamConfig<'a> {
     pub fn new(source: Protocol, target: Protocol) -> Self {
@@ -360,6 +364,7 @@ impl<'a> StreamConfig<'a> {
             validate_snapshots: false,
             allow_partial_usage: false,
             usage_emission: UsageEmission::Final,
+            gemini_chat_history: false,
         }
     }
 }
@@ -698,6 +703,10 @@ struct State {
     continuation: Option<(u32, Span)>,
     usage_seen: bool,
     usage_pending: bool,
+    gemini_chat_part: Option<usize>,
+    gemini_text_buffers: [Span; 2],
+    gemini_text_lane: usize,
+    gemini_chat_grounding: Option<Span>,
     provider_usage: [Option<Span>; 4],
 }
 impl State {
@@ -720,6 +729,10 @@ impl State {
             continuation: None,
             usage_seen: false,
             usage_pending: false,
+            gemini_chat_part: None,
+            gemini_text_buffers: [Span::EMPTY; 2],
+            gemini_text_lane: 0,
+            gemini_chat_grounding: None,
             provider_usage: [None; 4],
         })
     }
@@ -1335,7 +1348,7 @@ fn process(
     } else {
         decode::event(config.source, root, &mut emitter)?;
     }
-    emitter.flush_usage()?;
+    emitter.end_frame()?;
     emitter.state.report.source_events = emitter.state.report.source_events.saturating_add(1);
     let length = emitter.writer.finish()?;
     validate_arguments(config.json_limits, state, items, aggregate, tokens)?;
@@ -1554,6 +1567,14 @@ pub fn validate_stream_format(format: Format) -> Result<(), Error> {
 }
 
 fn validate_usage_emission(config: StreamConfig<'_>) -> Result<(), Error> {
+    if config.gemini_chat_history
+        && (config.target.protocol != Protocol::GeminiGenerateContent
+            || config.usage_emission != UsageEmission::Final)
+    {
+        return Err(Error::Unsupported {
+            feature: "single-candidate Gemini chat with final usage",
+        });
+    }
     if config.usage_emission == UsageEmission::Continuous
         && matches!(
             config.target.protocol,

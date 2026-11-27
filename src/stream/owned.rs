@@ -40,6 +40,7 @@ impl EventEncoderState {
                 validate_snapshots: config.validate_snapshots,
                 allow_partial_usage: config.allow_partial_usage,
                 usage_emission: config.usage_emission,
+                gemini_chat_history: config.gemini_chat_history,
             },
             state,
         })
@@ -178,7 +179,7 @@ pub(super) fn stage(
         for event in events {
             replay(*event, payload, &mut emitter, tokens, config.json_limits)?;
         }
-        emitter.flush_usage()?;
+        emitter.end_frame()?;
         emitter.state.report.ir_events =
             emitter.state.report.ir_events.saturating_add(events.len());
         let length = emitter.writer.finish()?;

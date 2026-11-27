@@ -49,25 +49,36 @@ impl Encoder {
         }
     }
     fn encode(&mut self, payload: &[u8], events: &[Event]) -> Result<String, Status> {
-        let mut output = vec![0; 65536];
-        let n = self.state.encode(
-            StreamContext {
-                response_id: Some("r"),
-                model: Some("m"),
-                created: Some(7),
-                item_id_prefix: Some("test_"),
-                ..Default::default()
-            },
-            payload,
-            events,
-            EventEncoderBuffers {
-                tokens: &mut self.tokens,
-                items: &mut self.items,
-                checkpoints: &mut self.checkpoints,
-                aggregate: &mut self.aggregate,
-            },
-            &mut output,
-        )?;
+        self.encode_batch(payload, events, 65536, false)
+    }
+    fn encode_batch(
+        &mut self,
+        payload: &[u8],
+        events: &[Event],
+        capacity: usize,
+        preview: bool,
+    ) -> Result<String, Status> {
+        let mut output = vec![0; capacity];
+        let context = StreamContext {
+            response_id: Some("r"),
+            model: Some("m"),
+            created: Some(7),
+            item_id_prefix: Some("test_"),
+            ..Default::default()
+        };
+        let buffers = EventEncoderBuffers {
+            tokens: &mut self.tokens,
+            items: &mut self.items,
+            checkpoints: &mut self.checkpoints,
+            aggregate: &mut self.aggregate,
+        };
+        let n = if preview {
+            self.state
+                .preview(context, payload, events, buffers, &mut output)?
+        } else {
+            self.state
+                .encode(context, payload, events, buffers, &mut output)?
+        };
         Ok(String::from_utf8(output[..n].to_vec()).unwrap())
     }
     fn frame(&mut self, protocol: Protocol, payload: &[u8]) -> Result<String, Status> {
@@ -754,4 +765,464 @@ fn complete_chat_tool_call_extensions_stay_outside_function() {
             .get("provider_metadata")
             .is_none()
     );
+}
+
+#[test]
+fn gemini_chat_history_preserves_real_parts_and_places_observed_usage_on_stop() {
+    for observed_usage in [false, true] {
+        let mut cfg = StreamConfig::new(Protocol::OpenAiChat, Protocol::GeminiGenerateContent);
+        cfg.gemini_chat_history = true;
+        let mut encoder = Encoder::new(Protocol::OpenAiChat, Protocol::GeminiGenerateContent);
+        encoder.state = EventEncoderState::new(cfg).unwrap();
+        let chat = Protocol::OpenAiChat;
+        let first = br#"{"id":"r","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"one"}}]}"#;
+        let second = br#"{"choices":[{"index":0,"delta":{"content":"two"}}]}"#;
+        let stopped = br#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#;
+        assert!(encoder.frame(chat, first).unwrap().is_empty());
+        let first_output = encoder.frame(chat, second).unwrap();
+        assert!(!first_output.is_empty());
+        assert!(encoder.frame(chat, stopped).unwrap().is_empty());
+        let usage =
+            br#"{"choices":[],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}"#;
+        if observed_usage {
+            assert!(encoder.frame(chat, usage).unwrap().is_empty());
+        }
+        let final_output = encoder
+            .encode(
+                b"",
+                &[Event {
+                    kind: EventKind::Finish,
+                    ..Event::EMPTY
+                }],
+            )
+            .unwrap();
+        let expected = [("one", false, &first_output), ("two", true, &final_output)];
+        for (text, terminal, wire) in expected {
+            let mut chunks = wire.lines().filter_map(|line| line.strip_prefix("data: "));
+            let mut tokens = [Token::EMPTY; 256];
+            let document = json::parse(
+                chunks.next().unwrap().as_bytes(),
+                &mut tokens,
+                Default::default(),
+            )
+            .unwrap();
+            assert!(
+                chunks.next().is_none(),
+                "one real content chunk, no separate metadata"
+            );
+            let chunk = document.root();
+            let candidates = chunk.get("candidates").unwrap();
+            let candidate = candidates.array().next().unwrap();
+            let content = candidate.get("content").unwrap();
+            assert!(
+                content
+                    .get("role")
+                    .unwrap()
+                    .as_string()
+                    .unwrap()
+                    .eq_str("model")
+            );
+            let mut parts = content.get("parts").unwrap().array();
+            assert!(
+                parts
+                    .next()
+                    .unwrap()
+                    .get("text")
+                    .unwrap()
+                    .as_string()
+                    .unwrap()
+                    .eq_str(text)
+            );
+            assert!(parts.next().is_none());
+            assert_eq!(candidate.get("finishReason").is_some(), terminal);
+            if terminal {
+                assert!(
+                    candidate
+                        .get("finishReason")
+                        .unwrap()
+                        .as_string()
+                        .unwrap()
+                        .eq_str("STOP")
+                );
+            }
+            assert_eq!(
+                chunk.get("usageMetadata").is_some(),
+                terminal && observed_usage
+            );
+            if terminal && observed_usage {
+                let usage = chunk.get("usageMetadata").unwrap();
+                assert_eq!(usage.get("promptTokenCount").unwrap().as_u64(), Some(4));
+                assert_eq!(usage.get("candidatesTokenCount").unwrap().as_u64(), Some(2));
+                assert_eq!(usage.get("totalTokenCount").unwrap().as_u64(), Some(6));
+            }
+        }
+    }
+}
+
+#[test]
+fn gemini_chat_preview_retries_long_streams_in_a_fixed_arena_and_preserves_zero() {
+    let gemini = Protocol::GeminiGenerateContent;
+    let mut cfg = StreamConfig::new(gemini, gemini);
+    cfg.gemini_chat_history = true;
+    let mut encoder = Encoder::new(gemini, gemini);
+    encoder.state = EventEncoderState::new(cfg).unwrap();
+    encoder.aggregate.resize(96, 0);
+    encoder
+        .encode(
+            b"",
+            &[
+                Event::EMPTY,
+                Event {
+                    kind: EventKind::BlockStart,
+                    ..Event::EMPTY
+                },
+            ],
+        )
+        .unwrap();
+    let delta = Event {
+        kind: EventKind::Delta,
+        a: EventText {
+            offset: 0,
+            length: 8,
+            quoted: false,
+            present: true,
+        },
+        ..Event::EMPTY
+    };
+    let mut previous = String::new();
+    for index in 0..256 {
+        let next = format!("{index:08}");
+        if index == 0 {
+            assert!(
+                encoder
+                    .encode(next.as_bytes(), &[delta])
+                    .unwrap()
+                    .is_empty()
+            );
+        } else {
+            assert!(matches!(
+                encoder.encode_batch(next.as_bytes(), &[delta], 1, false),
+                Err(Status::NeedBuffer {
+                    buffer: BufferKind::Pending,
+                    ..
+                })
+            ));
+            let preview = encoder
+                .encode_batch(next.as_bytes(), &[delta], 1024, true)
+                .unwrap();
+            let actual = encoder.encode(next.as_bytes(), &[delta]).unwrap();
+            assert_eq!(preview, actual);
+            assert!(actual.contains(&format!(r#""text":"{previous}""#)));
+        }
+        previous = next;
+    }
+    let terminal = [
+        Event {
+            kind: EventKind::Usage,
+            usage: Usage {
+                input: Some(0),
+                tool_use_prompt: Some(0),
+                ..Default::default()
+            },
+            ..Event::EMPTY
+        },
+        Event {
+            kind: EventKind::ChoiceEnd,
+            ..Event::EMPTY
+        },
+        Event {
+            kind: EventKind::Finish,
+            ..Event::EMPTY
+        },
+    ];
+    let preview = encoder.encode_batch(b"", &terminal, 1024, true).unwrap();
+    assert_eq!(preview, encoder.encode(b"", &terminal).unwrap());
+    let payload = preview.trim().strip_prefix("data: ").unwrap();
+    let mut tokens = [Token::EMPTY; 128];
+    let document = json::parse(payload.as_bytes(), &mut tokens, Default::default()).unwrap();
+    let usage = document.root().get("usageMetadata").unwrap();
+    assert_eq!(usage.get("promptTokenCount").unwrap().as_u64(), Some(0));
+    assert_eq!(
+        usage.get("toolUsePromptTokenCount").unwrap().as_u64(),
+        Some(0)
+    );
+    assert!(usage.get("candidatesTokenCount").is_none());
+    assert!(usage.get("totalTokenCount").is_none());
+    assert!(preview.contains(&format!(r#""text":"{previous}""#)));
+}
+
+#[test]
+fn gemini_chat_projects_grounding_and_continuation_on_the_owned_candidate() {
+    let gemini = Protocol::GeminiGenerateContent;
+    let mut cfg = StreamConfig::new(gemini, gemini);
+    cfg.gemini_chat_history = true;
+    let mut encoder = Encoder::new(gemini, gemini);
+    encoder.state = EventEncoderState::new(cfg).unwrap();
+    let payload = br#"{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"answer"}]},"groundingMetadata":{"webSearchQueries":["query"]},"finishReason":"CONTINUATION","continuationToken":"next"}]}"#;
+    assert!(encoder.frame(gemini, payload).unwrap().is_empty());
+    let terminal = encoder
+        .encode(
+            b"",
+            &[Event {
+                kind: EventKind::Finish,
+                ..Event::EMPTY
+            }],
+        )
+        .unwrap();
+    let mut tokens = [Token::EMPTY; 256];
+    let data = terminal.trim().strip_prefix("data: ").unwrap();
+    let doc = json::parse(data.as_bytes(), &mut tokens, Default::default()).unwrap();
+    let candidate = doc
+        .root()
+        .get("candidates")
+        .unwrap()
+        .array()
+        .next()
+        .unwrap();
+    assert_eq!(candidate.get("index").unwrap().as_u64(), Some(0));
+    assert!(
+        candidate
+            .get("finishReason")
+            .unwrap()
+            .as_string()
+            .unwrap()
+            .eq_str("CONTINUATION")
+    );
+    assert!(
+        candidate
+            .get("continuationToken")
+            .unwrap()
+            .as_string()
+            .unwrap()
+            .eq_str("next")
+    );
+    assert!(
+        candidate
+            .get("groundingMetadata")
+            .unwrap()
+            .get("webSearchQueries")
+            .unwrap()
+            .array()
+            .next()
+            .unwrap()
+            .as_string()
+            .unwrap()
+            .eq_str("query")
+    );
+    assert!(
+        candidate
+            .get("content")
+            .unwrap()
+            .get("parts")
+            .unwrap()
+            .array()
+            .next()
+            .unwrap()
+            .get("text")
+            .unwrap()
+            .as_string()
+            .unwrap()
+            .eq_str("answer")
+    );
+    let second = br#"{"candidates":[{"index":1,"content":{"role":"model","parts":[{"text":"second candidate"}]},"finishReason":"STOP"}]}"#;
+    for chat_mode in [false, true] {
+        let mut encoder = Encoder::new(gemini, gemini);
+        cfg.gemini_chat_history = chat_mode;
+        encoder.state = EventEncoderState::new(cfg).unwrap();
+        let result = encoder.frame(gemini, second);
+        if chat_mode {
+            assert!(matches!(
+                result,
+                Err(Status::Failed(Error::Unsupported { .. }))
+            ));
+        } else {
+            assert!(result.unwrap().contains(r#""index":1"#));
+        }
+    }
+}
+
+#[test]
+fn gemini_chat_binds_grounding_to_its_source_candidate_content() {
+    let gemini = Protocol::GeminiGenerateContent;
+    let mut cfg = StreamConfig::new(gemini, gemini);
+    cfg.gemini_chat_history = true;
+    let a = br#"{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"A"}]}}]}"#;
+    let b = br#"{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"B"}]}}]}"#;
+    let b_grounded = br#"{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"B"}]},"groundingMetadata":{"webSearchQueries":["for-B"]}}]}"#;
+    let only_grounding =
+        br#"{"candidates":[{"index":0,"groundingMetadata":{"webSearchQueries":["for-B"]}}]}"#;
+    let stop = br#"{"candidates":[{"index":0,"finishReason":"STOP"}]}"#;
+    for separate in [false, true] {
+        let mut encoder = Encoder::new(gemini, gemini);
+        encoder.state = EventEncoderState::new(cfg).unwrap();
+        assert!(encoder.frame(gemini, a).unwrap().is_empty());
+        let first = encoder
+            .frame(gemini, if separate { b } else { b_grounded })
+            .unwrap();
+        assert!(first.contains(r#""text":"A""#));
+        assert!(!first.contains("groundingMetadata"));
+        if separate {
+            assert!(encoder.frame(gemini, only_grounding).unwrap().is_empty());
+        }
+        assert!(encoder.frame(gemini, stop).unwrap().is_empty());
+        let last = encoder
+            .encode(
+                b"",
+                &[Event {
+                    kind: EventKind::Finish,
+                    ..Event::EMPTY
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            last.lines()
+                .filter(|line| line.starts_with("data: "))
+                .count(),
+            1
+        );
+        let mut tokens = [Token::EMPTY; 128];
+        let doc = json::parse(
+            last.trim().strip_prefix("data: ").unwrap().as_bytes(),
+            &mut tokens,
+            Default::default(),
+        )
+        .unwrap();
+        let candidate = doc
+            .root()
+            .get("candidates")
+            .unwrap()
+            .array()
+            .next()
+            .unwrap();
+        let part = candidate
+            .get("content")
+            .unwrap()
+            .get("parts")
+            .unwrap()
+            .array()
+            .next()
+            .unwrap();
+        assert!(part.get("text").unwrap().as_string().unwrap().eq_str("B"));
+        assert!(
+            candidate
+                .get("groundingMetadata")
+                .unwrap()
+                .get("webSearchQueries")
+                .unwrap()
+                .array()
+                .next()
+                .unwrap()
+                .as_string()
+                .unwrap()
+                .eq_str("for-B")
+        );
+        assert!(
+            candidate
+                .get("finishReason")
+                .unwrap()
+                .as_string()
+                .unwrap()
+                .eq_str("STOP")
+        );
+    }
+}
+
+#[test]
+fn gemini_chat_empty_deltas_do_not_replace_real_parts_or_their_signatures() {
+    let chat = Protocol::OpenAiChat;
+    let gemini = Protocol::GeminiGenerateContent;
+    let empty_chat = br#"{"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}"#;
+    let chat_real = br#"{"choices":[{"index":0,"delta":{"content":"real"}}]}"#;
+    let chat_stop = br#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#;
+    let chat_usage =
+        br#"{"choices":[],"usage":{"prompt_tokens":4,"completion_tokens":1,"total_tokens":5}}"#;
+    let native_empty =
+        br#"{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":""}]}}]}"#;
+    let native_real = br#"{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"real","thoughtSignature":"signed"}]}}]}"#;
+    let native_stop = br#"{"candidates":[{"index":0,"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":1,"totalTokenCount":5}}"#;
+    for src in [chat, gemini] {
+        let mut cfg = StreamConfig::new(src, gemini);
+        cfg.gemini_chat_history = true;
+        let mut encoder = Encoder::new(src, gemini);
+        encoder.state = EventEncoderState::new(cfg).unwrap();
+        let before: &[&[u8]] = if src == chat {
+            &[empty_chat, chat_real, empty_chat, chat_stop, chat_usage]
+        } else {
+            &[native_empty, native_real, native_empty, native_stop]
+        };
+        for frame in before {
+            assert!(encoder.frame(src, frame).unwrap().is_empty());
+        }
+        let final_wire = encoder
+            .encode(
+                b"",
+                &[Event {
+                    kind: EventKind::Finish,
+                    ..Event::EMPTY
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            final_wire
+                .lines()
+                .filter(|line| line.starts_with("data: "))
+                .count(),
+            1
+        );
+        let mut tokens = [Token::EMPTY; 128];
+        let doc = json::parse(
+            final_wire.trim().strip_prefix("data: ").unwrap().as_bytes(),
+            &mut tokens,
+            Default::default(),
+        )
+        .unwrap();
+        let candidate = doc
+            .root()
+            .get("candidates")
+            .unwrap()
+            .array()
+            .next()
+            .unwrap();
+        let mut parts = candidate
+            .get("content")
+            .unwrap()
+            .get("parts")
+            .unwrap()
+            .array();
+        let part = parts.next().unwrap();
+        assert!(parts.next().is_none());
+        assert!(
+            part.get("text")
+                .unwrap()
+                .as_string()
+                .unwrap()
+                .eq_str("real")
+        );
+        if src == gemini {
+            assert!(
+                part.get("thoughtSignature")
+                    .unwrap()
+                    .as_string()
+                    .unwrap()
+                    .eq_str("signed")
+            );
+        }
+        assert!(
+            candidate
+                .get("finishReason")
+                .unwrap()
+                .as_string()
+                .unwrap()
+                .eq_str("STOP")
+        );
+        assert_eq!(
+            doc.root()
+                .get("usageMetadata")
+                .unwrap()
+                .get("totalTokenCount")
+                .unwrap()
+                .as_u64(),
+            Some(5)
+        );
+    }
 }

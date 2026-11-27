@@ -6,6 +6,8 @@ pub(super) struct Emitter<'a, 'b, 'c, 'd> {
     pub(super) state: &'c mut State,
     items: &'d mut [ActiveItem],
     aggregate: &'d mut [u8],
+    chat_write_lane: usize,
+    frame_grounding: Option<Span>,
 }
 
 fn number(writer: &mut Writer<'_>, mut value: u64) {
@@ -95,13 +97,15 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
         }
         Ok(())
     }
-    fn flush_gemini_text(&mut self, slot: usize) -> Result<(), Error> {
+    fn gemini_header(&mut self) {
+        self.writer.raw(b"data: {\"responseId\":");
+        quoted_span(&mut self.writer, self.aggregate, self.state.id);
+        self.writer.raw(b",\"modelVersion\":");
+        quoted_span(&mut self.writer, self.aggregate, self.state.model);
+        self.writer.raw(b",\"candidates\":[{\"index\":0");
+    }
+    fn gemini_text_content(&mut self, slot: usize, text: Span) {
         let item = self.items[slot];
-        let Some(text) = item.pending_text else {
-            return Ok(());
-        };
-        self.writer.raw(b"data: {\"candidates\":[{\"index\":");
-        number(&mut self.writer, u64::from(item.key.choice));
         self.writer
             .raw(b",\"content\":{\"role\":\"model\",\"parts\":[{\"text\":");
         quoted_span(&mut self.writer, self.aggregate, text);
@@ -112,7 +116,7 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
             self.writer.raw(b",\"thoughtSignature\":");
             quoted_span(&mut self.writer, self.aggregate, signature);
         }
-        self.writer.raw(b"}]}}]}\n\n");
+        self.writer.raw(b"}]}");
         let end = item
             .signature
             .map_or(text.start + text.length, |signature| {
@@ -121,11 +125,94 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
         let contiguous = item
             .signature
             .is_none_or(|signature| signature.start == text.start + text.length);
-        if contiguous && self.state.aggregate_used == end {
+        // Preview and failed writes must retain the original bytes for retry.
+        // In chat mode a later part in this batch can reuse the same slot.
+        if !self.config.gemini_chat_history && contiguous && self.state.aggregate_used == end {
             self.state.aggregate_used = text.start;
         }
         self.items[slot].pending_text = None;
         self.items[slot].signature = None;
+    }
+    fn flush_gemini_text(&mut self, slot: usize) -> Result<(), Error> {
+        let item = self.items[slot];
+        if let Some(text) = item.pending_text {
+            self.writer.raw(b"data: {\"candidates\":[{\"index\":");
+            number(&mut self.writer, u64::from(item.key.choice));
+            self.gemini_text_content(slot, text);
+            self.writer.raw(b"}]}\n\n");
+        }
+        Ok(())
+    }
+    fn gemini_tool_content(&mut self, item: ActiveItem) -> Result<(), Error> {
+        self.writer
+            .raw(b",\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"id\":");
+        quoted_span(&mut self.writer, self.aggregate, item.id);
+        self.writer.raw(b",\"name\":");
+        quoted_span(&mut self.writer, self.aggregate, item.name);
+        self.writer.raw(b",\"args\":");
+        self.write_chain(item, false)?;
+        self.writer.byte(b'}');
+        if let Some(signature) = item.signature {
+            self.writer.raw(b",\"thoughtSignature\":");
+            quoted_span(&mut self.writer, self.aggregate, signature);
+        }
+        self.writer.raw(b"}]}");
+        Ok(())
+    }
+    fn bind_frame_grounding(&mut self) -> Result<(), Error> {
+        if let Some(metadata) = self.frame_grounding.take() {
+            if self.state.gemini_chat_grounding.is_some() {
+                return Err(Error::Unsupported {
+                    feature: "multiple grounding updates for one Gemini chat part",
+                });
+            }
+            self.state.gemini_chat_grounding = Some(metadata);
+        }
+        Ok(())
+    }
+    pub(super) fn end_frame(&mut self) -> Result<(), Error> {
+        self.bind_frame_grounding()?;
+        self.flush_usage()
+    }
+    fn emit_gemini_chat(&mut self, finish: Option<FinishReason>) -> Result<(), Error> {
+        if finish.is_some() {
+            self.bind_frame_grounding()?;
+        }
+        let part = self.state.gemini_chat_part.take();
+        if part.is_none() && finish.is_none() {
+            return Ok(());
+        }
+        self.gemini_header();
+        if let Some(slot) = part {
+            let item = self.items[slot];
+            if item.kind == BlockKind::Tool {
+                self.gemini_tool_content(item)?;
+            } else if let Some(text) = item.pending_text {
+                self.gemini_text_content(slot, text);
+            } else {
+                return Err(Error::InvalidInput {
+                    field: "Gemini content",
+                    reason: "missing pending part",
+                });
+            }
+        }
+        if let Some(grounding) = self.state.gemini_chat_grounding.take() {
+            self.writer.raw(b",\"groundingMetadata\":");
+            self.writer.raw(span(self.aggregate, grounding));
+        }
+        if let Some(reason) = finish {
+            self.gemini_finish_fields(0, reason)?;
+        }
+        self.writer.raw(b"}]");
+        if finish.is_some()
+            && self.state.usage_seen
+            && (self.state.usage.usage() != Usage::default()
+                || self.state.provider_usage.iter().any(Option::is_some))
+        {
+            self.writer.raw(b",\"usageMetadata\":");
+            self.write_usage(Protocol::GeminiGenerateContent)?;
+        }
+        self.end_event();
         Ok(())
     }
     fn store_signature(
@@ -210,13 +297,50 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
         items: &'d mut [ActiveItem],
         aggregate: &'d mut [u8],
     ) -> Self {
+        // All writes in this transaction use the lane that does not hold the
+        // committed part. A preview or capacity retry can restore the old state.
+        let chat_write_lane = 1 - state.gemini_text_lane;
         Self {
             config,
             writer,
+            chat_write_lane,
+            frame_grounding: None,
             state,
             items,
             aggregate,
         }
+    }
+    fn store_gemini_chat_text(&mut self, text: Text<'_>) -> Result<Span, Error> {
+        let mut buffer = self.state.gemini_text_buffers[self.chat_write_lane];
+        let length = text.len();
+        if length > buffer.length {
+            // A growing lane may leave its old reservation behind. Geometric
+            // growth bounds the total cost in terms of the largest delta.
+            let capacity = length
+                .checked_next_power_of_two()
+                .ok_or(Error::EventTooLarge { needed: usize::MAX })?;
+            let start = self.state.aggregate_used;
+            let needed = start
+                .checked_add(capacity)
+                .ok_or(Error::EventTooLarge { needed: usize::MAX })?;
+            if needed > self.aggregate.len() {
+                return Err(Error::EventTooLarge { needed });
+            }
+            buffer = Span {
+                start,
+                length: capacity,
+            };
+            self.state.gemini_text_buffers[self.chat_write_lane] = buffer;
+            self.state.aggregate_used = needed;
+            self.state.aggregate_peak = self.state.aggregate_peak.max(needed);
+        }
+        let end = buffer.start + length;
+        text.copy(&mut self.aggregate[buffer.start..end])?;
+        self.state.gemini_text_lane = self.chat_write_lane;
+        Ok(Span {
+            start: buffer.start,
+            length,
+        })
     }
     fn store(&mut self, text: Text<'_>) -> Result<Span, Error> {
         let start = self.state.aggregate_used;
@@ -722,6 +846,7 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
         }
         if self.config.target.protocol == Protocol::GeminiGenerateContent
             && self.items[slot].kind != BlockKind::Tool
+            && !self.config.gemini_chat_history
         {
             self.flush_gemini_text(slot)?;
         }
@@ -810,21 +935,15 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
                 }
             }
             Protocol::GeminiGenerateContent if item.kind == BlockKind::Tool => {
-                self.writer.raw(b"data: {\"candidates\":[{\"index\":");
-                number(&mut self.writer, u64::from(item.key.choice));
-                self.writer
-                    .raw(b",\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"id\":");
-                quoted_span(&mut self.writer, self.aggregate, item.id);
-                self.writer.raw(b",\"name\":");
-                quoted_span(&mut self.writer, self.aggregate, item.name);
-                self.writer.raw(b",\"args\":");
-                self.write_chain(item, false)?;
-                self.writer.byte(b'}');
-                if let Some(signature) = item.signature {
-                    self.writer.raw(b",\"thoughtSignature\":");
-                    quoted_span(&mut self.writer, self.aggregate, signature);
+                if self.config.gemini_chat_history {
+                    self.emit_gemini_chat(None)?;
+                    self.state.gemini_chat_part = Some(slot);
+                } else {
+                    self.writer.raw(b"data: {\"candidates\":[{\"index\":");
+                    number(&mut self.writer, u64::from(item.key.choice));
+                    self.gemini_tool_content(item)?;
+                    self.writer.raw(b"}]}\n\n");
                 }
-                self.writer.raw(b"}]}}]}\n\n");
             }
             Protocol::GeminiInteractions => {
                 self.named(b"step.stop", b"event_type");
@@ -1061,6 +1180,37 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
             number(&mut self.writer, value);
         }
     }
+    fn gemini_finish_fields(&mut self, choice: u32, reason: FinishReason) -> Result<(), Error> {
+        if reason == FinishReason::Continuation && self.state.continuation.is_none() {
+            return Err(Error::ContextRequired {
+                field: "continuationToken",
+            });
+        }
+        self.writer.raw(b",\"finishReason\":");
+        self.writer.string(match reason {
+            FinishReason::Stop | FinishReason::ToolCalls => b"STOP",
+            FinishReason::Length => b"MAX_TOKENS",
+            FinishReason::Safety => b"SAFETY",
+            FinishReason::Continuation => b"CONTINUATION",
+            FinishReason::Other => {
+                return Err(Error::Unsupported {
+                    feature: "finish reason",
+                });
+            }
+        });
+        if let Some((owner, token)) = self.state.continuation {
+            if owner != choice || reason != FinishReason::Continuation {
+                return Err(Error::InvalidInput {
+                    field: "continuationToken",
+                    reason: "choice/finish mismatch",
+                });
+            }
+            self.writer.raw(b",\"continuationToken\":");
+            quoted_span(&mut self.writer, self.aggregate, token);
+            self.state.continuation = None;
+        }
+        Ok(())
+    }
     fn emit_choice(&mut self, choice: u32, reason: FinishReason) -> Result<(), Error> {
         match self.config.target.protocol {
             Protocol::OpenAiChat | Protocol::OpenAiCompletions => {
@@ -1086,37 +1236,12 @@ impl<'a, 'b, 'c, 'd> Emitter<'a, 'b, 'c, 'd> {
                 self.end_chat_event()?;
             }
             Protocol::GeminiGenerateContent => {
-                if reason == FinishReason::Continuation && self.state.continuation.is_none() {
-                    return Err(Error::ContextRequired {
-                        field: "continuationToken",
-                    });
+                if !self.config.gemini_chat_history {
+                    self.writer.raw(b"data: {\"candidates\":[{\"index\":");
+                    number(&mut self.writer, u64::from(choice));
+                    self.gemini_finish_fields(choice, reason)?;
+                    self.writer.raw(b"}]}\n\n");
                 }
-                self.writer.raw(b"data: {\"candidates\":[{\"index\":");
-                number(&mut self.writer, u64::from(choice));
-                self.writer.raw(b",\"finishReason\":");
-                self.writer.string(match reason {
-                    FinishReason::Stop | FinishReason::ToolCalls => b"STOP",
-                    FinishReason::Length => b"MAX_TOKENS",
-                    FinishReason::Safety => b"SAFETY",
-                    FinishReason::Continuation => b"CONTINUATION",
-                    FinishReason::Other => {
-                        return Err(Error::Unsupported {
-                            feature: "finish reason",
-                        });
-                    }
-                });
-                if let Some((owner, token)) = self.state.continuation {
-                    if owner != choice || reason != FinishReason::Continuation {
-                        return Err(Error::InvalidInput {
-                            field: "continuationToken",
-                            reason: "choice/finish mismatch",
-                        });
-                    }
-                    self.writer.raw(b",\"continuationToken\":");
-                    quoted_span(&mut self.writer, self.aggregate, token);
-                    self.state.continuation = None;
-                }
-                self.writer.raw(b"}]}\n\n");
             }
             _ => {}
         }
@@ -1258,6 +1383,7 @@ impl Sink for Emitter<'_, '_, '_, '_> {
         created: Option<u64>,
     ) -> Result<(), Error> {
         if self.state.begun {
+            self.bind_frame_grounding()?;
             for (supplied, stored) in [(id, self.state.id), (model, self.state.model)] {
                 if let Some(supplied) = supplied {
                     let equal = match supplied {
@@ -1360,6 +1486,7 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                 self.writer.raw(b",\"output\":[],\"usage\":null}");
                 self.end_event();
             }
+            Protocol::GeminiGenerateContent if self.config.gemini_chat_history => {}
             Protocol::GeminiGenerateContent => {
                 self.writer.raw(b"data: {\"responseId\":");
                 quoted_span(&mut self.writer, self.aggregate, self.state.id);
@@ -1392,6 +1519,11 @@ impl Sink for Emitter<'_, '_, '_, '_> {
             return Err(Error::InvalidInput {
                 field: "block start",
                 reason: "outside stream lifecycle",
+            });
+        }
+        if self.config.gemini_chat_history && key.choice != 0 {
+            return Err(Error::Unsupported {
+                feature: "multiple Gemini chat candidates",
             });
         }
         if self.lookup(key, Some(kind)).is_some() {
@@ -1645,8 +1777,20 @@ impl Sink for Emitter<'_, '_, '_, '_> {
         }
         if self.config.target.protocol == Protocol::GeminiGenerateContent && kind != BlockKind::Tool
         {
-            self.flush_gemini_text(slot)?;
-            self.items[slot].pending_text = Some(self.store(text)?);
+            let stored = if self.config.gemini_chat_history {
+                // Role-only Chat chunks and trailing keepalive fragments do
+                // not create a model part or take an existing part's signature.
+                if text.len() == 0 {
+                    return Ok(());
+                }
+                self.emit_gemini_chat(None)?;
+                self.state.gemini_chat_part = Some(slot);
+                self.store_gemini_chat_text(text)?
+            } else {
+                self.flush_gemini_text(slot)?;
+                self.store(text)?
+            };
+            self.items[slot].pending_text = Some(stored);
             return Ok(());
         }
         let item = self.items[slot];
@@ -1814,7 +1958,16 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                 self.end_event();
             }
             Protocol::GeminiGenerateContent => {
-                if item.kind != BlockKind::Tool {
+                if self.config.gemini_chat_history
+                    && item.kind != BlockKind::Tool
+                    && self.state.gemini_chat_part != Some(slot)
+                {
+                    return Err(Error::InvalidInput {
+                        field: "thoughtSignature",
+                        reason: "no pending owning part",
+                    });
+                }
+                if !self.config.gemini_chat_history && item.kind != BlockKind::Tool {
                     self.flush_gemini_text(slot)?;
                 }
             }
@@ -1893,6 +2046,23 @@ impl Sink for Emitter<'_, '_, '_, '_> {
             return Err(Error::Unsupported {
                 feature: "Gemini grounding target",
             });
+        }
+        if self.config.gemini_chat_history {
+            if choice != 0 {
+                return Err(Error::Unsupported {
+                    feature: "multiple Gemini chat candidates",
+                });
+            }
+            if self.frame_grounding.is_some() {
+                return Err(Error::Unsupported {
+                    feature: "multiple grounding updates in one candidate frame",
+                });
+            }
+            // The native decoder reports candidate-level metadata before that
+            // candidate's parts. Binding now would decorate the previous frame
+            // when the first new delta releases its pending text.
+            self.frame_grounding = Some(self.store(Text::Utf8(value.raw()))?);
+            return Ok(());
         }
         self.writer.raw(b"data: {\"candidates\":[{\"index\":");
         number(&mut self.writer, u64::from(choice));
@@ -2149,7 +2319,9 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                         feature: "Gemini cancelled/failed status without error payload",
                     });
                 }
-                if self.state.usage_seen {
+                if self.config.gemini_chat_history {
+                    self.emit_gemini_chat(Some(reason))?;
+                } else if self.state.usage_seen {
                     self.writer
                         .raw(b"data: {\"candidates\":[],\"usageMetadata\":");
                     self.write_usage(Protocol::GeminiGenerateContent)?;
@@ -2181,6 +2353,10 @@ impl Sink for Emitter<'_, '_, '_, '_> {
         Ok(())
     }
     fn failure(&mut self, code: Option<Text<'_>>, message: Text<'_>) -> Result<(), Error> {
+        if self.config.gemini_chat_history {
+            self.bind_frame_grounding()?;
+            self.emit_gemini_chat(None)?;
+        }
         if self.config.target.protocol == Protocol::OpenAiResponses {
             self.response_event(b"error")?;
             if let Some(code) = code {
@@ -2279,6 +2455,10 @@ impl Sink for Emitter<'_, '_, '_, '_> {
                 });
             }
             let slot = self.state.item_count - 1;
+            if self.config.gemini_chat_history {
+                self.store_signature(slot, signature, self.config.source)?;
+                return self.close(key);
+            }
             let item = self.items[slot];
             self.writer.raw(b"data: {\"candidates\":[{\"index\":");
             number(&mut self.writer, u64::from(key.choice));

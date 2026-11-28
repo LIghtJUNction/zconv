@@ -423,8 +423,13 @@ impl<'s, 'a> Arena<'s, 'a> {
                 Presence::Missing,
             )
         } else if kind.eq_str("tool_use") {
-            if self.source.protocol == Protocol::AnthropicMessages && role != Role::Assistant {
-                return Err(invalid("tool_use", "must belong to assistant"));
+            let mut known: &[&str] = &["type", "id", "name", "input"];
+            if self.source.protocol == Protocol::AnthropicMessages {
+                if role != Role::Assistant {
+                    return Err(invalid("tool_use", "must belong to assistant"));
+                }
+                super::anthropic::validate_direct_tool_caller(v)?;
+                known = &["type", "id", "name", "input", "caller"];
             }
             let arguments = required(v, "input")?;
             object(arguments, "input")?;
@@ -436,7 +441,7 @@ impl<'s, 'a> Arena<'s, 'a> {
                     legacy: false,
                 },
                 Some(v),
-                &["type", "id", "name", "input"],
+                known,
                 Presence::Missing,
             )
         } else if kind.eq_str("tool_result") {

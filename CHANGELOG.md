@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Accept explicit Anthropic direct tool callers in streamed and buffered messages. Calls from provider-side execution retain their explicit unsupported result.
+
 - Accept Responses terminal usage with supplemental audit breakdowns and absent or null reasoning summaries. Preserve authoritative aggregate counters and reject malformed extensions.
 - Negotiate Anthropic Messages thinking display updates from validated native request controls.
 

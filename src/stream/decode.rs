@@ -870,7 +870,8 @@ fn anthropic(value: Value<'_, '_>, sink: &mut impl Sink) -> Result<(), Error> {
         };
         let block = object(value, "content_block")?;
         if eq(block, "type", "tool_use") {
-            fields(block, &["type", "id", "name", "input"])?;
+            fields(block, &["type", "id", "name", "input", "caller"])?;
+            crate::protocol::anthropic::validate_direct_tool_caller(block)?;
             sink.block(
                 key,
                 BlockKind::Tool,

@@ -1272,3 +1272,59 @@ fn responses_terminal_projects_aggregate_usage_with_supplemental_breakdown() {
         .is_err()
     );
 }
+
+#[test]
+fn anthropic_tool_use_accepts_only_a_direct_caller() {
+    let direct = br#"{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_1","name":"confirm_ready","input":{},"caller":{"type":"direct"}}}"#;
+    let events = decode(Protocol::AnthropicMessages, direct).unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == EventKind::BlockStart
+            && event.block == BlockKind::Tool
+            && event.key.index == 2
+    }));
+    for caller in [
+        r#"{"type":"code_execution_20250825","tool_id":"srvtoolu_1"}"#,
+        r#"{"type":"direct","tool_id":"srvtoolu_1"}"#,
+        r#""direct""#,
+    ] {
+        let payload = format!(
+            r#"{{"type":"content_block_start","index":2,"content_block":{{"type":"tool_use","id":"toolu_1","name":"confirm_ready","input":{{}},"caller":{caller}}}}}"#
+        );
+        assert!(matches!(
+            decode(Protocol::AnthropicMessages, payload.as_bytes()),
+            Err(Error::Unsupported { .. })
+        ));
+    }
+}
+
+#[test]
+fn anthropic_buffered_tool_use_checks_the_same_caller_contract() {
+    for (caller, direct) in [
+        (r#"{"type":"direct"}"#, true),
+        (
+            r#"{"type":"code_execution_20250825","tool_id":"srvtoolu_1"}"#,
+            false,
+        ),
+    ] {
+        let payload = format!(
+            r#"{{"id":"msg_1","model":"m","role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"confirm_ready","input":{{}},"caller":{caller}}}],"stop_reason":"tool_use"}}"#
+        );
+        let mut tokens = [Token::EMPTY; 128];
+        let mut records = [zconv::ir::Record::EMPTY; 16];
+        let document =
+            json::parse(payload.as_bytes(), &mut tokens, json::Limits::default()).unwrap();
+        let response = zconv::protocol::decode_response(
+            Protocol::AnthropicMessages.into(),
+            document.root(),
+            &mut records,
+        );
+        if direct {
+            assert!(response.unwrap().records.iter().any(|record| {
+                matches!(record, zconv::ir::Record::Block(block)
+                    if matches!(block.content, zconv::ir::Content::ToolCall { .. }))
+            }));
+        } else {
+            assert!(matches!(response, Err(Error::Unsupported { .. })));
+        }
+    }
+}

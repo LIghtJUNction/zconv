@@ -35,6 +35,24 @@ pub fn validate_messages_envelope(
     Ok(())
 }
 
+/// A direct caller has the same execution semantics as an omitted caller.
+pub(crate) fn validate_direct_tool_caller(value: Value<'_, '_>) -> Result<(), Error> {
+    let Some(caller) = value.get("caller").filter(|caller| !caller.is_null()) else {
+        return Ok(());
+    };
+    if caller
+        .get("type")
+        .and_then(Value::as_string)
+        .is_some_and(|kind| kind.eq_str("direct"))
+        && caller.object().all(|(key, _)| key.eq_str("type"))
+    {
+        return Ok(());
+    }
+    Err(Error::Unsupported {
+        feature: "non-direct Anthropic tool caller",
+    })
+}
+
 /// Validate a Messages output configuration carrying a named thinking effort.
 pub fn messages_effort(controls: Value<'_, '_>) -> Result<Option<&'static str>, Error> {
     let Some(config) = controls.get("output_config") else {

@@ -364,8 +364,23 @@ fn usage_openai(value: Value<'_, '_>, responses: bool) -> Result<Usage, Error> {
             "cache_creation_input_tokens",
             "cache_creation_details",
             "cost",
+            "x_details",
         ],
     )?;
+    if let Some(details) = value.get("x_details") {
+        if !responses {
+            return Err(Error::Unsupported {
+                feature: "unknown stream field",
+            });
+        }
+        // This Responses audit breakdown may repeat aggregate usage. It cannot
+        // supply missing counters or change the authoritative top-level totals.
+        if details.kind() != Kind::Array
+            || details.array().any(|entry| entry.kind() != Kind::Object)
+        {
+            return Err(invalid("x_details"));
+        }
+    }
     let mut usage = Usage {
         input: number(value, input)?,
         output: number(value, output)?,
@@ -1353,25 +1368,24 @@ fn response_snapshot(
     }
     if eq(item, "type", "reasoning") {
         empty_only(item, "encrypted_content")?;
-        array(item, "summary")?;
-        for (part, summary) in item
-            .get("summary")
-            .ok_or_else(|| invalid("summary"))?
-            .array()
-            .enumerate()
-        {
-            if !eq(summary, "type", "summary_text") {
-                return Err(invalid("summary part type"));
+        if let Some(summary) = item.get("summary").filter(|v| !v.is_null()) {
+            if summary.kind() != Kind::Array {
+                return Err(invalid("summary"));
             }
-            sink.snapshot(
-                Key {
-                    choice: 0,
-                    index: output_index,
-                    part: u32::try_from(part).map_err(|_| invalid("summary_index"))?,
-                },
-                BlockKind::ReasoningSummary,
-                string(summary, "text")?,
-            )?;
+            for (part, summary) in summary.array().enumerate() {
+                if !eq(summary, "type", "summary_text") {
+                    return Err(invalid("summary part type"));
+                }
+                sink.snapshot(
+                    Key {
+                        choice: 0,
+                        index: output_index,
+                        part: u32::try_from(part).map_err(|_| invalid("summary_index"))?,
+                    },
+                    BlockKind::ReasoningSummary,
+                    string(summary, "text")?,
+                )?;
+            }
         }
         if let Some(content) = item.get("content").filter(|v| !v.is_null()) {
             if content.kind() != Kind::Array {

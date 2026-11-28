@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Accept Responses terminal usage with supplemental audit breakdowns and absent or null reasoning summaries. Preserve authoritative aggregate counters and reject malformed extensions.
+- Negotiate Anthropic Messages thinking display updates from validated native request controls.
+
 - Add an explicit JSON control-escape policy for producers that must preserve `\u0008` and `\u000c` output. The existing writer keeps its default `\b` and `\f` spelling.
 - Share UTF-8 validation, escaping and exact output-capacity accounting across both policies. Cover prior producer bytes, all control characters, literal escape text and bounded-output failures.
 

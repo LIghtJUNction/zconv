@@ -1226,3 +1226,49 @@ fn gemini_chat_empty_deltas_do_not_replace_real_parts_or_their_signatures() {
         );
     }
 }
+
+#[test]
+fn responses_terminal_projects_aggregate_usage_with_supplemental_breakdown() {
+    let payload = br#"{"type":"response.incomplete","response":{"id":"resp_k","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"reasoning","summary":null}],"usage":{"input_tokens":126,"output_tokens":32,"total_tokens":158,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"output_tokens_details":{"reasoning_tokens":26},"x_details":[{"input_tokens":900,"output_tokens":400}]}}}"#;
+    let events = decode(Protocol::OpenAiResponses, payload).unwrap();
+    let usage = events
+        .iter()
+        .find(|e| e.kind == EventKind::Usage)
+        .unwrap()
+        .usage;
+    assert_eq!(usage.input, Some(126));
+    assert_eq!(usage.output, Some(32));
+    assert_eq!(usage.total, Some(158));
+    assert_eq!(usage.cached, Some(0));
+    assert!(!events.iter().any(|e| e.kind == EventKind::Snapshot));
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == EventKind::Finish && e.completion == Completion::Incomplete)
+    );
+
+    let absent = br#"{"type":"response.completed","response":{"id":"resp_missing","status":"completed","output":[{"type":"reasoning"}],"usage":{"x_details":[{"input_tokens":9,"output_tokens":4}]}}}"#;
+    let events = decode(Protocol::OpenAiResponses, absent).unwrap();
+    let usage = events
+        .iter()
+        .find(|e| e.kind == EventKind::Usage)
+        .unwrap()
+        .usage;
+    assert_eq!(usage.input, None);
+    assert_eq!(usage.output, None);
+
+    for payload in [
+        br#"{"type":"response.completed","response":{"output":[{"type":"reasoning","summary":{}}]}}"#.as_slice(),
+        br#"{"type":"response.completed","response":{"usage":{"x_details":{}}}}"#,
+        br#"{"type":"response.completed","response":{"usage":{"x_details":[12]}}}"#,
+    ] {
+        assert!(decode(Protocol::OpenAiResponses, payload).is_err());
+    }
+    assert!(
+        decode(
+            Protocol::OpenAiChat,
+            br#"{"choices":[],"usage":{"prompt_tokens":1,"x_details":[]}}"#
+        )
+        .is_err()
+    );
+}
